@@ -66,6 +66,9 @@ def sample_from_model(
         timesteps = torch.linspace(num_steps - 1, 0, num_steps, dtype=torch.long, device=device)
 
         for i, t_continuous in enumerate(timesteps):
+            # Print progress every 10 steps
+            if i % max(1, num_steps // 10) == 0:
+                print(f"  Denoising step {i+1}/{num_steps}")
             # Get discrete timestep
             t = torch.full((batch_size,), t_continuous.item(), dtype=torch.long, device=device)
 
@@ -99,6 +102,12 @@ def sample_from_model(
 
         # Sample tokens
         probs = F.softmax(logits, dim=-1)
+        # Handle potential NaN values from -inf logits
+        probs = torch.nan_to_num(probs, nan=0.0)
+        # Renormalize in case filtering produced NaNs
+        prob_sum = probs.sum(dim=-1, keepdim=True)
+        # If sum is effectively zero, use uniform distribution
+        probs = torch.where(prob_sum > 1e-6, probs / prob_sum, torch.ones_like(probs) / probs.shape[-1])
         generated_ids = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1)
         generated_ids = generated_ids.view(batch_size, seq_len)
 
@@ -116,20 +125,20 @@ def top_k_top_p_filtering(
 
     Args:
         logits: Logits distribution [batch_size, seq_len, vocab_size]
-        top_k: Keep only top k tokens with highest probability
-        top_p: Keep the top tokens with cumulative probability >= top_p
+        top_k: Keep only top k tokens with highest probability (None to disable)
+        top_p: Keep the top tokens with cumulative probability >= top_p (None to disable)
         filter_value: Value to use for filtered tokens
         min_tokens_to_keep: Minimum number of tokens to keep per sample
 
     Returns:
         filtered_logits: Filtered logits with same shape as input
     """
-    if top_k > 0:
+    if top_k is not None and top_k > 0:
         # Top-k filtering
         indices_to_remove = logits < torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
         logits = logits.masked_fill(indices_to_remove, filter_value)
 
-    if top_p < 1.0:
+    if top_p is not None and top_p < 1.0:
         # Top-p (nucleus) filtering
         sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
         cumsum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)

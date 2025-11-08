@@ -9,6 +9,7 @@ from .embeddings import (
     FiLMConditioning,
     AdditiveConditioning,
 )
+from .simple_mamba import SimpleMamba2, SimpleMamba2Block
 
 __all__ = [
     "DIMBA",
@@ -20,4 +21,6 @@ __all__ = [
     "PromptEncoder",
     "FiLMConditioning",
     "AdditiveConditioning",
+    "SimpleMamba2",
+    "SimpleMamba2Block",
 ]

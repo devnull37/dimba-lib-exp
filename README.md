@@ -24,7 +24,7 @@ DIMBA is a non-autoregressive language model that fuses a cosine-scheduled diffu
 
 ```bash
 # Clone repository
-git clone https://github.com/faris-allafi/dimba-lib-exp.git
+git clone https://github.com/devnull37/dimba-lib-exp.git
 cd dimba-lib-exp
 
 # Install in development mode

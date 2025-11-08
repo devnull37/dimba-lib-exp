@@ -43,6 +43,7 @@ class DIMBA(nn.Module):
         dropout: float = 0.1,
         use_weight_tying: bool = False,
         padding_idx: Optional[int] = None,
+        use_simple_mamba: bool = False,
     ):
         super().__init__()
 
@@ -81,6 +82,7 @@ class DIMBA(nn.Module):
             cond_dim=d_prompt,
             time_embed_dim=512,
             dropout=dropout,
+            use_simple_mamba=use_simple_mamba,
         )
 
         # Output head

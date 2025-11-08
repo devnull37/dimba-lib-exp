@@ -6,10 +6,9 @@ from typing import Literal, Optional
 
 try:
     from mamba_ssm import Mamba
+    HAS_MAMBA_SSM = True
 except ImportError:
-    raise ImportError(
-        "mamba-ssm is required. Install with: pip install mamba-ssm"
-    )
+    HAS_MAMBA_SSM = False
 
 from .embeddings import FiLMConditioning, AdditiveConditioning
 
@@ -46,26 +45,36 @@ class Mamba2Block(nn.Module):
         dt_scale: float = 1.0,
         bias: bool = True,
         conv_bias: bool = True,
+        use_simple_mamba: bool = False,
     ):
         super().__init__()
 
         self.d_model = d_model
         self.norm = nn.LayerNorm(d_model)
 
-        # Mamba SSM layer
-        self.mamba = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            dt_rank=dt_rank,
-            dt_min=dt_min,
-            dt_max=dt_max,
-            dt_init=dt_init,
-            dt_scale=dt_scale,
-            bias=bias,
-            conv_bias=conv_bias,
-        )
+        # Use simple Mamba if requested or if mamba_ssm not available
+        if use_simple_mamba or not HAS_MAMBA_SSM:
+            from .simple_mamba import SimpleMamba2
+            self.mamba = SimpleMamba2(
+                d_model=d_model,
+                d_state=d_state,
+                d_expand=expand,
+            )
+        else:
+            # Use optimized mamba-ssm
+            self.mamba = Mamba(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                dt_rank=dt_rank,
+                dt_min=dt_min,
+                dt_max=dt_max,
+                dt_init=dt_init,
+                dt_scale=dt_scale,
+                bias=bias,
+                conv_bias=conv_bias,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with residual connection.
@@ -108,6 +117,7 @@ class Mamba2Denoiser(nn.Module):
         cond_dim: int = 512,
         time_embed_dim: int = 512,
         dropout: float = 0.1,
+        use_simple_mamba: bool = False,
     ):
         super().__init__()
 
@@ -122,6 +132,7 @@ class Mamba2Denoiser(nn.Module):
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
+                use_simple_mamba=use_simple_mamba,
             )
             for _ in range(num_layers)
         ])

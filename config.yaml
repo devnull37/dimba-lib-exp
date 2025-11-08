@@ -2,27 +2,35 @@
 
 # Model architecture parameters
 model:
-  d_model: 512              # Hidden dimension
-  d_prompt: 512             # Prompt conditioning dimension
+  d_model: 256              # Hidden dimension (reduced for CPU testing)
+  d_prompt: 128             # Prompt conditioning dimension
   num_diffusion_steps: 1000 # Number of diffusion steps T
-  num_denoiser_layers: 6    # Number of Mamba-2 blocks
+  num_denoiser_layers: 6    # Number of Mamba-2 blocks (reduced for testing)
   d_state: 16               # SSM state size
   d_conv: 4                 # Convolution kernel size
   expand: 2                 # Expansion factor for Mamba
   conditioning_type: "film" # 'film' or 'additive'
   dropout: 0.1
   use_weight_tying: false   # Tie embedding and output weights
+  use_simple_mamba: false   # Set to true to force SimpleMamba2 (CPU), false for mamba-ssm (GPU)
+
+# Tokenizer configuration
+tokenizer:
+  type: "bpe"               # 'simple' for character-level, 'bpe' for byte pair encoding
+  vocab_size: 10000         # Vocabulary size
+  # BPE-specific settings:
+  bpe_vocab_size: 10000     # Target vocab size for training
 
 # Data configuration
 data:
-  type: "dummy"             # 'dummy', 'huggingface', or 'text'
+  type: "huggingface"             # 'dummy', 'huggingface', or 'text'
   batch_size: 32
   max_length: 256
   num_workers: 0
   num_examples: 1000        # For dummy dataset
   # For huggingface:
-  # dataset_name: "wikitext"
-  # dataset_config: "wikitext-2-raw-v1"
+  dataset_name: "wikitext"
+  dataset_config: "wikitext-2-raw-v1"
 
 # Training configuration
 training:
@@ -32,6 +40,17 @@ training:
   ema_decay: 0.9999
   use_ema: true
   gradient_clip: 1.0
+  num_epochs: 10
+  max_steps: null           # Set to limit training steps (null = no limit)
+  log_interval: 100
+  val_interval: 500
+
+# GPU/Device configuration
+device:
+  use_gpu: true             # Set to false to force CPU training
+  multi_gpu: false          # Use DataParallel for multi-GPU
+  mixed_precision: false    # Use automatic mixed precision (amp)
+  benchmark: true           # Enable cudnn benchmark
 
 # Inference configuration
 inference:
@@ -41,3 +60,9 @@ inference:
   top_p: 0.95
   use_ddim: false           # Use DDIM sampling
   ddim_eta: 0.0
+
+# Checkpoint configuration
+checkpoint:
+  save_dir: "./checkpoints"
+  save_interval: 500        # Save every N steps
+  keep_last_k: 3            # Keep last K checkpoints

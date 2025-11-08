@@ -64,8 +64,8 @@ def create_dataloaders(config: dict, vocab_size: int):
         except Exception as e:
             print(f"Failed to load HuggingFace dataset: {e}")
             print("Falling back to dummy dataset")
-            train_dataset = DummyDataset(size=1000, seq_length=max_length)
-            val_dataset = DummyDataset(size=100, seq_length=max_length)
+            train_dataset = DummyDataset(size=1000, vocab_size=vocab_size, seq_length=max_length)
+            val_dataset = DummyDataset(size=100, vocab_size=vocab_size, seq_length=max_length)
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 
@@ -91,7 +91,7 @@ def create_dataloaders(config: dict, vocab_size: int):
 def main():
     parser = argparse.ArgumentParser(description="Train DIMBA model")
     parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
-    parser.add_argument('--vocab-size', type=int, default=50000, help='Vocabulary size')
+    parser.add_argument('--vocab-size', type=int, default=10000, help='Vocabulary size')
     parser.add_argument('--max-epochs', type=int, default=10, help='Maximum number of epochs')
     parser.add_argument('--gpus', type=int, default=1 if torch.cuda.is_available() else 0, help='Number of GPUs')
     parser.add_argument('--mixed-precision', type=str, default=None, help='Mixed precision (16-mixed, 16-true, 32-true)')
@@ -132,9 +132,9 @@ def main():
     lightning_module = DIMBALightningModule(
         vocab_size=args.vocab_size,
         model_config=model_config,
-        learning_rate=training_config.get('learning_rate', 2e-5),
-        warmup_steps=training_config.get('warmup_steps', 500),
-        ema_decay=training_config.get('ema_decay', 0.9999),
+        learning_rate=float(training_config.get('learning_rate', 2e-5)),
+        warmup_steps=int(training_config.get('warmup_steps', 500)),
+        ema_decay=float(training_config.get('ema_decay', 0.9999)),
         use_ema=training_config.get('use_ema', True),
     )
 
@@ -159,7 +159,7 @@ def main():
     # Trainer
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
-        devices=args.gpus if args.gpus > 0 else None,
+        devices=args.gpus if args.gpus > 0 else 1,  # CPU trainer needs devices=1 (not None or -1)
         accelerator='gpu' if args.gpus > 0 else 'cpu',
         strategy='auto',
         precision=args.mixed_precision or '32-true',

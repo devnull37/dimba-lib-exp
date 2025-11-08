@@ -27,17 +27,21 @@ classifiers = [
 dependencies = [
     "torch>=2.0.0",
     "pytorch-lightning>=2.0.0",
-    "mamba-ssm>=2.2.0",
     "transformers>=4.30.0",
     "datasets>=2.13.0",
     "numpy>=1.24.0",
     "pyyaml>=6.0.0",
     "omegaconf>=2.3.0",
     "tqdm>=4.65.0",
+    "tokenizers>=0.13.0",
 ]
 
 [project.optional-dependencies]
-gpu = ["causal-conv1d>=1.4.0"]
+mamba = ["mamba-ssm>=2.2.0"]
+gpu = [
+    "mamba-ssm>=2.2.0",
+    "causal-conv1d>=1.4.0",
+]
 eval = [
     "sacrebleu>=2.3.1",
     "rouge-score>=0.1.2",

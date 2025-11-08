@@ -11,8 +11,15 @@ sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
 from dimba import DIMBA, sample_from_model, DDIMSampler
 
 
-def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str):
-    """Load model from checkpoint."""
+def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str, config_path: str = None):
+    """Load model from checkpoint.
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        vocab_size: Vocabulary size (used if config not provided)
+        device: Device to load model on
+        config_path: Optional path to config.yaml with model hyperparameters
+    """
     print(f"Loading checkpoint from {checkpoint_path}...")
 
     # Try to load as Lightning checkpoint first
@@ -40,8 +47,33 @@ def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str):
         # Try loading as raw model checkpoint
         model_state = torch.load(checkpoint_path, map_location=device)
 
-    # Create model
-    model = DIMBA(vocab_size=vocab_size)
+    # Load config if provided
+    model_kwargs = {'vocab_size': vocab_size}
+    if config_path:
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            if 'model' in config:
+                model_config = config['model']
+                model_kwargs.update({
+                    'd_model': model_config.get('d_model', 512),
+                    'd_prompt': model_config.get('d_prompt', 512),
+                    'num_diffusion_steps': model_config.get('num_diffusion_steps', 1000),
+                    'num_denoiser_layers': model_config.get('num_denoiser_layers', 6),
+                    'd_state': model_config.get('d_state', 16),
+                    'd_conv': model_config.get('d_conv', 4),
+                    'expand': model_config.get('expand', 2),
+                    'conditioning_type': model_config.get('conditioning_type', 'film'),
+                    'dropout': model_config.get('dropout', 0.1),
+                    'use_weight_tying': model_config.get('use_weight_tying', False),
+                })
+                print(f"Loaded model config: d_model={model_kwargs['d_model']}, vocab_size={vocab_size}")
+        except Exception as e:
+            print(f"Warning: Failed to load config from {config_path}: {e}")
+            print("Using default model parameters")
+
+    # Create model with loaded config
+    model = DIMBA(**model_kwargs)
     model.load_state_dict(model_state, strict=False)
     model = model.to(device)
     model.eval()
@@ -52,6 +84,7 @@ def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str):
 def main():
     parser = argparse.ArgumentParser(description="Generate text with DIMBA")
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
+    parser.add_argument('--config', type=str, default='config.yaml', help='Path to config.yaml file')
     parser.add_argument('--prompt', type=str, default='The quick brown fox', help='Prompt text')
     parser.add_argument('--length', type=int, default=100, help='Length of text to generate')
     parser.add_argument('--num-steps', type=int, default=50, help='Number of denoising steps')
@@ -59,7 +92,7 @@ def main():
     parser.add_argument('--top-k', type=int, default=None, help='Top-k sampling')
     parser.add_argument('--top-p', type=float, default=0.95, help='Top-p (nucleus) sampling')
     parser.add_argument('--use-ddim', action='store_true', help='Use DDIM sampling')
-    parser.add_argument('--vocab-size', type=int, default=50000, help='Vocabulary size')
+    parser.add_argument('--vocab-size', type=int, default=10000, help='Vocabulary size')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--num-samples', type=int, default=1, help='Number of samples to generate')
 
@@ -70,7 +103,7 @@ def main():
     print("=" * 50)
 
     # Load model
-    model = load_checkpoint(args.checkpoint, args.vocab_size, args.device)
+    model = load_checkpoint(args.checkpoint, args.vocab_size, args.device, args.config)
 
     print(f"\nModel loaded successfully!")
     print(f"Prompt: {args.prompt}")
@@ -83,8 +116,19 @@ def main():
         return [ord(c) % args.vocab_size for c in text]
 
     def detokenize(token_ids):
-        # For demo, just convert to readable format
-        return f"Generated text (IDs: {token_ids.tolist()[:20]}...)"
+        # Convert token IDs back to characters (inverse of tokenize)
+        # Since tokenize uses ord(c) % vocab_size, try to recover characters
+        try:
+            chars = [chr(int(t)) for t in token_ids.tolist() if 32 <= int(t) < 127]
+            if chars:
+                text = ''.join(chars)
+            else:
+                text = f"<non-printable tokens>"
+        except:
+            text = f"<decoding error>"
+
+        # Show both text and token IDs
+        return f"{text}\n  (Token IDs: {token_ids.tolist()[:30]}...)"
 
     # Tokenize prompt
     prompt_ids = torch.tensor([tokenize(args.prompt)], device=args.device)
