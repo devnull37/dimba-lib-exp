@@ -1,0 +1,64 @@
+# DIMBA Model Configuration for FineWeb 1B Parameter Model
+
+# Model architecture parameters
+model:
+  d_model: 2048               # Hidden dimension for ~1B parameters
+  d_prompt: 2048              # Prompt conditioning dimension (same as d_model)
+  num_diffusion_steps: 1000   # Number of diffusion steps T
+  num_denoiser_layers: 24     # Number of Mamba-2 blocks for ~1B parameters
+  d_state: 64                 # SSM state size
+  d_conv: 4                   # Convolution kernel size
+  expand: 2                   # Expansion factor for Mamba
+  conditioning_type: "film"   # 'film' or 'additive'
+  dropout: 0.1
+  use_weight_tying: true      # Tie embedding and output weights
+  use_simple_mamba: false     # Use mamba-ssm (GPU)
+
+# Tokenizer configuration
+tokenizer:
+  type: "bpe"                 # Using BPE for FineWeb
+  vocab_size: 32000           # Standard vocab size for large models
+
+# Data configuration
+data:
+  type: "huggingface"
+  dataset_name: "HuggingFaceFW/fineweb"
+  dataset_config: "sample-10BT"   # 10B token subset (~300GB)
+  batch_size: 8               # Smaller batch for streaming
+  max_length: 512             # Increased for better context
+  num_workers: 4              # Use multiple workers for data loading
+  streaming: true             # Streaming required for 300GB dataset
+
+# Training configuration
+training:
+  learning_rate: 1e-4         # Higher LR for larger model
+  warmup_steps: 2000          # Longer warmup for larger model
+  weight_decay: 0.01
+  ema_decay: 0.9999
+  use_ema: true
+  gradient_clip: 1.0
+  max_steps: 100000           # Train for 100K steps
+  log_interval: 100
+  val_interval: 1000
+
+# GPU/Device configuration
+device:
+  use_gpu: true
+  multi_gpu: false
+  mixed_precision: true       # Use FP16 to save memory
+  benchmark: true
+
+# Inference configuration
+inference:
+  num_steps: 100              # More steps for higher quality
+  temperature: 1.0
+  top_k: null
+  top_p: 0.95
+  use_ddim: false
+  ddim_eta: 0.0
+
+# Checkpoint configuration
+checkpoint:
+  save_dir: "./checkpoints/fineweb_1b"
+  save_interval: 1000         # Save every 1K steps
+  keep_last_k: 5              # Keep more checkpoints for long training

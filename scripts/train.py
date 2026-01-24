@@ -24,12 +24,25 @@ def load_config(config_path: str) -> dict:
 
 
 def create_dataloaders(config: dict, vocab_size: int):
-    """Create training and validation dataloaders."""
+    """Create training and validation dataloaders, handling tokenizers."""
+    from dimba.tokenizers import BPETokenizer, SimpleCharacterTokenizer
+
     data_config = config.get('data', {})
     dataset_type = data_config.get('type', 'dummy')
     batch_size = data_config.get('batch_size', 32)
     num_workers = data_config.get('num_workers', 0)
     max_length = data_config.get('max_length', 256)
+
+    # ----- Tokenizer creation -----
+    tokenizer_cfg = config.get('tokenizer', {})
+    tokenizer_type = tokenizer_cfg.get('type', 'simple')
+    vocab_sz = tokenizer_cfg.get('vocab_size', vocab_size)
+    if tokenizer_type == 'bpe':
+        # Initialize BPE tokenizer (untrained; users can pre‑train separately)
+        tokenizer = BPETokenizer(vocab_size=vocab_sz)
+    else:
+        tokenizer = SimpleCharacterTokenizer(vocab_size=vocab_sz)
+    # --------------------------------
 
     if dataset_type == 'dummy':
         num_examples = data_config.get('num_examples', 1000)
@@ -47,19 +60,24 @@ def create_dataloaders(config: dict, vocab_size: int):
         dataset_name = data_config.get('dataset_name', 'wikitext')
         dataset_config = data_config.get('dataset_config', 'wikitext-2-raw-v1')
         num_examples = data_config.get('num_examples', None)
+        streaming = data_config.get('streaming', False)
 
         try:
             train_dataset = HuggingFaceDataset(
                 dataset_name=dataset_name,
                 split='train',
+                tokenizer=tokenizer,
                 max_length=max_length,
                 num_examples=num_examples,
+                streaming=streaming,
             )
             val_dataset = HuggingFaceDataset(
                 dataset_name=dataset_name,
                 split='validation',
+                tokenizer=tokenizer,
                 max_length=max_length,
                 num_examples=num_examples // 10 if num_examples else None,
+                streaming=streaming,
             )
         except Exception as e:
             print(f"Failed to load HuggingFace dataset: {e}")
@@ -85,7 +103,8 @@ def create_dataloaders(config: dict, vocab_size: int):
         collate_fn=collate_fn,
     )
 
-    return train_loader, val_loader
+    # Return both loader and tokenizer for later saving
+    return train_loader, val_loader, tokenizer
 
 
 def main():
@@ -123,9 +142,10 @@ def main():
 
     # Create dataloaders
     print("\nPreparing data...")
-    train_loader, val_loader = create_dataloaders(config, args.vocab_size)
+    train_loader, val_loader, tokenizer = create_dataloaders(config, args.vocab_size)
     print(f"Train set: {len(train_loader.dataset)} examples")
     print(f"Val set: {len(val_loader.dataset)} examples")
+    print(f"Tokenizer: {type(tokenizer).__name__} (vocab_size={tokenizer.vocab_size})")
 
     # Create Lightning module
     print("\nCreating model...")
@@ -184,6 +204,11 @@ def main():
     print("Training complete!")
     print(f"Best model saved to: {args.checkpoint_dir}")
     print(f"Logs saved to: {args.log_dir}")
+
+    # Save tokenizer
+    tokenizer_path = f"{args.checkpoint_dir}/tokenizer.json"
+    tokenizer.save(tokenizer_path)
+    print(f"Tokenizer saved to: {tokenizer_path}")
 
 
 if __name__ == '__main__':
