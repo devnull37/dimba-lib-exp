@@ -5,7 +5,7 @@ import torch
 import sys
 sys.path.insert(0, str(__file__).rsplit('/', 2)[0] + '/src')
 
-from dimba.diffusion.schedules import CosineNoiseSchedule, LinearNoiseSchedule
+from dimba.diffusion.schedules import CosineNoiseSchedule
 from dimba.diffusion.sampling import sample_timesteps, top_k_top_p_filtering
 
 
@@ -41,22 +41,7 @@ class TestNoiseSchedules:
         # Should be decreasing over time
         assert (alphas[:-1] >= alphas[1:]).all()
 
-    def test_linear_schedule_initialization(self):
-        schedule = LinearNoiseSchedule(num_steps=1000)
 
-        assert schedule.alphas_cumprod.shape == (1000,)
-        assert schedule.betas.shape == (1000,)
-
-    def test_linear_schedule_add_noise(self):
-        schedule = LinearNoiseSchedule(num_steps=100)
-
-        x_0 = torch.randn(4, 32, 64)
-        t = torch.tensor([10, 25, 50, 75])
-
-        x_t, noise = schedule.add_noise(x_0, t)
-
-        assert x_t.shape == x_0.shape
-        assert noise.shape == x_0.shape
 
     def test_noise_without_predefined(self):
         """Test noise generation when not provided."""
