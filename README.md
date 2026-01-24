@@ -1,293 +1,206 @@
-﻿# DIMBA: Diffusion-based Mamba for Non-Autoregressive Text Generation
+# DIMBA: Diffusion-based Mamba for Non-Autoregressive Text Generation
 
-A complete PyTorch implementation of **DIMBA** (Diffusion + Mamba-based Architecture) from the paper "DIMBA: Revolutionizing Theoretical Ultra-Fast Inference and Advanced Reasoning with Mamba-Based Diffusion".
+A PyTorch implementation of **DIMBA** (Diffusion + Mamba-based Architecture) - a non-autoregressive language model combining cosine-scheduled diffusion with Mamba-2 state-space models for parallel text generation.
 
-DIMBA is a non-autoregressive language model that fuses a cosine-scheduled diffusion process with Mamba-2 state-space models to generate entire token sequences in parallel. This offers potential for faster inference compared to autoregressive models while maintaining semantic coherence.
+## Overview
 
-## Features
-
-- ✅ **Complete DIMBA architecture**: Token embeddings, prompt encoder, Mamba-2 denoiser with FiLM/additive conditioning
-- ✅ **Cosine noise schedule**: With zero terminal SNR fix for stable training/inference
-- ✅ **PyTorch Lightning training**: Easy multi-GPU training with EMA support
-- ✅ **Multiple sampling strategies**: Standard denoising + DDIM-style acceleration
-- ✅ **Evaluation metrics**: Perplexity, BLEU, ROUGE, METEOR
-- ✅ **Flexible data pipeline**: Support for dummy data, HuggingFace datasets, and custom text
-- ✅ **Configuration-driven**: YAML-based hyperparameter management
+DIMBA generates entire token sequences in parallel using iterative denoising, enabling controllable speed-quality trade-offs by adjusting diffusion steps T. It leverages Mamba-2's efficient long-range dependency modeling for linear-time sequence processing.
 
 ## Installation
 
 ### Requirements
 - Python 3.9+
-- CUDA 11.6+ (for GPU acceleration, optional)
+- CUDA 11.6+ (optional, for GPU acceleration)
 
-### Quick Install
+### Install
 
 ```bash
-# Clone repository
 git clone https://github.com/devnull37/dimba-lib-exp.git
 cd dimba-lib-exp
 
-# Install in development mode
+# Basic installation (CPU + SimpleMamba fallback)
 pip install -e .
 
-# For GPU support (Linux with CUDA)
+# With GPU support (full Mamba-2)
 pip install -e ".[gpu]"
 
-# For evaluation metrics
-pip install -e ".[eval]"
-
-# For experiment tracking
-pip install -e ".[tracking]"
-
-# For development (includes testing + linting tools)
-pip install -e ".[dev]"
+# Full development setup
+pip install -e ".[all]"
 ```
 
 ## Quick Start
 
-### 1. Basic Training
+### Training
 
 ```bash
-# Train with default config (uses dummy dataset on CPU)
-python scripts/train.py --config config.yaml
-
-# Train with GPU (if available)
+# Train on GPU
 python scripts/train.py --config config.yaml --gpus 1 --max-epochs 10
 
-# Train with custom settings
-python scripts/train.py \
-    --config config.yaml \
-    --vocab-size 10000 \
-    --max-epochs 5 \
-    --gpus 2 \
-    --mixed-precision 16-mixed
+# Train on CPU (uses SimpleMamba)
+python scripts/train.py --config config.yaml
 ```
 
-### 2. Model Training Example (Python)
+### Generation
+
+```bash
+python scripts/generate.py --checkpoint checkpoints/best.pt --prompt "Hello world"
+```
+
+### Evaluation
+
+```bash
+python scripts/evaluate.py --checkpoint checkpoints/best.pt --eval-speed
+```
+
+### Python API
 
 ```python
 import torch
-from torch.utils.data import DataLoader
-from dimba import DIMBA
-from dimba.data import DummyDataset, collate_fn
-from dimba.training import DIMBALightningModule
-import pytorch_lightning as pl
+from dimba import DIMBA, sample_from_model
 
 # Create model
-model = DIMBA(
-    vocab_size=50000,
-    d_model=512,
-    num_diffusion_steps=1000,
-    num_denoiser_layers=6,
-)
-
-# Create dataset
-dataset = DummyDataset(size=1000, vocab_size=50000, seq_length=256)
-dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
-
-# Create Lightning module
-lightning_module = DIMBALightningModule(
-    vocab_size=50000,
-    model_config={'d_model': 512, 'num_denoiser_layers': 6},
-)
-
-# Train
-trainer = pl.Trainer(max_epochs=10, accelerator='auto', devices='auto')
-trainer.fit(lightning_module, dataloader)
-```
-
-### 3. Generation
-
-```python
-from dimba import DIMBA, sample_from_model
-import torch
-
-# Load trained model
-model = DIMBA(vocab_size=50000)
-model.load_state_dict(torch.load('checkpoint.pt'))
+model = DIMBA(vocab_size=50000, d_model=512, num_diffusion_steps=1000)
 
 # Generate text
-prompt_ids = torch.tensor([[10, 20, 30]])  # Example token IDs
-generated = sample_from_model(
-    model,
-    prompt_ids,
-    seq_len=100,
-    num_steps=50,          # Use 50 denoising steps
-    temperature=1.0,
-    top_p=0.95,
-)
-print(f"Generated: {generated.shape}")
+prompt_ids = torch.tensor([[10, 20, 30]])
+generated = sample_from_model(model, prompt_ids, seq_len=100, num_steps=50)
 ```
 
-## Configuration
-
-Edit `config.yaml` to customize model and training parameters:
-
-```yaml
-model:
-  d_model: 512              # Hidden dimension
-  num_diffusion_steps: 1000 # Diffusion steps T
-  num_denoiser_layers: 6    # Mamba-2 blocks
-  conditioning_type: "film" # FiLM or additive conditioning
-
-training:
-  learning_rate: 2e-5
-  warmup_steps: 500
-  ema_decay: 0.9999         # EMA for smoother samples
-
-data:
-  type: "dummy"             # dummy, huggingface, or text
-  batch_size: 32
-  max_length: 256
-```
-
-## Architecture Overview
+## Architecture
 
 ### Core Components
 
-1. **Token Embedding**: Maps discrete tokens to continuous embeddings
-2. **Prompt Encoder**: Encodes prompt context as conditioning information
-3. **Diffusion Schedule**: Cosine-scheduled noise injection (per Nichol & Dhariwal 2021)
-4. **Timestep Embedding**: Sinusoidal embeddings to condition denoiser on noise level
-5. **Mamba-2 Denoiser**: SSM-based denoiser with FiLM/additive conditioning
-6. **Output Head**: Projects denoised embeddings back to token logits
+1. **Token Embeddings**: Learnable embedding matrix mapping tokens to continuous space
+2. **Prompt Encoder**: Lightweight MLP encoding prompt to conditioning vectors
+3. **Cosine Noise Schedule**: Following Nichol & Dhariwal (2021) with formula `ᾱ(t) = cos²((t/T + s)/(1+s)·π/2)`
+4. **Timestep Embeddings**: Sinusoidal encodings with MLP to condition on noise level
+5. **Mamba-2 Denoiser**: Stack of Mamba-2 SSM blocks with FiLM/additive conditioning
+6. **Output Projection**: Linear layer (optionally weight-tied) projecting to token logits
 
 ### Training Procedure
 
 ```
 For each batch:
-  1. Sample random timestep t
-  2. Add noise to clean embeddings: x_t = √ᾱ(t) * x_0 + √(1 - ᾱ(t)) * ε
-  3. Encode prompt to conditioning vector
-  4. Predict clean embeddings using Mamba-2 denoiser
-  5. Compute MSE loss: L = ||x_pred - x_0||²
-  6. Update model + EMA model
+  1. Sample random timestep t ~ Uniform(1, T)
+  2. Add noise: x_t = √ᾱ(t)·x₀ + √(1-ᾱ(t))·ε  where ε ~ N(0,I)
+  3. Encode prompt: C = PromptEncoder(x₀)
+  4. Get timestep embedding: τ = MLP(t)
+  5. Predict: x_pred = Denoiser(x_t, C, τ)
+  6. Compute loss: L = ||x_pred - x₀||²
+  7. Update parameters with AdamW + warmup
 ```
 
 ### Inference Procedure
 
 ```
-1. Encode prompt to conditioning
-2. Initialize with random noise
-3. Iteratively denoise from t=T down to t=0:
-   - For each timestep, predict cleaner version
-   - Add controlled noise for next step
-4. Project final embeddings to token logits
-5. Sample tokens or take argmax
+1. Compute prompt conditioning: C = PromptEncoder(prompt_ids)
+2. Initialize with noise: x_T ~ N(0, I)
+3. Iterative denoising (t = T down to 1):
+   - τ = MLP(t)
+   - x_{t-1} = Denoiser(x_t, C, τ)
+4. Project to logits: logits = Linear(x_0)
+5. Sample tokens with top-k/top-p
 ```
 
-## Evaluation
+## Configuration
 
-### Metrics
+Edit `config.yaml`:
 
-Compute various evaluation metrics:
+```yaml
+model:
+  d_model: 512
+  num_diffusion_steps: 1000  # Controls speed/quality: T=50 for fast, T=1000 for best
+  num_denoiser_layers: 6
+  conditioning_type: "film"  # or "additive"
+  use_simple_mamba: false    # Set true for CPU or if mamba-ssm not installed
 
-```python
-from dimba.evaluation import compute_perplexity, evaluate_generation
+training:
+  learning_rate: 2e-5
+  warmup_steps: 500
+  ema_decay: 0.9999
+  num_epochs: 10
 
-# Perplexity
-ppl = compute_perplexity(logits, targets)
-
-# Multiple metrics
-results = evaluate_generation(
-    predictions=generated_texts,
-    references=reference_texts,
-    compute_bleu=True,
-    compute_rouge=True,
-    compute_meteor=False,  # Requires METEOR
-)
+data:
+  type: "huggingface"  # "dummy", "huggingface", or "text"
+  dataset_name: "wikitext"
+  batch_size: 32
+  max_length: 256
 ```
 
-### Evaluation Script
+## GPU Training
+
+### Setup on Cloud GPU (e.g., TensorDock)
 
 ```bash
-# Evaluate checkpoint
-python scripts/evaluate.py \
-    --checkpoint checkpoints/dimba-best.pt \
-    --vocab-size 50000 \
-    --eval-speed  # Measure inference speed at different step counts
+# On your local machine
+git push origin main
+
+# On cloud GPU
+git clone https://github.com/your-username/dimba-lib-exp.git
+cd dimba-lib-exp
+pip install -e ".[gpu]"
+python scripts/train.py --config config.yaml --gpus 1
 ```
 
-## Performance Characteristics
+### Verify GPU Works
 
-### Speed/Quality Trade-off
+```python
+import torch
+print(torch.cuda.is_available())  # Should be True
+print(torch.cuda.get_device_name(0))  # GPU name
+```
 
-DIMBA allows tuning inference speed via the number of diffusion steps `T`:
+### Performance Tips
 
-- **T=10-25**: Fastest, may have lower quality
-- **T=50-100**: Balanced (recommended)
-- **T=200-500**: Higher quality, slower
-- **T=1000**: Highest quality, slowest (same as training)
-
-### Supported Architectures
-
-- **Model dimension**: 256-1024 (tested)
-- **Sequence length**: 64-1024 tokens
-- **Number of layers**: 4-12 Mamba-2 blocks
-- **State size**: 8-32 SSM state size
-
-## Known Limitations (From Paper)
-
-1. **Training cost**: Diffusion training is computationally expensive
-2. **Discrete-continuous gap**: Token embedding mapping can affect rare words
-3. **Hyperparameter sensitivity**: Performance varies with step count T and other parameters
-4. **Conditioning robustness**: Need empirical validation across diverse prompts
+- Increase batch size on GPU (32 → 64 → 128)
+- Use larger learning rates with GPU
+- Enable mixed precision with `--precision 16-mixed`
+- Use T=50 for fast inference, T=1000 for best quality
 
 ## Project Structure
 
 ```
 dimba-lib-exp/
-├── src/dimba/                    # Main package
-│   ├── models/                   # Model components
-│   │   ├── diffusion.py          # DIMBA wrapper
-│   │   ├── denoiser.py           # Mamba-2 denoiser
-│   │   └── embeddings.py         # Embedding layers
-│   ├── diffusion/                # Diffusion process
-│   │   ├── schedules.py          # Noise schedules
-│   │   └── sampling.py           # Inference sampling
-│   ├── data/                     # Data pipeline
-│   │   └── dataset.py            # Dataset classes
-│   ├── training/                 # Training loop
-│   │   └── trainer.py            # PyTorch Lightning module
-│   └── evaluation/               # Metrics
-│       └── metrics.py            # Evaluation functions
+├── src/dimba/
+│   ├── models/
+│   │   ├── diffusion.py       # DIMBA model wrapper
+│   │   ├── denoiser.py        # Mamba-2 denoiser
+│   │   ├── embeddings.py      # Token, timestep, prompt embeddings
+│   │   └── simple_mamba.py    # CPU fallback implementation
+│   ├── diffusion/
+│   │   ├── schedules.py       # Cosine noise schedule
+│   │   └── sampling.py        # Inference and sampling
+│   ├── data/
+│   │   └── dataset.py         # Dataset loaders
+│   ├── training/
+│   │   └── trainer.py         # PyTorch Lightning training
+│   └── evaluation/
+│       └── metrics.py         # BLEU, ROUGE, METEOR, perplexity
 ├── scripts/
-│   ├── train.py                  # Training entry point
-│   ├── generate.py               # Generation script
-│   └── evaluate.py               # Evaluation script
-├── tests/                        # Unit tests
-├── notebooks/                    # Jupyter notebooks
-├── config.yaml                   # Configuration template
-├── pyproject.toml               # Project metadata
-└── README.md                     # This file
+│   ├── train.py
+│   ├── generate.py
+│   └── evaluate.py
+├── tests/
+├── config.yaml
+├── README.md
+└── AGENTS.md
 ```
 
-## Development
+## Known Limitations
 
-### Running Tests
+1. **Training cost**: Diffusion requires substantial compute
+2. **Discrete-continuous gap**: Embedding mapping affects rare tokens
+3. **Hyperparameter sensitivity**: Performance varies with T, architecture
+4. **Conditioning robustness**: Needs empirical validation across prompts
 
-```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+## Next Steps
 
-# Run tests
-pytest tests/ -v --cov=src/dimba
-
-# Run linting
-black src/ scripts/
-isort src/ scripts/
-flake8 src/ scripts/
-```
-
-### Code Style
-
-- **Formatter**: Black (line length: 100)
-- **Import sorting**: isort
-- **Linter**: flake8
+1. **Train on real data**: Swap DummyDataset for HuggingFace datasets
+2. **Optimize hyperparameters**: Tune d_model, num_layers, T for your task
+3. **Benchmark**: Compare against autoregressive baselines
+4. **Evaluate**: Test on diverse prompts for conditioning robustness
 
 ## Citation
-
-If you use this implementation, please cite the original paper:
 
 ```bibtex
 @article{allafi2025dimba,
@@ -297,21 +210,6 @@ If you use this implementation, please cite the original paper:
 }
 ```
 
-## Acknowledgments
-
-- **Mamba-2**: https://github.com/state-spaces/mamba
-- **Diffusion Models**: Nichol & Dhariwal (2021) "Improved Denoising Diffusion Probabilistic Models"
-- **PyTorch Lightning**: Falcon et al. (2019)
-
 ## License
 
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions are welcome! This is a research implementation, so all suggestions for improvements are appreciated.
-
-For questions or issues:
-- Open an issue on GitHub
-- Check the paper for architectural details (see `paper/main.txt`)
-- Review `CLAUDE.md` for development guidelines 
+MIT License - See LICENSE file for details.
