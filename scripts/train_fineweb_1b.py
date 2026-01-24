@@ -9,7 +9,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # Add src to path
-sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
+script_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.join(script_dir, '..', 'src')
+sys.path.insert(0, os.path.abspath(src_dir))
 
 from dimba import DIMBA
 from dimba.data import HuggingFaceDataset, collate_fn
