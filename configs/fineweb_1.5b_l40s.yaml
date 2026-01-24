@@ -1,11 +1,11 @@
-# DIMBA Model Configuration for FineWeb 1B Parameter Model
+# DIMBA Model Configuration for FineWeb 1.5B Parameter Model (L40S 48GB)
 
 # Model architecture parameters
 model:
-  d_model: 2048               # Hidden dimension for ~1B parameters
-  d_prompt: 2048              # Prompt conditioning dimension (same as d_model)
+  d_model: 2560               # Hidden dimension for ~1.5B parameters
+  d_prompt: 2560              # Prompt conditioning dimension (same as d_model)
   num_diffusion_steps: 1000   # Number of diffusion steps T
-  num_denoiser_layers: 24     # Number of Mamba-2 blocks for ~1B parameters
+  num_denoiser_layers: 28     # Number of Mamba-2 blocks for ~1.5B parameters
   d_state: 64                 # SSM state size
   d_conv: 4                   # Convolution kernel size
   expand: 2                   # Expansion factor for Mamba
@@ -23,11 +23,11 @@ tokenizer:
 data:
   type: "huggingface"
   dataset_name: "HuggingFaceFW/fineweb"
-  dataset_config: "sample-10BT"   # 10B token subset (~300GB)
-  batch_size: 8               # Smaller batch for streaming
-  max_length: 512             # Increased for better context
-  num_workers: 4              # Use multiple workers for data loading
-  streaming: true             # Streaming required for 300GB dataset
+  dataset_config: "sample-10BT"   # 10B token subset (~30GB)
+  batch_size: 32              # Larger batch for L40S 48GB
+  max_length: 1024            # Longer context for better quality
+  num_workers: 8              # More workers for faster data loading
+  streaming: false            # No streaming needed for 30GB dataset
 
 # Training configuration
 training:

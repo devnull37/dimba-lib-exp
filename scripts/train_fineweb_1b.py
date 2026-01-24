@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Training script for DIMBA 1B model on FineWeb dataset."""
+"""Training script for DIMBA 1.5B model on FineWeb dataset (L40S 48GB)."""
 
 import os
 import sys
@@ -19,16 +19,16 @@ from dimba.training import DIMBALightningModule
 
 def main():
     print("=" * 60)
-    print("DIMBA 1B Model Training on FineWeb")
+    print("DIMBA 1.5B Model Training on FineWeb (L40S 48GB)")
     print("=" * 60)
     
-    # Configuration
+    # Configuration for L40S 48GB
     config = {
         'model': {
-            'd_model': 2048,
-            'd_prompt': 2048,
+            'd_model': 2560,
+            'd_prompt': 2560,
             'num_diffusion_steps': 1000,
-            'num_denoiser_layers': 24,
+            'num_denoiser_layers': 28,
             'd_state': 64,
             'd_conv': 4,
             'expand': 2,
@@ -41,10 +41,10 @@ def main():
             'type': 'huggingface',
             'dataset_name': 'HuggingFaceFW/fineweb',
             'dataset_config': 'sample-10BT',
-            'batch_size': 8,
-            'max_length': 512,
-            'num_workers': 4,
-            'streaming': True,
+            'batch_size': 32,
+            'max_length': 1024,
+            'num_workers': 8,
+            'streaming': False,
         },
         'training': {
             'learning_rate': 1e-4,
