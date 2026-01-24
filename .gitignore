@@ -141,7 +141,7 @@ wandb/
 .wandb/
 
 # Data
-data/
+/data/
 *.csv
 *.json
 *.txt.bak
