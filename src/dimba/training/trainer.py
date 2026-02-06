@@ -117,13 +117,16 @@ class DIMBALightningModule(pl.LightningModule):
         t = sample_timesteps(batch_size, self.model.num_diffusion_steps, self.device)
 
         # Forward pass
-        x_pred, noise = self.model(input_ids, t)
+        x_pred, noise, latent_info = self.model(input_ids, t)
 
         # Get clean embeddings
         x_0 = self.model.token_embed(input_ids)
 
-        # Compute loss (predict clean embeddings)
-        loss = self.loss_fn(x_pred, x_0)
+        # Compute loss (predict clean embeddings or latent targets)
+        loss = self.loss_fn(x_pred, x_0) * self.model.recon_loss_weight
+        if self.model.latent_diffusion and latent_info is not None:
+            latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
+            loss = loss + latent_loss * self.model.latent_loss_weight
 
         # Update EMA
         if self.use_ema:
@@ -150,7 +153,7 @@ class DIMBALightningModule(pl.LightningModule):
         model = self.ema_model if self.use_ema else self.model
 
         # Forward pass
-        x_pred, _ = model(input_ids, t)
+        x_pred, _, _ = model(input_ids, t)
         x_0 = model.token_embed(input_ids)
 
         # Compute loss
@@ -169,7 +172,7 @@ class DIMBALightningModule(pl.LightningModule):
         losses = []
         for t_val in [100, 500, 900]:
             t = torch.full((batch_size,), min(t_val, self.model.num_diffusion_steps - 1), device=self.device)
-            x_pred, _ = self.model(input_ids, t)
+            x_pred, _, _ = self.model(input_ids, t)
             x_0 = self.model.token_embed(input_ids)
             loss = self.loss_fn(x_pred, x_0)
             losses.append(loss)
@@ -279,7 +282,7 @@ class SimpleTrainer:
                 batch_size = input_ids.shape[0]
                 t = sample_timesteps(batch_size, self.model.num_diffusion_steps, torch.device(self.device))
 
-                x_pred, _ = self.model(input_ids, t)
+                x_pred, _, _ = self.model(input_ids, t)
                 x_0 = self.model.token_embed(input_ids)
 
                 loss = self.loss_fn(x_pred, x_0)
@@ -322,7 +325,7 @@ class SimpleTrainer:
                 batch_size = input_ids.shape[0]
                 t = torch.full((batch_size,), self.model.num_diffusion_steps // 2, device=self.device)
 
-                x_pred, _ = self.model(input_ids, t)
+                x_pred, _, _ = self.model(input_ids, t)
                 x_0 = self.model.token_embed(input_ids)
 
                 loss = self.loss_fn(x_pred, x_0)

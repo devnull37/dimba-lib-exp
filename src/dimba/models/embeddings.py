@@ -103,6 +103,87 @@ class TimestepEmbedding(nn.Module):
         return embeddings
 
 
+class LatentProjector(nn.Module):
+    """Project token embeddings into a latent diffusion subspace and back.
+
+    Args:
+        input_dim: Input embedding dimension
+        latent_dim: Latent diffusion dimension
+        hidden_dim: Hidden dimension for MLP layers
+        num_layers: Number of layers in encoder/decoder
+        dropout: Dropout rate
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int,
+        hidden_dim: Optional[int] = None,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim or max(input_dim, latent_dim)
+        self.num_layers = num_layers
+
+        self.encoder = self._build_mlp(
+            input_dim=input_dim,
+            output_dim=latent_dim,
+            hidden_dim=self.hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.decoder = self._build_mlp(
+            input_dim=latent_dim,
+            output_dim=input_dim,
+            hidden_dim=self.hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
+    @staticmethod
+    def _build_mlp(
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        dropout: float,
+    ) -> nn.Sequential:
+        layers = []
+        for i in range(num_layers):
+            in_features = input_dim if i == 0 else hidden_dim
+            out_features = output_dim if i == num_layers - 1 else hidden_dim
+            layers.append(nn.Linear(in_features, out_features))
+            if i < num_layers - 1:
+                layers.append(nn.GELU())
+                layers.append(nn.Dropout(dropout))
+        return nn.Sequential(*layers)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode embeddings into latent space.
+
+        Args:
+            x: Embeddings [batch_size, seq_len, input_dim]
+
+        Returns:
+            latent: [batch_size, seq_len, latent_dim]
+        """
+        return self.encoder(x)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latent representations back to embedding space.
+
+        Args:
+            z: Latent embeddings [batch_size, seq_len, latent_dim]
+
+        Returns:
+            embeddings: [batch_size, seq_len, input_dim]
+        """
+        return self.decoder(z)
+
+
 class PromptEncoder(nn.Module):
     """Lightweight MLP-based prompt encoder.
 
