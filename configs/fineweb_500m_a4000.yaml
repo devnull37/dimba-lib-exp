@@ -22,7 +22,10 @@ tokenizer:
 data:
   type: "huggingface"
   dataset_name: "HuggingFaceFW/fineweb"
-  dataset_config: "sample-10BT"
+  dataset_config: "sample-10BT"  # ~30GB subset (fits comfortably within 150GB disk)
+  train_split: "train"
+  val_split: "validation"
+  val_fallback_split: "train"
   max_length: 512
   batch_size: 2
   num_workers: 4

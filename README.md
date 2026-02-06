@@ -229,6 +229,15 @@ bash install_a4000.sh
 python scripts/train_fineweb_500m_a4000.py --config configs/fineweb_500m_a4000.yaml
 ```
 
+Optional: auto-upload to Hugging Face when training finishes:
+
+```bash
+export HF_TOKEN=hf_xxx
+python scripts/train_fineweb_500m_a4000.py \
+  --config configs/fineweb_500m_a4000.yaml \
+  --repo-id your-username/dimba-500m-fineweb-a4000
+```
+
 Notes for 16GB VRAM:
 - Uses `batch_size=2` with `accumulate_grad_batches=16` (effective batch size 32)
 - Uses mixed precision (`16-mixed`) on CUDA

@@ -27,10 +27,33 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def upload_artifacts_to_hf(save_dir: str, repo_id: str, token: str, private: bool = False) -> None:
+    """Upload training artifacts to a Hugging Face model repo."""
+    try:
+        from huggingface_hub import HfApi, upload_folder
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required for upload. Install with: pip install huggingface_hub"
+        ) from exc
+
+    api = HfApi(token=token)
+    api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+    upload_folder(
+        repo_id=repo_id,
+        folder_path=save_dir,
+        repo_type="model",
+        token=token,
+        commit_message="Upload DIMBA 500M A4000 FineWeb checkpoint and tokenizer",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train DIMBA 500M profile on FineWeb (A4000 16GB)")
     parser.add_argument("--config", default="configs/fineweb_500m_a4000.yaml", help="YAML config path")
     parser.add_argument("--hf-token", default=None, help="Optional HF token for dataset access")
+    parser.add_argument("--repo-id", default=None, help="Optional HF repo id for auto-upload after training")
+    parser.add_argument("--upload-private", action="store_true", help="Create private HF model repo on auto-upload")
+    parser.add_argument("--upload-token", default=None, help="HF token for upload (defaults to HF_TOKEN env var)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -52,20 +75,45 @@ def main() -> None:
     tokenizer = BPETokenizer(vocab_size=cfg["tokenizer"]["vocab_size"])
 
     data_cfg = cfg["data"]
+    train_split = data_cfg.get("train_split", "train")
+    val_split = data_cfg.get("val_split", "validation")
+    val_fallback_split = data_cfg.get("val_fallback_split", "train")
+
     train_dataset = HuggingFaceDataset(
         dataset_name=data_cfg["dataset_name"],
-        split="train",
+        dataset_config=data_cfg.get("dataset_config"),
+        split=train_split,
         tokenizer=tokenizer,
         max_length=data_cfg["max_length"],
         streaming=data_cfg.get("streaming", False),
     )
-    val_dataset = HuggingFaceDataset(
-        dataset_name=data_cfg["dataset_name"],
-        split="validation",
-        tokenizer=tokenizer,
-        max_length=data_cfg["max_length"],
-        streaming=data_cfg.get("streaming", False),
-    )
+
+    try:
+        val_dataset = HuggingFaceDataset(
+            dataset_name=data_cfg["dataset_name"],
+            dataset_config=data_cfg.get("dataset_config"),
+            split=val_split,
+            tokenizer=tokenizer,
+            max_length=data_cfg["max_length"],
+            streaming=data_cfg.get("streaming", False),
+        )
+    except ValueError as exc:
+        # FineWeb and some other datasets expose only a train split.
+        if val_split != val_fallback_split:
+            print(
+                f"WARNING: Could not load validation split '{val_split}' ({exc}). "
+                f"Falling back to split '{val_fallback_split}' for validation."
+            )
+            val_dataset = HuggingFaceDataset(
+                dataset_name=data_cfg["dataset_name"],
+                dataset_config=data_cfg.get("dataset_config"),
+                split=val_fallback_split,
+                tokenizer=tokenizer,
+                max_length=data_cfg["max_length"],
+                streaming=data_cfg.get("streaming", False),
+            )
+        else:
+            raise
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -130,6 +178,20 @@ def main() -> None:
     print("Training complete.")
     print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
     print(f"Artifacts saved under: {save_dir}")
+
+    if args.repo_id:
+        upload_token = args.upload_token or os.getenv("HF_TOKEN")
+        if not upload_token:
+            raise ValueError("--repo-id was provided but no upload token found. Use --upload-token or set HF_TOKEN.")
+
+        print(f"Uploading artifacts to https://huggingface.co/{args.repo_id} ...")
+        upload_artifacts_to_hf(
+            save_dir=save_dir,
+            repo_id=args.repo_id,
+            token=upload_token,
+            private=args.upload_private,
+        )
+        print(f"Upload complete: https://huggingface.co/{args.repo_id}")
 
 
 if __name__ == "__main__":
