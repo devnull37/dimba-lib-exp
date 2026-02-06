@@ -257,7 +257,7 @@ def compute_model_perplexity(
             t = sample_timesteps(batch_size, model.num_diffusion_steps, torch.device(device))
 
             # Forward pass
-            x_pred, _ = model(input_ids, t)
+            x_pred, _, _ = model(input_ids, t, return_latent_info=False)
 
             # Get clean embeddings
             x_0 = model.token_embed(input_ids)

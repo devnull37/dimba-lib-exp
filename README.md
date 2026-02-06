@@ -113,6 +113,11 @@ model:
   num_denoiser_layers: 6
   conditioning_type: "film"  # or "additive"
   use_simple_mamba: false    # Set true for CPU or if mamba-ssm not installed
+  latent_diffusion: false    # Enable latent-space diffusion (keeps original by default)
+  d_latent: null             # Latent dimension (defaults to d_model // 2)
+  latent_projector_depth: 2  # Encoder/decoder MLP depth
+  latent_loss_weight: 1.0    # Weight for latent MSE loss
+  recon_loss_weight: 1.0     # Weight for reconstruction MSE loss
 
 training:
   learning_rate: 2e-5
@@ -198,6 +203,14 @@ dimba-lib-exp/
 1. **Train on real data**: Swap DummyDataset for HuggingFace datasets
 2. **Optimize hyperparameters**: Tune d_model, num_layers, T for your task
 3. **Benchmark**: Compare against autoregressive baselines
+
+## Latent Diffusion Mode
+
+DIMBA defaults to the original embedding-space diffusion. When `latent_diffusion` is enabled, the
+model learns a compact latent representation via an MLP projector and performs denoising in that
+subspace before decoding back to the embedding space. This keeps the original diffusion method
+available by toggling the flag off, while allowing experimentation with lower-dimensional latents
+when enabled. Tune `d_latent` and loss weights to balance efficiency and reconstruction quality.
 4. **Evaluate**: Test on diverse prompts for conditioning robustness
 
 ## Citation

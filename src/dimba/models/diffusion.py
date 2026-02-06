@@ -5,7 +5,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 
 from ..diffusion.schedules import CosineNoiseSchedule
-from .embeddings import TokenEmbedding, TimestepEmbedding, PromptEncoder
+from .embeddings import TokenEmbedding, TimestepEmbedding, PromptEncoder, LatentProjector
 from .denoiser import Mamba2Denoiser, DenoisingHead
 
 
@@ -44,6 +44,11 @@ class DIMBA(nn.Module):
         use_weight_tying: bool = False,
         padding_idx: Optional[int] = None,
         use_simple_mamba: bool = False,
+        latent_diffusion: bool = False,
+        d_latent: Optional[int] = None,
+        latent_projector_depth: int = 2,
+        latent_loss_weight: float = 1.0,
+        recon_loss_weight: float = 1.0,
     ):
         super().__init__()
 
@@ -52,6 +57,16 @@ class DIMBA(nn.Module):
         self.d_prompt = d_prompt
         self.num_diffusion_steps = num_diffusion_steps
         self.use_weight_tying = use_weight_tying
+        self.latent_diffusion = latent_diffusion
+        self.latent_loss_weight = latent_loss_weight
+        self.recon_loss_weight = recon_loss_weight
+
+        if self.latent_diffusion:
+            if d_latent is None:
+                d_latent = max(1, d_model // 2)
+            self.d_latent = d_latent
+        else:
+            self.d_latent = d_model
 
         # Token embeddings
         self.token_embed = TokenEmbedding(vocab_size, d_model, padding_idx=padding_idx)
@@ -65,6 +80,20 @@ class DIMBA(nn.Module):
             dropout=dropout,
         )
 
+        # Latent projector
+        self.latent_projector = None
+        self.cond_projector = None
+        if self.latent_diffusion:
+            self.latent_projector = LatentProjector(
+                input_dim=d_model,
+                latent_dim=self.d_latent,
+                hidden_dim=max(d_model, self.d_latent),
+                num_layers=latent_projector_depth,
+                dropout=dropout,
+            )
+            if d_prompt != self.d_latent:
+                self.cond_projector = nn.Linear(d_prompt, self.d_latent)
+
         # Timestep embeddings
         self.timestep_embed = TimestepEmbedding(time_embed_dim=128, out_dim=512)
 
@@ -73,13 +102,13 @@ class DIMBA(nn.Module):
 
         # Mamba-2 denoiser
         self.denoiser = Mamba2Denoiser(
-            d_model=d_model,
+            d_model=self.d_latent,
             num_layers=num_denoiser_layers,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
             conditioning_type=conditioning_type,
-            cond_dim=d_prompt,
+            cond_dim=self.d_latent if self.latent_diffusion else d_prompt,
             time_embed_dim=512,
             dropout=dropout,
             use_simple_mamba=use_simple_mamba,
@@ -117,12 +146,31 @@ class DIMBA(nn.Module):
 
         return conditioning
 
+    def project_conditioning(self, conditioning: torch.Tensor) -> torch.Tensor:
+        """Project conditioning to latent space if needed."""
+        if self.cond_projector is None:
+            return conditioning
+        return self.cond_projector(conditioning)
+
+    def encode_latent(self, x_0: torch.Tensor) -> torch.Tensor:
+        """Encode embeddings into latent diffusion space."""
+        if self.latent_projector is None:
+            return x_0
+        return self.latent_projector.encode(x_0)
+
+    def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latent diffusion states back to embedding space."""
+        if self.latent_projector is None:
+            return z
+        return self.latent_projector.decode(z)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         t: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_latent_info: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
         """Forward pass during training.
 
         Adds noise to input at timestep t and predicts clean embeddings.
@@ -138,20 +186,30 @@ class DIMBA(nn.Module):
         """
         # Get clean embeddings
         x_0 = self.token_embed(input_ids)  # [batch_size, seq_len, d_model]
+        z_0 = self.encode_latent(x_0)  # [batch_size, seq_len, d_latent]
 
         # Add noise according to schedule
-        x_t, noise = self.noise_schedule.add_noise(x_0, t, noise)
+        x_t, noise = self.noise_schedule.add_noise(z_0, t, noise)
 
         # Encode prompt from same input (in practice, could be different)
         cond = self.encode_prompt(input_ids)  # [batch_size, seq_len, d_prompt]
+        cond = self.project_conditioning(cond)
 
         # Get timestep embeddings
         time_emb = self.timestep_embed(t)  # [batch_size, 512]
 
         # Denoise
-        x_pred = self.denoiser(x_t, cond, time_emb)  # [batch_size, seq_len, d_model]
+        z_pred = self.denoiser(x_t, cond, time_emb)  # [batch_size, seq_len, d_latent]
+        x_pred = self.decode_latent(z_pred)
 
-        return x_pred, noise
+        if not return_latent_info:
+            return x_pred, noise, None
+
+        latent_info = None
+        if self.latent_diffusion:
+            latent_info = {"z_pred": z_pred, "z_0": z_0}
+
+        return x_pred, noise, latent_info
 
     def denoise_step(
         self,
