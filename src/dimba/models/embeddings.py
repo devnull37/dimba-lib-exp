@@ -58,7 +58,8 @@ class TimestepEmbedding(nn.Module):
         self.time_embed_dim = time_embed_dim
 
         # Sinusoidal position encoding
-        self.position_encoding = self._create_position_encoding()
+        pe = self._create_position_encoding()
+        self.register_buffer("position_encoding", pe)
 
         # MLP to project to desired dimension
         self.mlp = nn.Sequential(
@@ -94,7 +95,7 @@ class TimestepEmbedding(nn.Module):
             embeddings: [batch_size, out_dim]
         """
         # Get sinusoidal encodings
-        pe = self.position_encoding[t].to(t.device)  # [batch_size, time_embed_dim]
+        pe = self.position_encoding[t]  # [batch_size, time_embed_dim]
 
         # Project through MLP
         embeddings = self.mlp(pe)  # [batch_size, out_dim]
