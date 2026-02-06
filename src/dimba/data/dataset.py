@@ -79,6 +79,7 @@ class HuggingFaceDataset(Dataset):
     def __init__(
         self,
         dataset_name: str,
+        dataset_config: Optional[str] = None,
         split: str = "train",
         tokenizer=None,
         max_length: int = 256,
@@ -87,6 +88,7 @@ class HuggingFaceDataset(Dataset):
         streaming: bool = False,
     ):
         self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
         self.split = split
         self.max_length = max_length
         self.tokenizer = tokenizer
@@ -95,7 +97,12 @@ class HuggingFaceDataset(Dataset):
 
         # Load dataset
         try:
-            self.dataset = load_dataset(dataset_name, split=split, streaming=streaming)
+            self.dataset = load_dataset(
+                dataset_name,
+                name=dataset_config,
+                split=split,
+                streaming=streaming,
+            )
         except Exception as e:
             raise ValueError(f"Failed to load dataset {dataset_name}: {e}")
 
