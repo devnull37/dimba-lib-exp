@@ -54,9 +54,10 @@ def sample_from_model(
             cond = torch.cat([prompt_cond, padding], dim=1)
         else:
             cond = prompt_cond[:, :seq_len, :]
+        cond = model.project_conditioning(cond)
 
         # Initialize with noise
-        x_t = torch.randn(batch_size, seq_len, model.d_model, device=device)
+        x_t = torch.randn(batch_size, seq_len, model.d_latent, device=device)
 
         # Get noise schedule
         noise_schedule = model.get_noise_schedule()
@@ -91,6 +92,7 @@ def sample_from_model(
                 x_t = x_pred
 
         # Project to logits and sample
+        x_t = model.decode_latent(x_t)
         logits = model.output_head(x_t)  # [batch_size, seq_len, vocab_size]
 
         # Apply temperature
@@ -222,9 +224,10 @@ class DDIMSampler:
                 cond = torch.cat([prompt_cond, padding], dim=1)
             else:
                 cond = prompt_cond[:, :seq_len, :]
+            cond = self.model.project_conditioning(cond)
 
             # Initialize with noise
-            x_t = torch.randn(batch_size, seq_len, self.model.d_model, device=self.device)
+            x_t = torch.randn(batch_size, seq_len, self.model.d_latent, device=self.device)
 
             # Get noise schedule
             alphas = self.model.get_alphas_cumprod().to(self.device)
@@ -256,6 +259,7 @@ class DDIMSampler:
                     x_t = x_pred
 
             # Project to logits and sample
+            x_t = self.model.decode_latent(x_t)
             logits = self.model.output_head(x_t) / temperature
             probs = F.softmax(logits, dim=-1)
             generated_ids = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1)

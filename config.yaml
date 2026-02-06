@@ -13,6 +13,11 @@ model:
   dropout: 0.1
   use_weight_tying: false   # Tie embedding and output weights
   use_simple_mamba: false   # Set to true to force SimpleMamba2 (CPU), false for mamba-ssm (GPU)
+  latent_diffusion: false   # Enable diffusion in a latent subspace
+  d_latent: null            # Latent dimension (defaults to d_model // 2)
+  latent_projector_depth: 2 # MLP depth for latent encode/decode
+  latent_loss_weight: 1.0   # Weight for latent-space MSE loss
+  recon_loss_weight: 1.0    # Weight for reconstruction MSE loss
 
 # Tokenizer configuration
 tokenizer:
