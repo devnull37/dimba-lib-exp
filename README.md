@@ -213,3 +213,46 @@ dimba-lib-exp/
 ## License
 
 MIT License - See LICENSE file for details.
+## RTX A4000 (16GB) recipe: FineWeb + FiLM + embedding diffusion (~500M)
+
+This profile matches your requested setup: **single RTX A4000 16GB**, **embedding diffusion**, **FiLM conditioning**, and a **~500M parameter target**.
+
+### 1) Instance setup (A4000 specific)
+
+```bash
+bash install_a4000.sh
+```
+
+### 2) Train the 500M profile
+
+```bash
+python scripts/train_fineweb_500m_a4000.py --config configs/fineweb_500m_a4000.yaml
+```
+
+Notes for 16GB VRAM:
+- Uses `batch_size=2` with `accumulate_grad_batches=16` (effective batch size 32)
+- Uses mixed precision (`16-mixed`) on CUDA
+- Uses sequence length 512 to fit A4000 memory more reliably
+
+### 3) Upload to Hugging Face when finished
+
+```bash
+export HF_TOKEN=hf_xxx
+python scripts/upload_to_hf.py \
+  --repo-id your-username/dimba-500m-fineweb-a4000 \
+  --artifacts-dir ./checkpoints/fineweb_500m_a4000
+```
+
+Optional private repo:
+
+```bash
+python scripts/upload_to_hf.py \
+  --repo-id your-username/dimba-500m-fineweb-a4000 \
+  --artifacts-dir ./checkpoints/fineweb_500m_a4000 \
+  --private
+```
+
+Expected artifacts in `./checkpoints/fineweb_500m_a4000`:
+- `last.ckpt` and top-k validation checkpoints
+- `tokenizer.json`
+- `train_config.yaml`

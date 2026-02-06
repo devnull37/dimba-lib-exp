@@ -1,0 +1,44 @@
+# DIMBA configuration tuned for NVIDIA RTX A4000 (16GB)
+
+model:
+  # ~500M target (exact count depends on tokenizer, mamba implementation, and tied weights)
+  d_model: 1536
+  d_prompt: 1536
+  num_diffusion_steps: 128
+  num_denoiser_layers: 16
+  d_state: 64
+  d_conv: 4
+  expand: 2
+  conditioning_type: "film"
+  dropout: 0.1
+  use_weight_tying: true
+  use_simple_mamba: false
+  latent_diffusion: false
+
+tokenizer:
+  type: "bpe"
+  vocab_size: 32000
+
+data:
+  type: "huggingface"
+  dataset_name: "HuggingFaceFW/fineweb"
+  dataset_config: "sample-10BT"
+  max_length: 512
+  batch_size: 2
+  num_workers: 4
+  streaming: true
+
+training:
+  learning_rate: 1e-4
+  warmup_steps: 2000
+  ema_decay: 0.9999
+  use_ema: true
+  gradient_clip: 1.0
+  max_steps: 200000
+  log_interval: 50
+  val_interval: 500
+  accumulate_grad_batches: 16
+
+checkpoint:
+  save_dir: "./checkpoints/fineweb_500m_a4000"
+  save_top_k: 3
