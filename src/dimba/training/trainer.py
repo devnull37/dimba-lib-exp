@@ -25,7 +25,7 @@ class DIMBALightningModule(pl.LightningModule):
         weight_decay: Weight decay for optimizer (default: 0.01)
         ema_decay: Exponential moving average decay (default: 0.9999)
         use_ema: Whether to use EMA (default: True)
-        ema_device: Device to store EMA weights (default: "cpu")
+        ema_device: Optional device to store EMA weights; None keeps default Lightning placement
         ema_update_interval: Update EMA every N steps (default: 1)
     """
 
@@ -38,7 +38,7 @@ class DIMBALightningModule(pl.LightningModule):
         weight_decay: float = 0.01,
         ema_decay: float = 0.9999,
         use_ema: bool = True,
-        ema_device: str = "cpu",
+        ema_device: Optional[str] = None,
         ema_update_interval: int = 1,
     ):
         super().__init__()
@@ -51,7 +51,7 @@ class DIMBALightningModule(pl.LightningModule):
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.ema_update_interval = max(1, int(ema_update_interval))
-        self.ema_device = torch.device(ema_device)
+        self.ema_device = torch.device(ema_device) if ema_device is not None else None
 
         # Build model
         self.model = DIMBA(vocab_size=vocab_size, **model_config)
@@ -59,8 +59,9 @@ class DIMBALightningModule(pl.LightningModule):
         # EMA model
         if use_ema:
             self.ema_model = DIMBA(vocab_size=vocab_size, **model_config)
-            # Keep EMA weights off-GPU when configured to avoid doubling GPU memory.
-            self.ema_model.to(self.ema_device)
+            # Keep EMA weights off-GPU only when explicitly configured via ema_device.
+            if self.ema_device is not None:
+                self.ema_model.to(self.ema_device)
             self.ema_model.requires_grad_(False)
             self.ema_model.eval()
             self._update_ema_model_once()
@@ -79,7 +80,7 @@ class DIMBALightningModule(pl.LightningModule):
             self.model.parameters()
         ):
             ema_param.data.copy_(
-                param.detach().to(device=self.ema_device, dtype=ema_param.dtype)
+                param.detach().to(device=(self.ema_device or ema_param.device), dtype=ema_param.dtype)
             )
 
     def _update_ema_model(self):
@@ -89,8 +90,11 @@ class DIMBALightningModule(pl.LightningModule):
                 self.ema_model.parameters(),
                 self.model.parameters()
             ):
-                param_cpu = param.detach().to(device=self.ema_device, dtype=ema_param.dtype)
-                ema_param.data.mul_(self.ema_decay).add_(param_cpu, alpha=(1 - self.ema_decay))
+                param_on_ema_device = param.detach().to(
+                    device=(self.ema_device or ema_param.device),
+                    dtype=ema_param.dtype,
+                )
+                ema_param.data.mul_(self.ema_decay).add_(param_on_ema_device, alpha=(1 - self.ema_decay))
 
     def configure_optimizers(self):
         """Configure optimizer and scheduler."""
@@ -157,7 +161,7 @@ class DIMBALightningModule(pl.LightningModule):
 
     def on_fit_start(self):
         """Ensure EMA stays on the configured device after Lightning device placement."""
-        if self.use_ema:
+        if self.use_ema and self.ema_device is not None:
             self.ema_model.to(self.ema_device)
 
     def validation_step(self, batch, batch_idx):
