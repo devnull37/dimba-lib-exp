@@ -138,6 +138,8 @@ def main() -> None:
         warmup_steps=int(train_cfg["warmup_steps"]),
         ema_decay=float(train_cfg["ema_decay"]),
         use_ema=bool(train_cfg["use_ema"]),
+        ema_device=str(train_cfg.get("ema_device", "cpu")),
+        ema_update_interval=int(train_cfg.get("ema_update_interval", 1)),
     )
 
     total_params = sum(p.numel() for p in lightning_module.model.parameters())

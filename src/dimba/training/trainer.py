@@ -25,6 +25,8 @@ class DIMBALightningModule(pl.LightningModule):
         weight_decay: Weight decay for optimizer (default: 0.01)
         ema_decay: Exponential moving average decay (default: 0.9999)
         use_ema: Whether to use EMA (default: True)
+        ema_device: Device to store EMA weights (default: "cpu")
+        ema_update_interval: Update EMA every N steps (default: 1)
     """
 
     def __init__(
@@ -36,6 +38,8 @@ class DIMBALightningModule(pl.LightningModule):
         weight_decay: float = 0.01,
         ema_decay: float = 0.9999,
         use_ema: bool = True,
+        ema_device: str = "cpu",
+        ema_update_interval: int = 1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -46,7 +50,8 @@ class DIMBALightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.use_ema = use_ema
         self.ema_decay = ema_decay
-        self.ema_device = torch.device("cpu")
+        self.ema_update_interval = max(1, int(ema_update_interval))
+        self.ema_device = torch.device(ema_device)
 
         # Build model
         self.model = DIMBA(vocab_size=vocab_size, **model_config)
@@ -54,7 +59,7 @@ class DIMBALightningModule(pl.LightningModule):
         # EMA model
         if use_ema:
             self.ema_model = DIMBA(vocab_size=vocab_size, **model_config)
-            # Keep EMA weights on CPU to avoid doubling GPU memory for large models.
+            # Keep EMA weights off-GPU when configured to avoid doubling GPU memory.
             self.ema_model.to(self.ema_device)
             self.ema_model.requires_grad_(False)
             self.ema_model.eval()
@@ -136,8 +141,8 @@ class DIMBALightningModule(pl.LightningModule):
             latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
             loss = loss + latent_loss * self.model.latent_loss_weight
 
-        # Update EMA
-        if self.use_ema:
+        # Update EMA periodically to reduce transfer overhead for CPU-offloaded EMA.
+        if self.use_ema and (self.global_step + 1) % self.ema_update_interval == 0:
             self._update_ema_model()
 
         # Logging
@@ -148,6 +153,12 @@ class DIMBALightningModule(pl.LightningModule):
         self.num_training_steps += 1
 
         return loss
+
+
+    def on_fit_start(self):
+        """Ensure EMA stays on the configured device after Lightning device placement."""
+        if self.use_ema:
+            self.ema_model.to(self.ema_device)
 
     def validation_step(self, batch, batch_idx):
         """Validation step."""
