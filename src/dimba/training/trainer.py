@@ -25,6 +25,8 @@ class DIMBALightningModule(pl.LightningModule):
         weight_decay: Weight decay for optimizer (default: 0.01)
         ema_decay: Exponential moving average decay (default: 0.9999)
         use_ema: Whether to use EMA (default: True)
+        ema_device: Optional device to store EMA weights; None keeps default Lightning placement
+        ema_update_interval: Update EMA every N steps (default: 1)
     """
 
     def __init__(
@@ -36,6 +38,8 @@ class DIMBALightningModule(pl.LightningModule):
         weight_decay: float = 0.01,
         ema_decay: float = 0.9999,
         use_ema: bool = True,
+        ema_device: Optional[str] = None,
+        ema_update_interval: int = 1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -46,6 +50,8 @@ class DIMBALightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.use_ema = use_ema
         self.ema_decay = ema_decay
+        self.ema_update_interval = max(1, int(ema_update_interval))
+        self.ema_device = torch.device(ema_device) if ema_device is not None else None
 
         # Build model
         self.model = DIMBA(vocab_size=vocab_size, **model_config)
@@ -53,6 +59,11 @@ class DIMBALightningModule(pl.LightningModule):
         # EMA model
         if use_ema:
             self.ema_model = DIMBA(vocab_size=vocab_size, **model_config)
+            # Keep EMA weights off-GPU only when explicitly configured via ema_device.
+            if self.ema_device is not None:
+                self.ema_model.to(self.ema_device)
+            self.ema_model.requires_grad_(False)
+            self.ema_model.eval()
             self._update_ema_model_once()
 
         # Loss function
@@ -68,7 +79,9 @@ class DIMBALightningModule(pl.LightningModule):
             self.ema_model.parameters(),
             self.model.parameters()
         ):
-            ema_param.data.copy_(param.data)
+            ema_param.data.copy_(
+                param.detach().to(device=(self.ema_device or ema_param.device), dtype=ema_param.dtype)
+            )
 
     def _update_ema_model(self):
         """Update EMA model parameters."""
@@ -77,7 +90,11 @@ class DIMBALightningModule(pl.LightningModule):
                 self.ema_model.parameters(),
                 self.model.parameters()
             ):
-                ema_param.data = ema_param.data * self.ema_decay + param.data * (1 - self.ema_decay)
+                param_on_ema_device = param.detach().to(
+                    device=(self.ema_device or ema_param.device),
+                    dtype=ema_param.dtype,
+                )
+                ema_param.data.mul_(self.ema_decay).add_(param_on_ema_device, alpha=(1 - self.ema_decay))
 
     def configure_optimizers(self):
         """Configure optimizer and scheduler."""
@@ -128,8 +145,8 @@ class DIMBALightningModule(pl.LightningModule):
             latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
             loss = loss + latent_loss * self.model.latent_loss_weight
 
-        # Update EMA
-        if self.use_ema:
+        # Update EMA periodically to reduce transfer overhead for CPU-offloaded EMA.
+        if self.use_ema and (self.global_step + 1) % self.ema_update_interval == 0:
             self._update_ema_model()
 
         # Logging
@@ -141,6 +158,12 @@ class DIMBALightningModule(pl.LightningModule):
 
         return loss
 
+
+    def on_fit_start(self):
+        """Ensure EMA stays on the configured device after Lightning device placement."""
+        if self.use_ema and self.ema_device is not None:
+            self.ema_model.to(self.ema_device)
+
     def validation_step(self, batch, batch_idx):
         """Validation step."""
         input_ids = batch["input_ids"]
@@ -149,8 +172,8 @@ class DIMBALightningModule(pl.LightningModule):
         # Use middle timesteps for validation
         t = torch.full((batch_size,), self.model.num_diffusion_steps // 2, device=self.device)
 
-        # Use EMA model for validation if available
-        model = self.ema_model if self.use_ema else self.model
+        # Keep validation on the active training model to avoid moving EMA to GPU.
+        model = self.model
 
         # Forward pass
         x_pred, _, _ = model(input_ids, t)
