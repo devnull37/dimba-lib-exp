@@ -17,7 +17,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_DIR = (SCRIPT_DIR / ".." / "src").resolve()
 sys.path.insert(0, str(SRC_DIR))
 
-from dimba.data import HuggingFaceDataset, collate_fn
+from dimba.data import HuggingFaceDataset, HuggingFaceIterableDataset, collate_fn
 from dimba.tokenizers import BPETokenizer
 from dimba.training import DIMBALightningModule
 
@@ -79,23 +79,24 @@ def main() -> None:
     val_split = data_cfg.get("val_split", "validation")
     val_fallback_split = data_cfg.get("val_fallback_split", "train")
 
-    train_dataset = HuggingFaceDataset(
+    streaming = data_cfg.get("streaming", False)
+    dataset_cls = HuggingFaceIterableDataset if streaming else HuggingFaceDataset
+
+    train_dataset = dataset_cls(
         dataset_name=data_cfg["dataset_name"],
         dataset_config=data_cfg.get("dataset_config"),
         split=train_split,
         tokenizer=tokenizer,
         max_length=data_cfg["max_length"],
-        streaming=data_cfg.get("streaming", False),
     )
 
     try:
-        val_dataset = HuggingFaceDataset(
+        val_dataset = dataset_cls(
             dataset_name=data_cfg["dataset_name"],
             dataset_config=data_cfg.get("dataset_config"),
             split=val_split,
             tokenizer=tokenizer,
             max_length=data_cfg["max_length"],
-            streaming=data_cfg.get("streaming", False),
         )
     except ValueError as exc:
         # FineWeb and some other datasets expose only a train split.
@@ -104,13 +105,12 @@ def main() -> None:
                 f"WARNING: Could not load validation split '{val_split}' ({exc}). "
                 f"Falling back to split '{val_fallback_split}' for validation."
             )
-            val_dataset = HuggingFaceDataset(
+            val_dataset = dataset_cls(
                 dataset_name=data_cfg["dataset_name"],
                 dataset_config=data_cfg.get("dataset_config"),
                 split=val_fallback_split,
                 tokenizer=tokenizer,
                 max_length=data_cfg["max_length"],
-                streaming=data_cfg.get("streaming", False),
             )
         else:
             raise
@@ -118,7 +118,7 @@ def main() -> None:
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=data_cfg["batch_size"],
-        shuffle=not data_cfg.get("streaming", False),
+        shuffle=not streaming,
         num_workers=data_cfg["num_workers"],
         collate_fn=collate_fn,
     )

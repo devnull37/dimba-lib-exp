@@ -1,7 +1,7 @@
 """Dataset classes for DIMBA training."""
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 from typing import Optional, List, Dict, Any
 from datasets import load_dataset
 
@@ -157,6 +157,83 @@ class HuggingFaceDataset(Dataset):
         return {
             "input_ids": input_ids,
         }
+
+
+class HuggingFaceIterableDataset(IterableDataset):
+    """Streaming dataset wrapper for HuggingFace iterable datasets.
+
+    This class is intended for ``load_dataset(..., streaming=True)`` where random
+    integer indexing is not supported.
+    """
+
+    def __init__(
+        self,
+        dataset_name: str,
+        dataset_config: Optional[str] = None,
+        split: str = "train",
+        tokenizer=None,
+        max_length: int = 256,
+        num_examples: Optional[int] = None,
+        text_column: str = "text",
+    ):
+        self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
+        self.split = split
+        self.max_length = max_length
+        self.tokenizer = tokenizer
+        self.text_column = text_column
+        self.num_examples = num_examples
+
+        try:
+            self.dataset = load_dataset(
+                dataset_name,
+                name=dataset_config,
+                split=split,
+                streaming=True,
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to load dataset {dataset_name}: {e}")
+
+        if num_examples is not None:
+            self.dataset = self.dataset.take(num_examples)
+
+    def _tokenize(self, text: str) -> torch.Tensor:
+        if self.tokenizer is not None:
+            if callable(self.tokenizer):
+                encoded = self.tokenizer(
+                    text,
+                    max_length=self.max_length,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                input_ids = encoded["input_ids"].squeeze(0)
+            elif hasattr(self.tokenizer, "encode"):
+                tokens = self.tokenizer.encode(text)
+                input_ids = torch.tensor(tokens, dtype=torch.long)
+
+                if len(input_ids) > self.max_length:
+                    input_ids = input_ids[:self.max_length]
+
+                if len(input_ids) < self.max_length:
+                    pad_size = self.max_length - len(input_ids)
+                    input_ids = torch.nn.functional.pad(input_ids, (0, pad_size), value=0)
+            else:
+                raise TypeError("Tokenizer must be callable or provide an encode(text) method")
+        else:
+            tokens = text.split()[:self.max_length]
+            input_ids = torch.tensor(tokens, dtype=torch.long)
+
+            if len(input_ids) < self.max_length:
+                pad_size = self.max_length - len(input_ids)
+                input_ids = torch.nn.functional.pad(input_ids, (0, pad_size), value=0)
+
+        return input_ids
+
+    def __iter__(self):
+        for example in self.dataset:
+            text = example[self.text_column]
+            yield {"input_ids": self._tokenize(text)}
 
 
 class DummyDataset(Dataset):
