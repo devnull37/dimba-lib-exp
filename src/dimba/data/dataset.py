@@ -34,9 +34,8 @@ class TextDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         text = self.texts[idx]
 
-        # Tokenize
-        if hasattr(self.tokenizer, "encode"):
-            # HuggingFace tokenizer
+        if callable(self.tokenizer):
+            # HuggingFace-style tokenizer
             encoded = self.tokenizer(
                 text,
                 max_length=self.max_length,
@@ -45,19 +44,19 @@ class TextDataset(Dataset):
                 return_tensors="pt",
             )
             input_ids = encoded["input_ids"].squeeze(0)
-        else:
-            # Custom tokenizer
-            tokens = self.tokenizer(text)
+        elif hasattr(self.tokenizer, "encode"):
+            # Custom tokenizer class with encode API
+            tokens = self.tokenizer.encode(text)
             input_ids = torch.tensor(tokens, dtype=torch.long)
 
-            # Truncate
             if len(input_ids) > self.max_length:
                 input_ids = input_ids[:self.max_length]
 
-            # Pad
             if self.padding and len(input_ids) < self.max_length:
                 pad_size = self.max_length - len(input_ids)
                 input_ids = torch.nn.functional.pad(input_ids, (0, pad_size), value=0)
+        else:
+            raise TypeError("Tokenizer must be callable or provide an encode(text) method")
 
         return {
             "input_ids": input_ids,
@@ -124,14 +123,27 @@ class HuggingFaceDataset(Dataset):
         text = example[self.text_column]
 
         if self.tokenizer is not None:
-            encoded = self.tokenizer(
-                text,
-                max_length=self.max_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
-            input_ids = encoded["input_ids"].squeeze(0)
+            if callable(self.tokenizer):
+                encoded = self.tokenizer(
+                    text,
+                    max_length=self.max_length,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                input_ids = encoded["input_ids"].squeeze(0)
+            elif hasattr(self.tokenizer, "encode"):
+                tokens = self.tokenizer.encode(text)
+                input_ids = torch.tensor(tokens, dtype=torch.long)
+
+                if len(input_ids) > self.max_length:
+                    input_ids = input_ids[:self.max_length]
+
+                if len(input_ids) < self.max_length:
+                    pad_size = self.max_length - len(input_ids)
+                    input_ids = torch.nn.functional.pad(input_ids, (0, pad_size), value=0)
+            else:
+                raise TypeError("Tokenizer must be callable or provide an encode(text) method")
         else:
             # Simple word-based tokenization
             tokens = text.split()[:self.max_length]
