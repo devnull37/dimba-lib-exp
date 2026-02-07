@@ -245,6 +245,8 @@ class SimpleTrainer:
         learning_rate: float = 2e-5,
         warmup_steps: int = 500,
         ema_decay: float = 0.9999,
+        gradient_accumulation_steps: int = 1,
+        use_amp: bool = False,
     ):
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
@@ -254,6 +256,9 @@ class SimpleTrainer:
         self.learning_rate = learning_rate
         self.warmup_steps = warmup_steps
         self.ema_decay = ema_decay
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.use_amp = use_amp
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         # EMA model
         self.ema_model = DIMBA(
@@ -295,6 +300,7 @@ class SimpleTrainer:
         for epoch in range(self.num_epochs):
             self.model.train()
             epoch_loss = 0.0
+            self.optimizer.zero_grad()
 
             for batch_idx, batch in enumerate(self.train_dataloader):
                 # Learning rate warmup
@@ -308,32 +314,40 @@ class SimpleTrainer:
                 batch_size = input_ids.shape[0]
                 t = sample_timesteps(batch_size, self.model.num_diffusion_steps, torch.device(self.device))
 
-                output = self.model(input_ids, t, return_latent_info=True)
-                x_pred, noise, latent_info = output
-                x_0 = self.model.token_embed(input_ids)
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    output = self.model(input_ids, t, return_latent_info=True)
+                    x_pred, noise, latent_info = output
+                    x_0 = self.model.token_embed(input_ids)
 
-                loss = self.loss_fn(x_pred, x_0) * self.model.recon_loss_weight
-                if self.model.latent_diffusion and latent_info is not None:
-                    latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
-                    loss = loss + latent_loss * self.model.latent_loss_weight
+                    loss = self.loss_fn(x_pred, x_0) * self.model.recon_loss_weight
+                    if self.model.latent_diffusion and latent_info is not None:
+                        latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
+                        loss = loss + latent_loss * self.model.latent_loss_weight
+                    
+                    # Normalize loss for accumulation
+                    loss = loss / self.gradient_accumulation_steps
 
                 # Backward
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
+                self.scaler.scale(loss).backward()
 
-                # Update EMA
-                self._update_ema()
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
 
-                epoch_loss += loss.item()
-                self.global_step += 1
+                    # Update EMA
+                    self._update_ema()
+                    self.global_step += 1
+
+                epoch_loss += loss.item() * self.gradient_accumulation_steps
 
                 if batch_idx % 100 == 0:
                     print(
                         f"Epoch {epoch + 1}/{self.num_epochs} | "
                         f"Step {batch_idx}/{len(self.train_dataloader)} | "
-                        f"Loss: {loss.item():.4f}"
+                        f"Loss: {loss.item() * self.gradient_accumulation_steps:.4f}"
                     )
 
             avg_epoch_loss = epoch_loss / len(self.train_dataloader)

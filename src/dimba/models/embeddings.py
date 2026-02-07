@@ -35,6 +35,9 @@ class TokenEmbedding(nn.Module):
         Returns:
             embeddings: [batch_size, seq_len, embed_dim]
         """
+        # Ensure input_ids are LongTensor for embedding lookup
+        if not input_ids.dtype in [torch.long, torch.int]:
+            input_ids = input_ids.long()
         return self.embedding(input_ids)
 
     def get_weight(self) -> torch.Tensor:
