@@ -169,6 +169,7 @@ class DIMBA(nn.Module):
         input_ids: torch.Tensor,
         t: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
+        return_latent_info: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
         """Forward pass during training.
 
@@ -178,10 +179,12 @@ class DIMBA(nn.Module):
             input_ids: Target token IDs [batch_size, seq_len]
             t: Timesteps [batch_size], values in [0, num_diffusion_steps-1]
             noise: Optional predefined noise, otherwise sampled
+            return_latent_info: Whether to return latent information for latent loss
 
         Returns:
             predicted_embeddings: Predicted clean embeddings [batch_size, seq_len, d_model]
             noise: The noise that was used for noising
+            latent_info: Optional dictionary containing latent information
         """
         # Get clean embeddings
         x_0 = self.token_embed(input_ids)  # [batch_size, seq_len, d_model]
@@ -205,7 +208,9 @@ class DIMBA(nn.Module):
         if self.latent_diffusion:
             latent_info = {"z_pred": z_pred, "z_0": z_0}
 
-        return x_pred, noise, latent_info
+        if return_latent_info:
+            return x_pred, noise, latent_info
+        return x_pred, noise
 
     def denoise_step(
         self,
