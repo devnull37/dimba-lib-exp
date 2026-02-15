@@ -10,7 +10,7 @@ sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
 
 from dimba import DIMBA
 from dimba.data import DummyDataset, collate_fn
-from dimba.evaluation import compute_model_perplexity, MetricsLogger
+from dimba.evaluation import compute_model_perplexity
 from torch.utils.data import DataLoader
 
 

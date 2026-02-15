@@ -2,8 +2,8 @@
 """Test script to verify DIMBA configuration and dependencies."""
 
 import sys
+
 import torch
-import yaml
 
 # Add src to path
 sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
