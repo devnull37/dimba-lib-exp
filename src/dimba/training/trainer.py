@@ -4,9 +4,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Optional, Dict, Any
-import math
 
 from ..models.diffusion import DIMBA
 from ..diffusion.sampling import sample_timesteps

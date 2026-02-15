@@ -145,3 +145,18 @@ wandb/
 *.csv
 *.json
 *.txt.bak
+
+# Experimental / temporary files
+experiments/
+*.tmp
+*.bak
+*.orig
+
+# Profiling
+*.prof
+.prof/
+
+# Local development
+local/
+local_config.yaml
+config_local.yaml

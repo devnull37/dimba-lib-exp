@@ -2,8 +2,6 @@
 
 import pytest
 import torch
-import sys
-sys.path.insert(0, str(__file__).rsplit('/', 2)[0] + '/src')
 
 from dimba.models.embeddings import (
     TokenEmbedding,
