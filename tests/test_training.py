@@ -2,12 +2,10 @@
 
 import pytest
 import torch
-import sys
-sys.path.insert(0, str(__file__).rsplit('/', 2)[0] + '/src')
+from torch.utils.data import DataLoader
 
 from dimba.training.trainer import DIMBALightningModule, SimpleTrainer
 from dimba.data import DummyDataset, collate_fn
-from torch.utils.data import DataLoader
 
 
 class TestDIMBALightningModule:

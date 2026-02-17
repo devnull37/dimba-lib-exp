@@ -24,9 +24,6 @@ def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str, config_p
 
     # Try to load as Lightning checkpoint first
     try:
-        from pytorch_lightning import LightningModule
-        import pytorch_lightning as pl
-
         # Load Lightning checkpoint
         state_dict = torch.load(checkpoint_path, map_location=device)
 

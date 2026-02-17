@@ -2,8 +2,6 @@
 
 import pytest
 import torch
-import sys
-sys.path.insert(0, str(__file__).rsplit('/', 2)[0] + '/src')
 
 from dimba.diffusion.schedules import CosineNoiseSchedule
 from dimba.diffusion.sampling import sample_timesteps, top_k_top_p_filtering
