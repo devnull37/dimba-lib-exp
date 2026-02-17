@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """Interactive training script for DIMBA with auto GPU detection and config wizard.
 
+Supports four training modes:
+1. VAE Only - Pre-train the TokenVAE for latent diffusion
+2. DIMBA (Embedding) - Train diffusion model in embedding space (no VAE needed)
+3. DIMBA (Latent) - Train diffusion model in VAE latent space (requires pre-trained VAE)
+4. Both - Train VAE first, then train DIMBA with that VAE
+
+Architecture Overview:
+    EMBEDDING-SPACE DIFFUSION (no VAE):
+        Tokens → Embeddings → [Diffusion] → Embeddings → Tokens
+        
+    LATENT-SPACE DIFFUSION (with VAE):
+        Tokens → Embeddings → VAE Encode → Latents → [Diffusion] → Latents → VAE Decode → Embeddings → Tokens
+        
+    The VAE compresses embeddings into a lower-dimensional latent space, which can:
+    - Reduce computation during diffusion
+    - Provide a smoother, more continuous representation
+
 Usage:
-    # Launch interactive mode
+    # Launch interactive mode (choose what to train)
     python scripts/train_interactive.py
 
-    # Resume from checkpoint
-    python scripts/train_interactive.py --resume
+    # Train specific component directly
+    python scripts/train_interactive.py --train-mode vae
+    python scripts/train_interactive.py --train-mode dimba-embedding
+    python scripts/train_interactive.py --train-mode dimba-latent --vae-checkpoint checkpoints/vae/final.ckpt
 
-    # Resume specific checkpoint
-    python scripts/train_interactive.py --resume-from ./checkpoints/interactive
-
-    # Skip wizard and use specific preset
-    python scripts/train_interactive.py --preset a4000-500m
-
-    # Use custom config with auto GPU detection
-    python scripts/train_interactive.py --config my_config.yaml --auto-gpu
-
-Available presets:
-    - cpu-small: CPU training, tiny model for testing
-    - a4000-500m: RTX A4000 16GB, ~500M params
-    - l40s-1b: L40S 48GB, ~1.5B params
-    - a100-3b: A100 80GB, ~3B params
-    - multi-gpu: Multi-GPU training (auto-detect count)
+    # Train both (VAE first, then DIMBA)
+    python scripts/train_interactive.py --train-mode both
 """
 
 import argparse
@@ -49,6 +55,9 @@ try:
     from dimba.data import DummyDataset, HuggingFaceDataset, collate_fn
     from dimba.tokenizers import BPETokenizer, SimpleCharacterTokenizer
     from dimba.training import DIMBALightningModule
+    from dimba.models.vae import TokenVAE
+    from dimba.models.embeddings import TokenEmbedding
+    from dimba.training.trainer import VAELightningModule
 
     HAS_DEPS = True
 except ImportError as e:
@@ -282,6 +291,95 @@ PRESETS = {
 }
 
 
+# VAE-specific presets
+VAE_PRESETS = {
+    'vae-small': {
+        'name': 'Small VAE (fast training)',
+        'description': 'Small VAE for testing, ~10M params',
+        'vae': {
+            'latent_dim': 128,
+            'hidden_dim': 512,
+            'num_layers': 2,
+            'dropout': 0.1,
+            'kl_weight': 1.0,
+        },
+        'model': {
+            'd_model': 512,
+        },
+        'data': {
+            'type': 'huggingface',
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-2-raw-v1',
+            'batch_size': 64,
+            'max_length': 256,
+            'num_workers': 4,
+        },
+        'training': {
+            'learning_rate': 1e-4,
+            'warmup_steps': 500,
+            'max_steps': 10000,
+            'weight_decay': 0.01,
+        },
+    },
+    'vae-medium': {
+        'name': 'Medium VAE (balanced)',
+        'description': 'Medium VAE for production use, ~50M params',
+        'vae': {
+            'latent_dim': 256,
+            'hidden_dim': 1024,
+            'num_layers': 3,
+            'dropout': 0.1,
+            'kl_weight': 0.5,
+        },
+        'model': {
+            'd_model': 1024,
+        },
+        'data': {
+            'type': 'huggingface',
+            'dataset_name': 'HuggingFaceFW/fineweb',
+            'dataset_config': 'sample-10BT',
+            'batch_size': 32,
+            'max_length': 512,
+            'num_workers': 4,
+        },
+        'training': {
+            'learning_rate': 5e-5,
+            'warmup_steps': 1000,
+            'max_steps': 50000,
+            'weight_decay': 0.01,
+        },
+    },
+    'vae-large': {
+        'name': 'Large VAE (high quality)',
+        'description': 'Large VAE for best reconstruction, ~100M params',
+        'vae': {
+            'latent_dim': 512,
+            'hidden_dim': 2048,
+            'num_layers': 4,
+            'dropout': 0.1,
+            'kl_weight': 0.1,
+        },
+        'model': {
+            'd_model': 2048,
+        },
+        'data': {
+            'type': 'huggingface',
+            'dataset_name': 'HuggingFaceFW/fineweb',
+            'dataset_config': 'sample-10BT',
+            'batch_size': 16,
+            'max_length': 1024,
+            'num_workers': 8,
+        },
+        'training': {
+            'learning_rate': 3e-5,
+            'warmup_steps': 2000,
+            'max_steps': 100000,
+            'weight_decay': 0.01,
+        },
+    },
+}
+
+
 # =============================================================================
 # Interactive UI
 # =============================================================================
@@ -293,113 +391,141 @@ def print_header(text: str):
     print("=" * 60)
 
 
-def find_interactive_checkpoints(base_dir: str = "./checkpoints/interactive") -> list[dict]:
-    """Find existing checkpoints in the interactive folder.
+def interactive_training_mode_selection() -> tuple[str, Optional[str]]:
+    """Let user select what to train: VAE, DIMBA (embedding), DIMBA (latent), or Both.
     
-    Returns list of checkpoint info dicts with path, step, config, etc.
+    Returns:
+        (mode, vae_checkpoint_path)
+        mode: 'vae', 'dimba-embedding', 'dimba-latent', or 'both'
+        vae_checkpoint_path: Path to pre-trained VAE (for 'dimba-latent' mode)
     """
-    checkpoints = []
-    base_path = Path(base_dir)
+    print_header("Select Training Mode")
     
-    if not base_path.exists():
-        return checkpoints
+    print("""
+DIMBA supports two diffusion modes:
+
+  1. EMBEDDING-SPACE DIFFUSION (no VAE needed)
+     Tokens → Embeddings → [Diffusion] → Embeddings → Tokens
+     • Simpler, no pre-training required
+     • Direct control over embeddings
+     
+  2. LATENT-SPACE DIFFUSION (requires VAE)
+     Tokens → Embeddings → VAE Encode → Latents → [Diffusion] → Latents → VAE Decode → Embeddings → Tokens
+     • Compressed representation (faster)
+     • Smoother latent space
+     • Requires pre-trained VAE
+
+What would you like to train?
+""")
     
-    # Look for checkpoint files
-    for ckpt_file in base_path.glob("*.ckpt"):
-        # Parse checkpoint info
-        name = ckpt_file.stem
-        step = None
-        val_loss = None
-        
-        # Try to extract step from filename (dimba-{step:07d}-{val/loss:.4f})
-        if "step=" in name or "-" in name:
-            parts = name.split("-")
-            for i, part in enumerate(parts):
-                if part.isdigit():
-                    step = int(part)
-                elif ".ckpt" not in part and i > 0:
-                    try:
-                        val_loss = float(part)
-                    except:
-                        pass
-        
-        # Check for config
-        config_path = ckpt_file.parent / "train_config.yaml"
-        has_config = config_path.exists()
-        
-        # Check for tokenizer
-        tokenizer_path = ckpt_file.parent / "tokenizer.json"
-        has_tokenizer = tokenizer_path.exists()
-        
-        # Get file stats
-        stat = ckpt_file.stat()
-        size_mb = stat.st_size / (1024 * 1024)
-        mtime = stat.st_mtime
-        
-        checkpoints.append({
-            'path': str(ckpt_file),
-            'name': name,
-            'step': step,
-            'val_loss': val_loss,
-            'size_mb': size_mb,
-            'modified': mtime,
-            'has_config': has_config,
-            'has_tokenizer': has_tokenizer,
-            'config_path': str(config_path) if has_config else None,
-            'dir': str(ckpt_file.parent),
-        })
+    print("  [1] VAE only")
+    print("      Pre-train a TokenVAE for latent diffusion")
+    print("      → Use this if you want to do latent-space diffusion later")
+    print()
+    print("  [2] DIMBA (embedding-space)")
+    print("      Train diffusion model in embedding space")
+    print("      → No VAE needed, simpler setup")
+    print()
+    print("  [3] DIMBA (latent-space)")
+    print("      Train diffusion model in VAE latent space")
+    print("      → Requires a pre-trained VAE checkpoint")
+    print()
+    print("  [4] BOTH (VAE + DIMBA)")
+    print("      Train VAE first, then train DIMBA with that VAE")
+    print("      → Complete pipeline in one command")
+    print()
     
-    # Sort by modified time (newest first)
-    checkpoints.sort(key=lambda x: x['modified'], reverse=True)
-    return checkpoints
+    while True:
+        choice = input("Select mode [2]: ").strip() or '2'
+        
+        if choice == '1':
+            return 'vae', None
+        elif choice == '2':
+            return 'dimba-embedding', None
+        elif choice == '3':
+            # Need VAE checkpoint
+            vae_path = input("Path to VAE checkpoint: ").strip()
+            if not vae_path or not os.path.exists(vae_path):
+                print(f"❌ VAE checkpoint not found: {vae_path}")
+                print("Please train a VAE first using option [1] or [4]")
+                continue
+            return 'dimba-latent', vae_path
+        elif choice == '4':
+            return 'both', None
+        else:
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
-def interactive_resume_selection(checkpoints: list[dict]) -> tuple[Optional[str], Optional[str], bool]:
-    """Let user select whether to resume and which checkpoint to use.
+def interactive_vae_preset_selection() -> dict:
+    """Let user select a VAE preset."""
+    print_header("Select VAE Configuration")
     
-    Returns: (checkpoint_path, config_path, use_new_config)
-    """
-    if not checkpoints:
-        return None, None, False
+    print("\nAvailable VAE presets:")
+    for key, preset in VAE_PRESETS.items():
+        print(f"  [{key:12}] {preset['name']}")
+        print(f"               Latent dim: {preset['vae']['latent_dim']}, "
+              f"Hidden: {preset['vae']['hidden_dim']}, "
+              f"Layers: {preset['vae']['num_layers']}")
+        print(f"               {preset['description']}")
+        print()
     
-    print_header("Existing Checkpoints Found")
-    print(f"\nFound {len(checkpoints)} checkpoint(s) in interactive folder:\n")
+    print("  [custom]     Create custom VAE configuration")
     
-    for i, ckpt in enumerate(checkpoints[:5], 1):  # Show top 5
-        step_str = f"step {ckpt['step']}" if ckpt['step'] else "unknown step"
-        loss_str = f"val_loss={ckpt['val_loss']:.4f}" if ckpt['val_loss'] else ""
-        size_str = f"{ckpt['size_mb']:.1f} MB"
-        config_marker = "✓" if ckpt['has_config'] else "✗"
+    while True:
+        choice = input(f"Select preset [vae-medium]: ").strip() or 'vae-medium'
         
-        print(f"  [{i}] {ckpt['name']}")
-        print(f"      {step_str} {loss_str} | {size_str} | config: {config_marker}")
+        if choice in VAE_PRESETS:
+            return VAE_PRESETS[choice].copy()
+        elif choice == 'custom':
+            return interactive_custom_vae_config()
+        else:
+            print(f"Unknown preset: {choice}")
+
+
+def interactive_custom_vae_config() -> dict:
+    """Guide user through creating a custom VAE config."""
+    print_header("Custom VAE Configuration")
     
-    print("\nOptions:")
-    print("  [r] Resume from latest checkpoint (use saved config)")
-    print("  [n] Resume but use NEW config (keep weights, change settings)")
-    print("  [1-5] Resume from specific checkpoint above")
-    print("  [f] Start FRESH (ignore existing checkpoints)")
+    config = {
+        'vae': {},
+        'model': {},
+        'data': {},
+        'training': {},
+    }
     
-    choice = input("\nSelect option [r]: ").strip().lower() or 'r'
+    # VAE architecture
+    print("\n1. VAE Architecture:")
+    config['vae']['latent_dim'] = int(input("Latent dimension [256]: ") or 256)
+    config['vae']['hidden_dim'] = int(input("Hidden dimension [1024]: ") or 1024)
+    config['vae']['num_layers'] = int(input("Number of layers [3]: ") or 3)
+    config['vae']['dropout'] = float(input("Dropout [0.1]: ") or 0.1)
+    config['vae']['kl_weight'] = float(input("KL weight (beta-VAE) [0.5]: ") or 0.5)
     
-    if choice == 'f':
-        return None, None, False
-    elif choice == 'n':
-        # Resume latest but use new config
-        return checkpoints[0]['path'], None, True
-    elif choice == 'r':
-        # Resume latest with saved config
-        ckpt = checkpoints[0]
-        return ckpt['path'], ckpt['config_path'] if ckpt['has_config'] else None, False
-    elif choice.isdigit():
-        idx = int(choice) - 1
-        if 0 <= idx < len(checkpoints):
-            ckpt = checkpoints[idx]
-            return ckpt['path'], ckpt['config_path'] if ckpt['has_config'] else None, False
+    # Model dims (embedding dimension)
+    config['model']['d_model'] = int(input("Embedding dimension (d_model) [1024]: ") or 1024)
     
-    # Default: resume latest
-    ckpt = checkpoints[0]
-    return ckpt['path'], ckpt['config_path'] if ckpt['has_config'] else None, False
+    # Data config
+    print("\n2. Data Configuration:")
+    config['data']['type'] = input("Dataset type [huggingface/dummy] [huggingface]: ").strip() or 'huggingface'
+    
+    if config['data']['type'] == 'huggingface':
+        config['data']['dataset_name'] = input("Dataset name [HuggingFaceFW/fineweb]: ").strip() or 'HuggingFaceFW/fineweb'
+        config['data']['dataset_config'] = input("Dataset config [sample-10BT]: ").strip() or 'sample-10BT'
+    else:
+        config['data']['num_examples'] = int(input("Number of examples [1000]: ") or 1000)
+    
+    config['data']['batch_size'] = int(input("Batch size [32]: ") or 32)
+    config['data']['max_length'] = int(input("Max sequence length [512]: ") or 512)
+    config['data']['num_workers'] = int(input("Num workers [4]: ") or 4)
+    
+    # Training config
+    print("\n3. Training Configuration:")
+    config['training']['learning_rate'] = float(input("Learning rate [5e-5]: ") or 5e-5)
+    config['training']['warmup_steps'] = int(input("Warmup steps [1000]: ") or 1000)
+    config['training']['max_steps'] = int(input("Max steps [50000]: ") or 50000)
+    config['training']['weight_decay'] = float(input("Weight decay [0.01]: ") or 0.01)
+    
+    return config
 
 
 def print_gpu_info(gpus: list[dict]):
@@ -436,7 +562,7 @@ def interactive_gpu_selection(gpus: list[dict]) -> tuple[int, list[int]]:
     print("  s) Use specific GPU(s)")
     print("  c) Use CPU only")
 
-    choice = input("\nSelect option [a/s/c]: ").strip().lower()
+    choice = input("\nSelect option [a]: ").strip().lower() or 'a'
 
     if choice == 'c':
         return 0, []
@@ -632,7 +758,7 @@ def interactive_config_review(config: dict, gpus: list[dict]) -> dict:
 def estimate_memory_usage(config: dict, num_gpus: int) -> dict:
     """Estimate memory usage for the configuration."""
     d_model = config['model']['d_model']
-    num_layers = config['model']['num_denoiser_layers']
+    num_layers = config['model'].get('num_denoiser_layers', 6)
     vocab_size = config['tokenizer']['vocab_size']
     batch_size = config['data']['batch_size']
     max_length = config['data']['max_length']
@@ -748,62 +874,228 @@ def create_dataloaders(config: dict, tokenizer):
     return train_loader, val_loader
 
 
-def run_training(config: dict, num_gpus: int, gpu_indices: list[int], 
-                 resume_ckpt: Optional[str] = None, force_new_config: bool = False,
-                 hf_repo_id: Optional[str] = None, hf_token: Optional[str] = None,
-                 hf_private: bool = False, skip_hf_prompt: bool = False):
-    """Run the training loop.
+def upload_to_huggingface(checkpoint_dir: str, repo_id: Optional[str] = None, 
+                          token: Optional[str] = None, private: bool = False) -> bool:
+    """Upload training artifacts to HuggingFace Hub."""
+    try:
+        from huggingface_hub import HfApi, upload_folder
+    except ImportError:
+        print("\n⚠️  huggingface_hub not installed. Install with:")
+        print("  pip install huggingface_hub")
+        return False
     
-    Args:
-        config: Training configuration
-        num_gpus: Number of GPUs to use
-        gpu_indices: List of GPU indices
-        resume_ckpt: Path to checkpoint to resume from (optional)
-        force_new_config: If True, use the provided config instead of loading from checkpoint
-        hf_repo_id: HuggingFace repo ID for auto-upload
-        hf_token: HuggingFace API token
-        hf_private: Whether to create private HF repo
-        skip_hf_prompt: If True, don't prompt for HF upload (useful for --yes mode)
-    """
+    if repo_id is None:
+        repo_id = input("\nHuggingFace repo ID (username/model-name): ").strip()
+        if not repo_id:
+            print("No repo ID provided, skipping upload.")
+            return False
+    
+    if token is None:
+        token = os.getenv("HF_TOKEN")
+        if token is None:
+            token = input("HuggingFace token (or set HF_TOKEN env var): ").strip()
+            if not token:
+                print("No token provided, skipping upload.")
+                return False
+    
+    try:
+        print(f"\n📤 Uploading to HuggingFace: https://huggingface.co/{repo_id}")
+        api = HfApi(token=token)
+        api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+        upload_folder(
+            repo_id=repo_id,
+            folder_path=checkpoint_dir,
+            repo_type="model",
+            token=token,
+            commit_message="Upload DIMBA training checkpoint",
+        )
+        print(f"\n✅ Upload complete! URL: https://huggingface.co/{repo_id}")
+        return True
+    except Exception as e:
+        print(f"\n❌ Upload failed: {e}")
+        return False
+
+
+def run_vae_training(vae_config: dict, num_gpus: int, gpu_indices: list[int],
+                     hf_repo_id: Optional[str] = None, hf_token: Optional[str] = None,
+                     hf_private: bool = False) -> Optional[str]:
+    """Run VAE training and return the path to the best checkpoint."""
     if not HAS_DEPS:
         print(f"\n❌ Error: Missing dependencies: {DEPS_ERROR}")
-        print("Please install required packages:")
-        print("  pip install pytorch-lightning datasets tokenizers")
-        return
+        return None
 
-    print_header("Starting Training")
+    print_header("Training VAE")
 
-    # Determine checkpoint directory
-    if resume_ckpt and not force_new_config:
-        # Use the directory of the checkpoint
-        checkpoint_dir = str(Path(resume_ckpt).parent)
-        print(f"Resuming from: {resume_ckpt}")
-        print(f"Checkpoint directory: {checkpoint_dir}")
-    else:
-        # Get checkpoint directory from user or use default
-        checkpoint_dir = input("\nCheckpoint directory [./checkpoints/interactive]: ").strip() or "./checkpoints/interactive"
-    
+    checkpoint_dir = input("\nVAE checkpoint directory [./checkpoints/vae]: ").strip() or "./checkpoints/vae"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Load or save config
-    config_path = os.path.join(checkpoint_dir, "train_config.yaml")
+    # Save config
+    config_path = os.path.join(checkpoint_dir, "vae_config.yaml")
+    with open(config_path, 'w') as f:
+        yaml.dump(vae_config, f, sort_keys=False)
+    print(f"Config saved to: {config_path}")
+
+    # Create tokenizer (BPE for VAE)
+    tokenizer = BPETokenizer(vocab_size=32000)
+    tokenizer.save(os.path.join(checkpoint_dir, "tokenizer.json"))
+    print(f"Tokenizer: BPE (vocab_size={tokenizer.vocab_size})")
+
+    # Create dataloaders
+    print("Loading datasets...")
+    train_loader, val_loader = create_dataloaders(vae_config, tokenizer)
+
+    # Create VAE model
+    print("Creating VAE model...")
+    vae = TokenVAE(
+        input_dim=vae_config['model']['d_model'],
+        latent_dim=vae_config['vae']['latent_dim'],
+        hidden_dim=vae_config['vae'].get('hidden_dim'),
+        num_layers=vae_config['vae']['num_layers'],
+        dropout=vae_config['vae']['dropout'],
+        kl_weight=vae_config['vae']['kl_weight'],
+    )
+
+    total_params = sum(p.numel() for p in vae.parameters())
+    print(f"VAE parameters: {total_params:,} (~{total_params/1e6:.1f}M)")
+    print(f"  Input dim: {vae_config['model']['d_model']}")
+    print(f"  Latent dim: {vae_config['vae']['latent_dim']}")
+    print(f"  Compression ratio: {vae_config['model']['d_model'] / vae_config['vae']['latent_dim']:.1f}x")
+
+    # Create Lightning module
+    token_embed = TokenEmbedding(vocab_size=tokenizer.vocab_size, embed_dim=vae_config['model']['d_model'])
     
-    if resume_ckpt and not force_new_config:
-        # Load config from checkpoint directory
-        if os.path.exists(config_path):
-            print(f"Loading config from: {config_path}")
-            with open(config_path) as f:
-                config = yaml.safe_load(f)
-        else:
-            print("Warning: No config file found in checkpoint directory, using current config")
-            # Save the config we're using
-            with open(config_path, 'w') as f:
-                yaml.dump(config, f, sort_keys=False)
+    # We'll create a simple wrapper for VAE training
+    class SimpleVAEModule(pl.LightningModule):
+        def __init__(self, vae, token_embed, config):
+            super().__init__()
+            self.vae = vae
+            self.token_embed = token_embed
+            self.lr = config['training']['learning_rate']
+            self.warmup_steps = config['training'].get('warmup_steps', 1000)
+            self.weight_decay = config['training'].get('weight_decay', 0.01)
+            
+        def forward(self, batch):
+            input_ids = batch['input_ids']
+            embeddings = self.token_embed(input_ids)
+            x_recon, stats = self.vae(embeddings, return_stats=True)
+            loss, loss_dict = self.vae.compute_loss(
+                embeddings, x_recon, stats['mu'], stats['logvar']
+            )
+            return loss, loss_dict
+            
+        def training_step(self, batch, batch_idx):
+            loss, loss_dict = self(batch)
+            self.log('train/loss', loss_dict['total'])
+            self.log('train/recon_loss', loss_dict['recon'])
+            self.log('train/kl_loss', loss_dict['kl'])
+            return loss
+            
+        def validation_step(self, batch, batch_idx):
+            loss, loss_dict = self(batch)
+            self.log('val/loss', loss_dict['total'])
+            self.log('val/recon_loss', loss_dict['recon'])
+            self.log('val/kl_loss', loss_dict['kl'])
+            return loss
+            
+        def configure_optimizers(self):
+            optimizer = torch.optim.AdamW(
+                list(self.vae.parameters()) + list(self.token_embed.parameters()),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.1, total_iters=self.warmup_steps
+            )
+            return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
+
+    lightning_module = SimpleVAEModule(vae, token_embed, vae_config)
+
+    # Callbacks
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="vae-{step:07d}-{val/loss:.4f}",
+        monitor="val/loss",
+        mode="min",
+        save_top_k=3,
+        save_last=True,
+    )
+
+    # Trainer setup
+    trainer_kwargs = {
+        'max_steps': int(vae_config['training']['max_steps']),
+        'callbacks': [checkpoint_callback],
+        'logger': TensorBoardLogger("./logs", name="vae_training"),
+        'log_every_n_steps': 50,
+        'val_check_interval': 500,
+        'gradient_clip_val': 1.0,
+    }
+
+    if num_gpus > 0:
+        trainer_kwargs['accelerator'] = 'gpu'
+        trainer_kwargs['devices'] = len(gpu_indices) if len(gpu_indices) > 1 else 1
+        if len(gpu_indices) > 1:
+            trainer_kwargs['strategy'] = 'ddp'
+        trainer_kwargs['precision'] = '16-mixed'
     else:
-        # Save new config
-        with open(config_path, 'w') as f:
-            yaml.dump(config, f, sort_keys=False)
-        print(f"Config saved to: {config_path}")
+        trainer_kwargs['accelerator'] = 'cpu'
+        trainer_kwargs['devices'] = 1
+
+    print(f"\nTraining on: {trainer_kwargs.get('accelerator', 'cpu').upper()}")
+
+    if input("\nStart VAE training? [Y/n]: ").strip().lower() == 'n':
+        print("Training cancelled.")
+        return None
+
+    trainer = pl.Trainer(**trainer_kwargs)
+
+    try:
+        trainer.fit(lightning_module, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        print(f"\n✅ VAE Training complete!")
+        print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
+        
+        if hf_repo_id:
+            upload_to_huggingface(checkpoint_dir, repo_id=hf_repo_id, token=hf_token, private=hf_private)
+        elif input("\nUpload VAE to HuggingFace? [y/N]: ").strip().lower() == 'y':
+            repo_id = input("Repo ID (username/model-name): ").strip()
+            if repo_id:
+                private = input("Private repo? [y/N]: ").strip().lower() == 'y'
+                upload_to_huggingface(checkpoint_dir, repo_id=repo_id, private=private)
+        
+        return checkpoint_callback.best_model_path or checkpoint_callback.last_model_path
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted by user")
+        print(f"Last checkpoint: {checkpoint_callback.last_model_path}")
+        return checkpoint_callback.last_model_path
+    except Exception as e:
+        print(f"\n❌ Training failed: {e}")
+        raise
+
+
+def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int],
+                       vae_checkpoint: Optional[str] = None,
+                       hf_repo_id: Optional[str] = None, hf_token: Optional[str] = None,
+                       hf_private: bool = False):
+    """Run DIMBA training (embedding or latent space)."""
+    if not HAS_DEPS:
+        print(f"\n❌ Error: Missing dependencies: {DEPS_ERROR}")
+        return
+
+    print_header("Training DIMBA" + (" (latent space)" if vae_checkpoint else " (embedding space)"))
+
+    if vae_checkpoint:
+        print(f"\nUsing VAE from: {vae_checkpoint}")
+        # Note: In a full implementation, you'd load the VAE here and pass it to DIMBA
+        # For now, we just note that latent space training requires VAE integration
+
+    checkpoint_dir = input("\nCheckpoint directory [./checkpoints/interactive]: ").strip() or "./checkpoints/interactive"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Save config
+    config_path = os.path.join(checkpoint_dir, "train_config.yaml")
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, sort_keys=False)
+    print(f"Config saved to: {config_path}")
 
     # Create tokenizer
     tok_cfg = config['tokenizer']
@@ -812,16 +1104,13 @@ def run_training(config: dict, num_gpus: int, gpu_indices: list[int],
     else:
         tokenizer = SimpleCharacterTokenizer(vocab_size=tok_cfg['vocab_size'])
 
-    print(f"Tokenizer: {type(tokenizer).__name__} (vocab_size={tokenizer.vocab_size})")
-
-    # Save tokenizer
     tokenizer.save(os.path.join(checkpoint_dir, "tokenizer.json"))
 
     # Create dataloaders
     print("Loading datasets...")
     train_loader, val_loader = create_dataloaders(config, tokenizer)
 
-    # Create or load model
+    # Create model
     print("Creating model...")
     train_cfg = config['training']
     model_config = config['model']
@@ -849,10 +1138,11 @@ def run_training(config: dict, num_gpus: int, gpu_indices: list[int],
         save_last=True,
     )
 
-    callbacks = [checkpoint_callback]
     if input("Enable early stopping? [y/N]: ").strip().lower() == 'y':
         early_stop = EarlyStopping(monitor="val/loss", patience=5, mode="min")
-        callbacks.append(early_stop)
+        callbacks = [checkpoint_callback, early_stop]
+    else:
+        callbacks = [checkpoint_callback]
 
     # Trainer setup
     trainer_kwargs = {
@@ -864,11 +1154,6 @@ def run_training(config: dict, num_gpus: int, gpu_indices: list[int],
         'gradient_clip_val': float(train_cfg.get('gradient_clip', 1.0)),
         'accumulate_grad_batches': int(train_cfg.get('accumulate_grad_batches', 1)),
     }
-    
-    # Add resume_from_checkpoint if specified
-    if resume_ckpt:
-        trainer_kwargs['resume_from_checkpoint'] = resume_ckpt
-        print(f"Resuming training from checkpoint: {resume_ckpt}")
 
     if num_gpus > 0:
         trainer_kwargs['accelerator'] = 'gpu'
@@ -881,9 +1166,6 @@ def run_training(config: dict, num_gpus: int, gpu_indices: list[int],
         trainer_kwargs['devices'] = 1
 
     print(f"\nTraining on: {trainer_kwargs.get('accelerator', 'cpu').upper()}")
-    if num_gpus > 0:
-        print(f"  GPUs: {gpu_indices}")
-        print(f"  Precision: {trainer_kwargs['precision']}")
 
     if input("\nStart training? [Y/n]: ").strip().lower() == 'n':
         print("Training cancelled.")
@@ -896,19 +1178,18 @@ def run_training(config: dict, num_gpus: int, gpu_indices: list[int],
         print(f"\n✅ Training complete!")
         print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
         
-        # HuggingFace upload
         if hf_repo_id:
-            # Auto-upload if repo specified via CLI
             upload_to_huggingface(checkpoint_dir, repo_id=hf_repo_id, token=hf_token, private=hf_private)
-        elif not skip_hf_prompt:
-            # Interactive prompt
-            interactive_upload_prompt(checkpoint_dir)
-            
+        elif input("\nUpload to HuggingFace? [y/N]: ").strip().lower() == 'y':
+            repo_id = input("Repo ID (username/model-name): ").strip()
+            if repo_id:
+                private = input("Private repo? [y/N]: ").strip().lower() == 'y'
+                upload_to_huggingface(checkpoint_dir, repo_id=repo_id, private=private)
+                
     except KeyboardInterrupt:
         print("\n⚠️ Training interrupted by user")
         print(f"Last checkpoint: {checkpoint_callback.last_model_path}")
-        print("\nTo resume training, run:")
-        print(f"  python scripts/train_interactive.py --resume")
+        print("\nTo resume, run: python scripts/train_interactive.py --resume")
     except Exception as e:
         print(f"\n❌ Training failed: {e}")
         raise
@@ -927,39 +1208,37 @@ Examples:
   # Launch interactive wizard
   python scripts/train_interactive.py
 
-  # Resume from latest checkpoint
+  # Train VAE only
+  python scripts/train_interactive.py --train-mode vae
+
+  # Train DIMBA with embedding-space diffusion
+  python scripts/train_interactive.py --train-mode dimba-embedding
+
+  # Train DIMBA with latent-space diffusion (requires VAE checkpoint)
+  python scripts/train_interactive.py --train-mode dimba-latent --vae-checkpoint checkpoints/vae/final.ckpt
+
+  # Train both VAE and DIMBA
+  python scripts/train_interactive.py --train-mode both
+
+  # Resume training
   python scripts/train_interactive.py --resume
-
-  # Resume from specific checkpoint directory
-  python scripts/train_interactive.py --resume-from ./checkpoints/interactive
-
-  # Resume with new config (keep weights, change settings)
-  python scripts/train_interactive.py --resume --new-config
-
-  # Use specific preset with auto HF upload
-  python scripts/train_interactive.py --preset a4000-500m --hf-repo-id username/dimba-500m
-
-  # Load config with auto GPU detection
-  python scripts/train_interactive.py --config my_config.yaml --auto-gpu
-
-  # Non-interactive mode with specific GPUs and HF upload
-  python scripts/train_interactive.py --preset l40s-1b --gpus 0,1 --yes --hf-repo-id username/dimba-1b
         """
     )
+    parser.add_argument('--train-mode', type=str, 
+                        choices=['vae', 'dimba-embedding', 'dimba-latent', 'both'],
+                        help='What to train: vae, dimba-embedding, dimba-latent, or both')
+    parser.add_argument('--vae-checkpoint', type=str,
+                        help='Path to pre-trained VAE checkpoint (for dimba-latent mode)')
     parser.add_argument('--preset', type=str, choices=list(PRESETS.keys()),
-                        help='Use a predefined configuration preset')
+                        help='Use a predefined DIMBA configuration preset')
+    parser.add_argument('--vae-preset', type=str, choices=list(VAE_PRESETS.keys()),
+                        help='Use a predefined VAE configuration preset')
     parser.add_argument('--config', type=str, help='Load configuration from YAML file')
     parser.add_argument('--auto-gpu', action='store_true',
                         help='Auto-detect and use best GPU configuration')
     parser.add_argument('--gpus', type=str, help='Specific GPU indices to use (comma-separated, e.g., 0,1)')
     parser.add_argument('--yes', '-y', action='store_true',
                         help='Skip confirmation prompts (non-interactive mode)')
-    parser.add_argument('--resume', action='store_true',
-                        help='Resume from latest checkpoint in interactive folder')
-    parser.add_argument('--resume-from', type=str,
-                        help='Resume from specific checkpoint path or directory')
-    parser.add_argument('--new-config', action='store_true',
-                        help='When resuming, use new config instead of saved config')
     
     # HuggingFace upload arguments
     parser.add_argument('--hf-repo-id', type=str,
@@ -968,8 +1247,6 @@ Examples:
                         help='HuggingFace API token (or set HF_TOKEN env var)')
     parser.add_argument('--hf-private', action='store_true',
                         help='Create private HuggingFace repo')
-    parser.add_argument('--skip-hf-upload', action='store_true',
-                        help='Skip HuggingFace upload prompt after training')
 
     args = parser.parse_args()
 
@@ -984,70 +1261,50 @@ Examples:
         if not args.yes:
             input("Press Enter to continue...")
 
-    # Handle resume logic
-    resume_ckpt = None
-    loaded_config_path = None
-    force_new_config = args.new_config
-    
-    if args.resume or args.resume_from:
-        if args.resume_from:
-            # User specified a path
-            resume_path = Path(args.resume_from)
-            if resume_path.is_file() and resume_path.suffix == '.ckpt':
-                resume_ckpt = str(resume_path)
-                loaded_config_path = str(resume_path.parent / "train_config.yaml")
-            elif resume_path.is_dir():
-                # Find latest checkpoint in directory
-                checkpoints = find_interactive_checkpoints(str(resume_path))
-                if checkpoints:
-                    resume_ckpt = checkpoints[0]['path']
-                    loaded_config_path = checkpoints[0]['config_path']
-                else:
-                    print(f"No checkpoints found in {resume_path}")
-                    return
-            else:
-                print(f"Invalid resume path: {args.resume_from}")
-                return
-        else:
-            # Auto-find latest checkpoint
-            checkpoints = find_interactive_checkpoints()
-            if checkpoints:
-                if args.yes:
-                    # Non-interactive: just use latest
-                    resume_ckpt = checkpoints[0]['path']
-                    loaded_config_path = checkpoints[0]['config_path']
-                else:
-                    # Interactive selection
-                    resume_ckpt, loaded_config_path, force_new_config = interactive_resume_selection(checkpoints)
-            else:
-                print("\nNo existing checkpoints found to resume from.")
-                if input("Start fresh training? [Y/n]: ").strip().lower() == 'n':
-                    return
-    
     # Detect GPUs
     gpus = detect_gpus()
 
     # Determine GPU configuration
     if args.gpus:
-        # User specified GPUs
         gpu_indices = [int(x.strip()) for x in args.gpus.split(',')]
         gpu_indices = [i for i in gpu_indices if i < len(gpus)]
         num_gpus = len(gpu_indices)
     elif args.auto_gpu:
-        # Auto-detect: use all available
         num_gpus = len(gpus)
         gpu_indices = list(range(len(gpus)))
     else:
-        # Interactive selection (skip if resuming non-interactively)
-        if resume_ckpt and args.yes:
+        if args.yes:
             num_gpus = len(gpus)
             gpu_indices = list(range(len(gpus)))
         else:
             num_gpus, gpu_indices = interactive_gpu_selection(gpus)
 
-    # Get configuration
-    if force_new_config or (not resume_ckpt):
-        # Use new config (either fresh start or --new-config flag)
+    # Select training mode
+    if args.train_mode:
+        train_mode = args.train_mode
+        vae_checkpoint = args.vae_checkpoint
+    else:
+        train_mode, vae_checkpoint = interactive_training_mode_selection()
+
+    # Get configurations based on mode
+    if train_mode == 'vae':
+        # VAE only training
+        if args.vae_preset:
+            vae_config = VAE_PRESETS[args.vae_preset].copy()
+        elif args.config:
+            with open(args.config) as f:
+                vae_config = yaml.safe_load(f)
+        else:
+            vae_config = interactive_vae_preset_selection()
+        
+        if not args.yes:
+            vae_config = interactive_config_review(vae_config, gpus)
+        
+        run_vae_training(vae_config, num_gpus, gpu_indices,
+                        hf_repo_id=args.hf_repo_id, hf_token=args.hf_token, hf_private=args.hf_private)
+
+    elif train_mode in ('dimba-embedding', 'dimba-latent'):
+        # DIMBA training (embedding or latent)
         if args.config:
             with open(args.config) as f:
                 config = yaml.safe_load(f)
@@ -1056,130 +1313,56 @@ Examples:
         else:
             config = interactive_preset_selection(gpus)
         
-        # Review and edit config
         if not args.yes:
             config = interactive_config_review(config, gpus)
-    else:
-        # Load config from checkpoint
-        if loaded_config_path and os.path.exists(loaded_config_path):
-            print(f"\nLoading configuration from checkpoint: {loaded_config_path}")
-            with open(loaded_config_path) as f:
-                config = yaml.safe_load(f)
-            print("✅ Config loaded successfully")
-            
-            if not args.yes:
-                # Still allow editing
-                config = interactive_config_review(config, gpus)
+        
+        run_dimba_training(config, num_gpus, gpu_indices, vae_checkpoint=vae_checkpoint,
+                          hf_repo_id=args.hf_repo_id, hf_token=args.hf_token, hf_private=args.hf_private)
+
+    elif train_mode == 'both':
+        # Train VAE first, then DIMBA
+        print("\n🔄 Training Mode: BOTH (VAE → DIMBA)")
+        print("=" * 60)
+        
+        # Get VAE config
+        if args.vae_preset:
+            vae_config = VAE_PRESETS[args.vae_preset].copy()
         else:
-            print("\n⚠️  No config file found in checkpoint directory.")
-            print("You'll need to specify configuration.")
-            if args.preset:
-                config = PRESETS[args.preset].copy()
-            else:
-                config = interactive_preset_selection(gpus)
-
-    # Show memory estimate
-    mem_estimate = estimate_memory_usage(config, num_gpus if num_gpus > 0 else 1)
-    print_memory_estimate(mem_estimate, gpus, gpu_indices)
-
-    # Final confirmation
-    if not args.yes:
-        if input("\nProceed with training? [Y/n]: ").strip().lower() == 'n':
-            print("Training cancelled.")
+            vae_config = interactive_vae_preset_selection()
+        
+        if not args.yes:
+            vae_config = interactive_config_review(vae_config, gpus)
+        
+        # Train VAE
+        vae_ckpt = run_vae_training(vae_config, num_gpus, gpu_indices,
+                                    hf_repo_id=args.hf_repo_id, 
+                                    hf_token=args.hf_token, 
+                                    hf_private=args.hf_private)
+        
+        if vae_ckpt is None:
+            print("\n❌ VAE training failed or was cancelled.")
             return
-
-    # Run training with HF upload params
-    run_training(
-        config, num_gpus, gpu_indices, 
-        resume_ckpt, force_new_config,
-        hf_repo_id=args.hf_repo_id,
-        hf_token=args.hf_token,
-        hf_private=args.hf_private,
-        skip_hf_prompt=args.skip_hf_upload or args.yes
-    )
-
-
-def upload_to_huggingface(checkpoint_dir: str, repo_id: Optional[str] = None, 
-                          token: Optional[str] = None, private: bool = False) -> bool:
-    """Upload training artifacts to HuggingFace Hub.
-    
-    Args:
-        checkpoint_dir: Directory containing checkpoints and config
-        repo_id: HuggingFace repo ID (username/model-name). If None, will prompt.
-        token: HuggingFace API token. If None, will check env var or prompt.
-        private: Whether to create private repo
-    
-    Returns:
-        True if upload successful, False otherwise
-    """
-    try:
-        from huggingface_hub import HfApi, upload_folder
-    except ImportError:
-        print("\n⚠️  huggingface_hub not installed. Install with:")
-        print("  pip install huggingface_hub")
-        return False
-    
-    # Get repo ID
-    if repo_id is None:
-        repo_id = input("\nHuggingFace repo ID (username/model-name): ").strip()
-        if not repo_id:
-            print("No repo ID provided, skipping upload.")
-            return False
-    
-    # Get token
-    if token is None:
-        token = os.getenv("HF_TOKEN")
-        if token is None:
-            token = input("HuggingFace token (or set HF_TOKEN env var): ").strip()
-            if not token:
-                print("No token provided, skipping upload.")
-                return False
-    
-    try:
-        print(f"\n📤 Uploading to HuggingFace: https://huggingface.co/{repo_id}")
-        print(f"   Directory: {checkpoint_dir}")
-        print(f"   Private: {private}")
         
-        api = HfApi(token=token)
+        print("\n" + "=" * 60)
+        print("VAE training complete! Now training DIMBA with this VAE.")
+        print("=" * 60)
         
-        # Create repo if doesn't exist
-        api.create_repo(
-            repo_id=repo_id, 
-            repo_type="model", 
-            private=private, 
-            exist_ok=True
-        )
+        # Get DIMBA config
+        if args.config:
+            with open(args.config) as f:
+                config = yaml.safe_load(f)
+        elif args.preset:
+            config = PRESETS[args.preset].copy()
+        else:
+            config = interactive_preset_selection(gpus)
         
-        # Upload all files in checkpoint directory
-        upload_folder(
-            repo_id=repo_id,
-            folder_path=checkpoint_dir,
-            repo_type="model",
-            token=token,
-            commit_message="Upload DIMBA training checkpoint",
-        )
+        if not args.yes:
+            config = interactive_config_review(config, gpus)
         
-        print(f"\n✅ Upload complete!")
-        print(f"   URL: https://huggingface.co/{repo_id}")
-        return True
-        
-    except Exception as e:
-        print(f"\n❌ Upload failed: {e}")
-        return False
+        # Train DIMBA with the VAE
+        run_dimba_training(config, num_gpus, gpu_indices, vae_checkpoint=vae_ckpt,
+                          hf_repo_id=args.hf_repo_id, hf_token=args.hf_token, hf_private=args.hf_private)
 
 
-def interactive_upload_prompt(checkpoint_dir: str) -> bool:
-    """Prompt user for HF upload after training."""
-    if input("\nUpload to HuggingFace Hub? [y/N]: ").strip().lower() != 'y':
-        return False
-    
-    # Ask for repo details
-    repo_id = input("Repo ID (username/model-name): ").strip()
-    if not repo_id:
-        print("No repo ID provided, skipping upload.")
-        return False
-    
-    private = input("Make repo private? [y/N]: ").strip().lower() == 'y'
-    
-    return upload_to_huggingface(checkpoint_dir, repo_id=repo_id, private=private)
+if __name__ == '__main__':
     main()

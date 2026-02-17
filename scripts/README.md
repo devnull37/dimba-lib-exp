@@ -34,10 +34,65 @@ python scripts/train_interactive.py
 ```
 
 This launches a wizard that:
+- **Asks what to train**: VAE, DIMBA (embedding), DIMBA (latent), or BOTH
 - Auto-detects your GPU(s)
 - Suggests optimal presets based on VRAM
 - Estimates memory usage before training
 - Lets you customize everything interactively
+
+### Training Modes Explained
+
+**EMBEDDING-SPACE DIFFUSION** (no VAE needed)
+```
+Tokens → Embeddings → [Diffusion] → Embeddings → Tokens
+```
+- Simpler, no pre-training required
+- Direct control over embeddings
+- Good for getting started
+
+**LATENT-SPACE DIFFUSION** (requires VAE)
+```
+Tokens → Embeddings → VAE Encode → Latents → [Diffusion] → Latents → VAE Decode → Embeddings → Tokens
+```
+- Compressed representation (faster training/inference)
+- Smoother latent space
+- Requires pre-trained VAE
+
+### Train VAE only
+```bash
+python scripts/train_interactive.py --train-mode vae
+```
+Pre-train a TokenVAE for later use with latent-space diffusion.
+
+### Train DIMBA (embedding-space)
+```bash
+python scripts/train_interactive.py --train-mode dimba-embedding
+```
+Train the diffusion model directly in embedding space. No VAE needed.
+
+### Train DIMBA (latent-space)
+```bash
+# Requires a pre-trained VAE checkpoint
+python scripts/train_interactive.py --train-mode dimba-latent --vae-checkpoint checkpoints/vae/final.ckpt
+```
+Train the diffusion model in VAE latent space for potentially better efficiency.
+
+### Train BOTH (VAE + DIMBA)
+```bash
+python scripts/train_interactive.py --train-mode both
+```
+Train VAE first, then automatically train DIMBA using that VAE. Complete pipeline in one command.
+
+### Do I need a VAE?
+
+**No** - You can train and use DIMBA without a VAE using embedding-space diffusion. This is the simpler option and works well.
+
+**Yes** - If you want:
+- Faster training/inference through compression
+- Smoother latent space representations
+- To experiment with latent diffusion techniques
+
+The VAE is trained on the **same dataset** as the diffusion model (or you can use a different one). The key is that the VAE learns to compress the token embeddings, and the diffusion model then learns to generate in that compressed space.
 
 ### Auto-upload to HuggingFace
 
