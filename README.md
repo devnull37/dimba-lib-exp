@@ -243,6 +243,7 @@ dimba-lib-exp/
 │   │   ├── diffusion.py       # DIMBA model wrapper
 │   │   ├── denoiser.py        # Mamba-2 denoiser
 │   │   ├── embeddings.py      # Token, timestep, prompt embeddings
+│   │   ├── vae.py             # TokenVAE for latent diffusion
 │   │   └── simple_mamba.py    # CPU fallback implementation
 │   ├── diffusion/
 │   │   ├── schedules.py       # Cosine noise schedule
@@ -253,10 +254,25 @@ dimba-lib-exp/
 │   │   └── trainer.py         # PyTorch Lightning training
 │   └── evaluation/
 │       └── metrics.py         # BLEU, ROUGE, METEOR, perplexity
-├── scripts/
-│   ├── train.py
-│   ├── generate.py
-│   └── evaluate.py
+├── scripts/                   # All training and utility scripts
+│   ├── train_interactive.py   # Interactive wizard (RECOMMENDED)
+│   ├── train.py               # Generic training script
+│   ├── train_vae.py           # VAE pre-training
+│   ├── train_fineweb_1b.py    # 1.5B model on FineWeb
+│   ├── train_fineweb_500m_a4000.py  # 500M model for A4000
+│   ├── generate.py            # Text generation
+│   ├── evaluate.py            # Model evaluation
+│   ├── upload_to_hf.py        # HuggingFace upload
+│   ├── README.md              # Detailed script documentation
+│   ├── setup/                 # Installation scripts
+│   │   ├── install_a4000.sh
+│   │   ├── install_l40s.sh
+│   │   ├── install_deps.sh
+│   │   └── setup_training.sh
+│   └── utils/                 # Utility scripts
+│       ├── calculate_memory.py
+│       ├── test_config.py
+│       └── test_dataset_loading.py
 ├── tests/
 ├── config.yaml
 ├── README.md
@@ -297,7 +313,7 @@ This profile matches your requested setup: **single RTX A4000 16GB**, **embeddin
 ### 1) Instance setup (A4000 specific)
 
 ```bash
-bash install_a4000.sh
+bash scripts/setup/install_a4000.sh
 ```
 
 ### 2) Train the 500M profile
