@@ -160,3 +160,7 @@ experiments/
 local/
 local_config.yaml
 config_local.yaml
+
+# Interactive training outputs
+checkpoints/interactive/
+logs/interactive/

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Test if FineWeb 10BT can be loaded without streaming."""
+"""Test if FineWeb 10BT can be loaded without streaming.
+
+Usage:
+    python scripts/utils/test_dataset_loading.py
+"""
 
 from datasets import load_dataset
 

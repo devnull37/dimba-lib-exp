@@ -1,20 +1,40 @@
 #!/usr/bin/env python3
-"""Training script for DIMBA model."""
+"""Training script for DIMBA model.
+
+Usage:
+    # Train with default config
+    python scripts/train.py
+
+    # Train with custom config
+    python scripts/train.py --config configs/my_config.yaml --max-epochs 20
+
+    # Train on CPU
+    python scripts/train.py --gpus 0
+
+    # Train with mixed precision
+    python scripts/train.py --mixed-precision 16-mixed
+"""
 
 import argparse
-import yaml
-import torch
-from torch.utils.data import DataLoader
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
-
 import sys
-sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
+from pathlib import Path
+
+import pytorch_lightning as pl
+import torch
+import yaml
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from torch.utils.data import DataLoader
+
+# Add src to path
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = (SCRIPT_DIR / ".." / "src").resolve()
+sys.path.insert(0, str(SRC_DIR))
 
 from dimba import DIMBA
-from dimba.data import TextDataset, HuggingFaceDataset, DummyDataset, collate_fn
+from dimba.data import DummyDataset, HuggingFaceDataset, TextDataset, collate_fn
 from dimba.training import DIMBALightningModule
+from dimba.tokenizers import BPETokenizer, SimpleCharacterTokenizer
 
 
 def load_config(config_path: str) -> dict:

@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Test script to verify DIMBA configuration and dependencies."""
+"""Test script to verify DIMBA configuration and dependencies.
+
+Usage:
+    python scripts/utils/test_config.py
+"""
 
 import sys
+from pathlib import Path
 
 import torch
 
-# Add src to path
-sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
+# Add src to path (handle both direct and scripts/utils/ locations)
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = (SCRIPT_DIR / ".." / ".." / "src").resolve()
+sys.path.insert(0, str(SRC_DIR))
 
 def test_dependencies():
     """Test if all required dependencies are available."""

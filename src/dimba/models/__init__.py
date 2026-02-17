@@ -10,6 +10,7 @@ from .embeddings import (
     AdditiveConditioning,
 )
 from .simple_mamba import SimpleMamba2, SimpleMamba2Block
+from .vae import TokenVAE, TokenVAEWithDeterministicFallback, create_latent_projector
 
 __all__ = [
     "DIMBA",
@@ -23,4 +24,7 @@ __all__ = [
     "AdditiveConditioning",
     "SimpleMamba2",
     "SimpleMamba2Block",
+    "TokenVAE",
+    "TokenVAEWithDeterministicFallback",
+    "create_latent_projector",
 ]
