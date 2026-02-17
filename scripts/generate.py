@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
-"""Generation script for DIMBA model."""
+"""Generation script for DIMBA model.
+
+Usage:
+    # Generate with default settings
+    python scripts/generate.py --checkpoint checkpoints/dimba.ckpt --prompt "Hello world"
+
+    # Generate with DDIM sampling
+    python scripts/generate.py --checkpoint checkpoints/dimba.ckpt --prompt "Hello world" --use-ddim
+
+    # Generate multiple samples
+    python scripts/generate.py --checkpoint checkpoints/dimba.ckpt --prompt "Hello world" --num-samples 3
+"""
 
 import argparse
+import sys
+from pathlib import Path
+
 import torch
 import yaml
-import sys
 
-sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
+# Add src to path
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = (SCRIPT_DIR / ".." / "src").resolve()
+sys.path.insert(0, str(SRC_DIR))
 
-from dimba import DIMBA, sample_from_model, DDIMSampler
+from dimba import DIMBA, DDIMSampler, sample_from_model
 
 
 def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str, config_path: str = None):

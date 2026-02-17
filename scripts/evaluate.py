@@ -1,17 +1,33 @@
 #!/usr/bin/env python3
-"""Evaluation script for DIMBA model."""
+"""Evaluation script for DIMBA model.
+
+Usage:
+    # Basic evaluation
+    python scripts/evaluate.py --checkpoint checkpoints/dimba.ckpt --vocab-size 32000
+
+    # Evaluate with speed benchmarking
+    python scripts/evaluate.py --checkpoint checkpoints/dimba.ckpt --vocab-size 32000 --eval-speed
+
+    # Evaluate on CPU
+    python scripts/evaluate.py --checkpoint checkpoints/dimba.ckpt --vocab-size 32000 --device cpu
+"""
 
 import argparse
-import torch
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, str(__file__).rsplit('/', 1)[0] + '/../src')
+import torch
+from torch.utils.data import DataLoader
+
+# Add src to path
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = (SCRIPT_DIR / ".." / "src").resolve()
+sys.path.insert(0, str(SRC_DIR))
 
 from dimba import DIMBA
 from dimba.data import DummyDataset, collate_fn
 from dimba.evaluation import compute_model_perplexity
-from torch.utils.data import DataLoader
 
 
 def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str):

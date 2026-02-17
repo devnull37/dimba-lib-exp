@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Upload DIMBA training artifacts to the Hugging Face Hub."""
+"""Upload DIMBA training artifacts to the Hugging Face Hub.
+
+Usage:
+    # Upload with explicit token
+    python scripts/upload_to_hf.py --repo-id username/dimba-500m --token $HF_TOKEN
+
+    # Upload with env token
+    export HF_TOKEN=your_token
+    python scripts/upload_to_hf.py --repo-id username/dimba-500m
+
+    # Upload as private repo
+    python scripts/upload_to_hf.py --repo-id username/dimba-500m --private
+"""
 
 import argparse
 import os

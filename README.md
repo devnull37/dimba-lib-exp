@@ -66,6 +66,83 @@ prompt_ids = torch.tensor([[10, 20, 30]])
 generated = sample_from_model(model, prompt_ids, seq_len=100, num_steps=50)
 ```
 
+## VAE Pre-training for Latent Diffusion
+
+DIMBA supports Variational Autoencoder (VAE) based latent diffusion, which compresses token embeddings into a probabilistic latent space. This can improve diffusion efficiency and model capacity.
+
+### VAE Architecture
+
+The `TokenVAE` class implements:
+- **Encoder**: Maps token embeddings to latent distribution (μ, log σ²)
+- **Reparameterization**: Stochastic sampling z = μ + σ·ε where ε ~ N(0,I)
+- **Decoder**: Maps latent z back to embedding space
+- **ELBO Loss**: Reconstruction loss + β·KL divergence
+
+### Pre-training the VAE
+
+Pre-train the VAE before full diffusion training:
+
+```bash
+# Basic VAE training
+python scripts/train_vae.py \
+    --dataset wikitext \
+    --dataset-config wikitext-2-raw-v1 \
+    --latent-dim 256 \
+    --kl-weight 1.0 \
+    --learning-rate 1e-4 \
+    --batch-size 64 \
+    --epochs 10
+
+# With PyTorch Lightning (multi-GPU support)
+python scripts/train_vae.py \
+    --use-lightning \
+    --dataset wikitext \
+    --gpus 1 \
+    --latent-dim 256 \
+    --kl-weight 0.1 \
+    --max-steps 100000
+
+# Resume from checkpoint
+python scripts/train_vae.py \
+    --resume-from checkpoints/vae/last.ckpt \
+    --epochs 20
+```
+
+### Using VAE in DIMBA
+
+After pre-training, use the VAE checkpoint for latent diffusion:
+
+```python
+from dimba import DIMBA
+
+model = DIMBA(
+    vocab_size=50000,
+    d_model=512,
+    latent_diffusion=True,
+    d_latent=256,
+    use_vae_latent=True,           # Use VAE instead of deterministic projector
+    vae_kl_weight=1.0,             # KL weight for VAE
+    vae_checkpoint_path='checkpoints/vae/final.ckpt',  # Load pre-trained VAE
+)
+```
+
+### VAE Training Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--latent-dim` | Dimension of latent space | 256 |
+| `--kl-weight` | Weight for KL divergence (β-VAE) | 1.0 |
+| `--hidden-dim` | Hidden layer dimension | max(d_model, latent_dim) |
+| `--num-layers` | Number of encoder/decoder layers | 2 |
+| `--dropout` | Dropout rate | 0.1 |
+
+### Key Features
+
+- **Deterministic inference**: Use μ for encoding during diffusion, sample z only during training
+- **Pre-training**: Train VAE independently to learn a good latent space
+- **Checkpoint loading**: Load pre-trained VAE weights into DIMBA
+- **KL regularization**: β-VAE formulation allows controlling latent space structure
+
 ## Architecture
 
 ### Core Components

@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Training script for DIMBA 1.5B model on FineWeb dataset (L40S 48GB)."""
+"""Training script for DIMBA 1.5B model on FineWeb dataset (L40S 48GB).
+
+Usage:
+    python scripts/train_fineweb_1b.py
+
+This script trains a 1.5B parameter DIMBA model on the FineWeb dataset,
+optimized for an L40S GPU with 48GB VRAM.
+"""
 
 import os
 import sys
-import torch
+from pathlib import Path
+
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+import torch
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # Add src to path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(script_dir, '..', 'src')
-sys.path.insert(0, os.path.abspath(src_dir))
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = (SCRIPT_DIR / ".." / "src").resolve()
+sys.path.insert(0, str(SRC_DIR))
 
-from dimba import DIMBA
 from dimba.data import HuggingFaceDataset, collate_fn
 from dimba.tokenizers import BPETokenizer
 from dimba.training import DIMBALightningModule

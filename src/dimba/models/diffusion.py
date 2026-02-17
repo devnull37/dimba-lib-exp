@@ -2,11 +2,12 @@
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from ..diffusion.schedules import CosineNoiseSchedule
 from .embeddings import TokenEmbedding, TimestepEmbedding, PromptEncoder, LatentProjector
 from .denoiser import Mamba2Denoiser, DenoisingHead
+from .vae import TokenVAE, TokenVAEWithDeterministicFallback
 
 
 class DIMBA(nn.Module):
@@ -49,6 +50,9 @@ class DIMBA(nn.Module):
         latent_projector_depth: int = 2,
         latent_loss_weight: float = 1.0,
         recon_loss_weight: float = 1.0,
+        use_vae_latent: bool = False,
+        vae_kl_weight: float = 1.0,
+        vae_checkpoint_path: Optional[str] = None,
     ):
         super().__init__()
 
@@ -60,6 +64,7 @@ class DIMBA(nn.Module):
         self.latent_diffusion = latent_diffusion
         self.latent_loss_weight = latent_loss_weight
         self.recon_loss_weight = recon_loss_weight
+        self.use_vae_latent = use_vae_latent
 
         if self.latent_diffusion:
             if d_latent is None:
@@ -80,17 +85,43 @@ class DIMBA(nn.Module):
             dropout=dropout,
         )
 
-        # Latent projector
+        # Latent projector (VAE or deterministic)
         self.latent_projector = None
         self.cond_projector = None
         if self.latent_diffusion:
-            self.latent_projector = LatentProjector(
-                input_dim=d_model,
-                latent_dim=self.d_latent,
-                hidden_dim=max(d_model, self.d_latent),
-                num_layers=latent_projector_depth,
-                dropout=dropout,
-            )
+            if self.use_vae_latent:
+                # Use VAE for latent diffusion
+                vae = TokenVAE(
+                    input_dim=d_model,
+                    latent_dim=self.d_latent,
+                    hidden_dim=max(d_model, self.d_latent),
+                    num_layers=latent_projector_depth,
+                    dropout=dropout,
+                    kl_weight=vae_kl_weight,
+                )
+                # Load checkpoint if provided
+                if vae_checkpoint_path is not None:
+                    checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
+                    if "vae_state_dict" in checkpoint:
+                        vae.load_state_dict(checkpoint["vae_state_dict"])
+                    else:
+                        vae.load_state_dict(checkpoint)
+                    print(f"Loaded VAE checkpoint from {vae_checkpoint_path}")
+                
+                self.latent_projector = TokenVAEWithDeterministicFallback(
+                    vae=vae,
+                    use_vae_sampling=False,  # Use deterministic mu for diffusion
+                )
+            else:
+                # Use deterministic LatentProjector
+                self.latent_projector = LatentProjector(
+                    input_dim=d_model,
+                    latent_dim=self.d_latent,
+                    hidden_dim=max(d_model, self.d_latent),
+                    num_layers=latent_projector_depth,
+                    dropout=dropout,
+                )
+            
             if d_prompt != self.d_latent:
                 self.cond_projector = nn.Linear(d_prompt, self.d_latent)
 
@@ -169,6 +200,7 @@ class DIMBA(nn.Module):
         input_ids: torch.Tensor,
         t: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
+        return_latent_info: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
         """Forward pass during training.
 
@@ -178,14 +210,28 @@ class DIMBA(nn.Module):
             input_ids: Target token IDs [batch_size, seq_len]
             t: Timesteps [batch_size], values in [0, num_diffusion_steps-1]
             noise: Optional predefined noise, otherwise sampled
+            return_latent_info: Whether to return latent information for latent loss
 
         Returns:
             predicted_embeddings: Predicted clean embeddings [batch_size, seq_len, d_model]
             noise: The noise that was used for noising
+            latent_info: Optional dictionary containing latent information
         """
         # Get clean embeddings
         x_0 = self.token_embed(input_ids)  # [batch_size, seq_len, d_model]
+        
+        # Encode to latent space
         z_0 = self.encode_latent(x_0)  # [batch_size, seq_len, d_latent]
+        
+        # If using VAE, get the VAE stats for KL loss computation
+        vae_kl_loss = None
+        if self.use_vae_latent and self.latent_projector is not None:
+            # Re-run through VAE to get mu/logvar for KL loss
+            _, vae_stats = self.latent_projector(x_0, return_stats=True)
+            if vae_stats is not None:
+                vae_kl_loss = -0.5 * torch.sum(
+                    1 + vae_stats["logvar"] - vae_stats["mu"].pow(2) - vae_stats["logvar"].exp()
+                )
 
         # Add noise according to schedule
         x_t, noise = self.noise_schedule.add_noise(z_0, t, noise)
@@ -204,8 +250,12 @@ class DIMBA(nn.Module):
         latent_info = None
         if self.latent_diffusion:
             latent_info = {"z_pred": z_pred, "z_0": z_0}
+            if vae_kl_loss is not None:
+                latent_info["vae_kl_loss"] = vae_kl_loss
 
-        return x_pred, noise, latent_info
+        if return_latent_info:
+            return x_pred, noise, latent_info
+        return x_pred, noise
 
     def denoise_step(
         self,

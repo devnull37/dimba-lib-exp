@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Calculate optimal configuration for L40S 48GB VRAM."""
+"""Calculate optimal configuration for L40S 48GB VRAM.
+
+Usage:
+    python scripts/utils/calculate_memory.py
+"""
 
 
 def calculate_memory_usage():

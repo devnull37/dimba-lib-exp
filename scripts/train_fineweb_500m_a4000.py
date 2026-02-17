@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Train DIMBA (~500M) on FineWeb using an RTX A4000 16GB profile."""
+"""Train DIMBA (~500M) on FineWeb using an RTX A4000 16GB profile.
+
+Usage:
+    # Train with default config
+    python scripts/train_fineweb_500m_a4000.py
+
+    # Train with custom config
+    python scripts/train_fineweb_500m_a4000.py --config configs/my_config.yaml
+
+    # Auto-upload to HuggingFace after training
+    python scripts/train_fineweb_500m_a4000.py --repo-id username/dimba-500m --upload-token $HF_TOKEN
+"""
 
 import argparse
 import os
