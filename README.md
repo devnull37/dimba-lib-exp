@@ -2,6 +2,9 @@
 
 A PyTorch implementation of **DIMBA** (Diffusion + Mamba-based Architecture) - a non-autoregressive language model combining cosine-scheduled diffusion with Mamba-2 state-space models for parallel text generation.
 
+🌐 **Website**: [dimbalabs.netlify.app](https://dimbalabs.netlify.app/)  
+📄 **Paper**: [Read on ResearchHub](https://doi.org/10.55277/researchhub.lu30m581.2)
+
 ## Overview
 
 DIMBA generates entire token sequences in parallel using iterative denoising, enabling controllable speed-quality trade-offs by adjusting diffusion steps T. It leverages Mamba-2's efficient long-range dependency modeling for linear-time sequence processing.
@@ -306,6 +309,10 @@ dimba-lib-exp/
 ## License
 
 MIT License - See LICENSE file for details.
+
+---
+
+**Learn more**: [dimbalabs.netlify.app](https://dimbalabs.netlify.app/) | [Research Paper](https://doi.org/10.55277/researchhub.lu30m581.2)
 ## RTX A4000 (16GB) recipe: FineWeb + FiLM + embedding diffusion (~500M)
 
 This profile matches your requested setup: **single RTX A4000 16GB**, **embedding diffusion**, **FiLM conditioning**, and a **~500M parameter target**.
