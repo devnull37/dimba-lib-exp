@@ -76,3 +76,10 @@ checkpoint:
   save_dir: "./checkpoints"
   save_interval: 500        # Save every N steps
   keep_last_k: 3            # Keep last K checkpoints
+
+# Progressive checkpointing configuration
+progressive_checkpoints:
+  enabled: false                     # Enable milestone-based checkpointing
+  milestones: [1000000000, 5000000000, 10000000000, 30000000000]  # 1B, 5B, 10B, 30B params
+  save_dir: "./progressive_checkpoints"
+  # Resume from progressive checkpoint: set checkpoint_path to the milestone checkpoint file

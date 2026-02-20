@@ -5,13 +5,14 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import math
 import os
 
 from ..models.diffusion import DIMBA
 from ..models.vae import TokenVAE
 from ..diffusion.sampling import sample_timesteps
+from ..utils.checkpointing import ProgressiveCheckpointManager
 
 
 def compute_consistency_loss(
@@ -116,6 +117,7 @@ class DIMBALightningModule(pl.LightningModule):
 
     Handles training loop, optimization, EMA, and logging.
     Supports CDLM (Consistency Diffusion Language Model) training for faster inference.
+    Supports progressive checkpointing based on parameter milestones.
 
     Args:
         vocab_size: Size of vocabulary
@@ -131,6 +133,9 @@ class DIMBALightningModule(pl.LightningModule):
         consistency_loss_weight: Weight for consistency loss (default: 0.5)
         consistency_delta_min: Minimum timestep delta for consistency pairs (default: 50)
         consistency_delta_max: Maximum timestep delta for consistency pairs (default: 200)
+        progressive_milestones: List of parameter count milestones for progressive checkpointing
+        progressive_save_dir: Directory for progressive checkpoints
+        enable_progressive_checkpoints: Whether to enable progressive checkpointing
     """
 
     def __init__(
@@ -148,6 +153,9 @@ class DIMBALightningModule(pl.LightningModule):
         consistency_loss_weight: float = 0.5,
         consistency_delta_min: int = 50,
         consistency_delta_max: int = 200,
+        progressive_milestones: Optional[List[int]] = None,
+        progressive_save_dir: str = "./progressive_checkpoints",
+        enable_progressive_checkpoints: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -166,6 +174,15 @@ class DIMBALightningModule(pl.LightningModule):
         self.consistency_loss_weight = consistency_loss_weight
         self.consistency_delta_min = consistency_delta_min
         self.consistency_delta_max = consistency_delta_max
+
+        # Progressive checkpointing
+        self.progressive_checkpoint_manager = None
+        if enable_progressive_checkpoints and progressive_milestones:
+            self.progressive_checkpoint_manager = ProgressiveCheckpointManager(
+                milestones=progressive_milestones,
+                save_dir=progressive_save_dir,
+                enabled=True,
+            )
 
         # Build model
         self.model = DIMBA(vocab_size=vocab_size, **model_config)
@@ -240,7 +257,7 @@ class DIMBALightningModule(pl.LightningModule):
         return self.model(input_ids, t)
 
     def training_step(self, batch, batch_idx):
-        """Training step with optional CDLM consistency loss."""
+        """Training step with optional CDLM consistency loss and progressive checkpointing."""
         input_ids = batch["input_ids"]
         batch_size = input_ids.shape[0]
 
@@ -275,6 +292,30 @@ class DIMBALightningModule(pl.LightningModule):
         # Update EMA periodically to reduce transfer overhead for CPU-offloaded EMA.
         if self.use_ema and (self.global_step + 1) % self.ema_update_interval == 0:
             self._update_ema_model()
+
+        # Check for progressive checkpoint milestones
+        if self.progressive_checkpoint_manager is not None:
+            should_save, milestone = self.progressive_checkpoint_manager.should_save_checkpoint(self.model)
+            if should_save and milestone is not None:
+                optimizer = self.optimizers()
+                checkpoint_path = self.progressive_checkpoint_manager.save_checkpoint(
+                    model=self.model,
+                    optimizer=optimizer,
+                    global_step=self.global_step,
+                    milestone=milestone,
+                    metadata={
+                        "epoch": self.current_epoch,
+                        "train_loss": loss.item(),
+                        "use_consistency_training": self.use_consistency_training,
+                    },
+                )
+                milestone_str = self.progressive_checkpoint_manager.format_param_count(milestone)
+                current_str = self.progressive_checkpoint_manager.format_param_count(
+                    self.progressive_checkpoint_manager.count_parameters(self.model)
+                )
+                self.log("train/progressive_checkpoint_saved", float(milestone), prog_bar=True)
+                print(f"\n🎯 Progressive checkpoint saved: {milestone_str} (current: {current_str}) at step {self.global_step}")
+                print(f"   Path: {checkpoint_path}")
 
         # Logging
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
@@ -380,7 +421,7 @@ def get_model_config(model: DIMBA) -> Dict[str, Any]:
 class SimpleTrainer:
     """Simple training loop without PyTorch Lightning (for debugging/custom needs).
 
-    Supports CDLM consistency training for faster inference.
+    Supports CDLM consistency training and progressive checkpointing.
 
     Args:
         model: DIMBA model
@@ -395,6 +436,9 @@ class SimpleTrainer:
         consistency_loss_weight: Weight for consistency loss (default: 0.5)
         consistency_delta_min: Minimum timestep delta (default: 50)
         consistency_delta_max: Maximum timestep delta (default: 200)
+        progressive_milestones: List of parameter count milestones (default: None)
+        progressive_save_dir: Directory for progressive checkpoints (default: "./progressive_checkpoints")
+        enable_progressive_checkpoints: Enable progressive checkpointing (default: False)
     """
 
     def __init__(
@@ -411,6 +455,9 @@ class SimpleTrainer:
         consistency_loss_weight: float = 0.5,
         consistency_delta_min: int = 50,
         consistency_delta_max: int = 200,
+        progressive_milestones: Optional[List[int]] = None,
+        progressive_save_dir: str = "./progressive_checkpoints",
+        enable_progressive_checkpoints: bool = False,
     ):
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
@@ -426,6 +473,15 @@ class SimpleTrainer:
         self.consistency_loss_weight = consistency_loss_weight
         self.consistency_delta_min = consistency_delta_min
         self.consistency_delta_max = consistency_delta_max
+
+        # Progressive checkpointing
+        self.progressive_checkpoint_manager = None
+        if enable_progressive_checkpoints and progressive_milestones:
+            self.progressive_checkpoint_manager = ProgressiveCheckpointManager(
+                milestones=progressive_milestones,
+                save_dir=progressive_save_dir,
+                enabled=True,
+            )
 
         # EMA model - preserve all config
         ema_config = get_model_config(model)
@@ -457,7 +513,7 @@ class SimpleTrainer:
                 ema_param.data = ema_param.data * self.ema_decay + param.data * (1 - self.ema_decay)
 
     def train(self):
-        """Run training loop with optional CDLM consistency training."""
+        """Run training loop with optional CDLM consistency training and progressive checkpointing."""
         total_steps = len(self.train_dataloader) * self.num_epochs
 
         for epoch in range(self.num_epochs):
@@ -510,6 +566,28 @@ class SimpleTrainer:
                 epoch_loss += loss.item()
                 epoch_denoise_loss += denoise_loss.item()
                 self.global_step += 1
+
+                # Check for progressive checkpoint milestones
+                if self.progressive_checkpoint_manager is not None:
+                    should_save, milestone = self.progressive_checkpoint_manager.should_save_checkpoint(self.model)
+                    if should_save and milestone is not None:
+                        checkpoint_path = self.progressive_checkpoint_manager.save_checkpoint(
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            global_step=self.global_step,
+                            milestone=milestone,
+                            metadata={
+                                "epoch": epoch,
+                                "train_loss": loss.item(),
+                                "use_consistency_training": self.use_consistency_training,
+                            },
+                        )
+                        milestone_str = self.progressive_checkpoint_manager.format_param_count(milestone)
+                        current_str = self.progressive_checkpoint_manager.format_param_count(
+                            self.progressive_checkpoint_manager.count_parameters(self.model)
+                        )
+                        print(f"\n🎯 Progressive checkpoint saved: {milestone_str} (current: {current_str}) at step {self.global_step}")
+                        print(f"   Path: {checkpoint_path}")
 
                 if batch_idx % 100 == 0:
                     log_msg = (
