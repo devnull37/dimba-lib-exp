@@ -404,11 +404,11 @@ def get_model_config(model: DIMBA) -> Dict[str, Any]:
         'd_model': model.d_model,
         'd_prompt': model.d_prompt,
         'num_diffusion_steps': model.num_diffusion_steps,
-        # Extract from denoiser if available
-        'num_denoiser_layers': len(model.denoiser.layers) if hasattr(model.denoiser, 'layers') else 6,
-        'd_state': getattr(model.denoiser, 'd_state', 16) if hasattr(model, 'denoiser') else 16,
-        'd_conv': getattr(model.denoiser, 'd_conv', 4) if hasattr(model, 'denoiser') else 4,
-        'expand': getattr(model.denoiser, 'expand', 2) if hasattr(model, 'denoiser') else 2,
+        # Extract from denoiser if available (simplified getattr)
+        'num_denoiser_layers': len(model.denoiser.layers) if hasattr(model, 'denoiser') and hasattr(model.denoiser, 'layers') else 6,
+        'd_state': getattr(getattr(model, 'denoiser', None), 'd_state', 16),
+        'd_conv': getattr(getattr(model, 'denoiser', None), 'd_conv', 4),
+        'expand': getattr(getattr(model, 'denoiser', None), 'expand', 2),
         # Latent diffusion settings
         'latent_diffusion': model.latent_diffusion,
         'd_latent': getattr(model, 'd_latent', None),
