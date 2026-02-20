@@ -49,6 +49,11 @@ training:
   max_steps: null           # Set to limit training steps (null = no limit)
   log_interval: 100
   val_interval: 500
+  # CDLM Consistency Training (Together AI paper)
+  use_consistency_training: false  # Enable for up to 14x faster inference
+  consistency_loss_weight: 0.5    # Lambda weight for consistency loss (0.5-1.0)
+  consistency_delta_min: 50       # Minimum timestep gap for consistency pairs
+  consistency_delta_max: 200      # Maximum timestep gap for consistency pairs
 
 # GPU/Device configuration
 device:
@@ -71,3 +76,10 @@ checkpoint:
   save_dir: "./checkpoints"
   save_interval: 500        # Save every N steps
   keep_last_k: 3            # Keep last K checkpoints
+
+# Progressive checkpointing configuration
+progressive_checkpoints:
+  enabled: false                     # Enable milestone-based checkpointing
+  milestones: [1000000000, 5000000000, 10000000000, 30000000000]  # 1B, 5B, 10B, 30B params
+  save_dir: "./progressive_checkpoints"
+  # Resume from progressive checkpoint: set checkpoint_path to the milestone checkpoint file

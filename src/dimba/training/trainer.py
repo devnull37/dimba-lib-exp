@@ -4,18 +4,120 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from torch.optim import AdamW
-from typing import Optional, Dict, Any
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from typing import Optional, Dict, Any, Tuple, List
+import math
 import os
 
 from ..models.diffusion import DIMBA
 from ..models.vae import TokenVAE
 from ..diffusion.sampling import sample_timesteps
+from ..utils.checkpointing import ProgressiveCheckpointManager
+
+
+def compute_consistency_loss(
+    model: DIMBA,
+    input_ids: torch.Tensor,
+    x_0: torch.Tensor,
+    t_early: torch.Tensor,
+    delta_min: int,
+    delta_max: int,
+) -> torch.Tensor:
+    """Compute CDLM consistency loss.
+
+    Shared utility function for computing consistency loss between predictions
+    at different timesteps. Aligns predictions at timestep t with predictions
+    at t-delta (later, less noisy state).
+
+    Args:
+        model: DIMBA model instance
+        input_ids: Target token IDs [batch_size, seq_len]
+        x_0: Clean embeddings [batch_size, seq_len, d_model]
+        t_early: Timesteps for early (noisier) state [batch_size]
+        delta_min: Minimum timestep delta for consistency pairs
+        delta_max: Maximum timestep delta for consistency pairs
+
+    Returns:
+        consistency_loss: MSE between predictions at t and t-delta
+    """
+    device = t_early.device
+    batch_size = input_ids.shape[0]
+
+    # Adaptive delta sampling: ensure delta doesn't exceed t_early - delta_min
+    # This prevents t_late from becoming negative
+    max_possible_delta = torch.clamp(t_early - delta_min, min=0)
+    effective_max_delta = torch.min(
+        torch.full_like(t_early, delta_max),
+        max_possible_delta
+    )
+
+    # Only process items where we can have a valid delta
+    valid_mask = effective_max_delta >= delta_min
+    if not valid_mask.any():
+        return torch.tensor(0.0, device=device)
+
+    # Filter to valid items
+    t_early = t_early[valid_mask]
+    effective_max_delta = effective_max_delta[valid_mask]
+    input_ids = input_ids[valid_mask]
+    x_0 = x_0[valid_mask]
+
+    # Sample delta timesteps within valid range for each item
+    delta = torch.stack([
+        torch.randint(
+            delta_min,
+            min(int(eff.item()) + 1, delta_max + 1),
+            (1,),
+            device=device
+        ).squeeze(0)
+        for eff in effective_max_delta
+    ])
+    delta = torch.min(delta, effective_max_delta.long())
+
+    # Compute t_late
+    t_late = t_early - delta
+
+    # Encode to latent space (same as main loss)
+    z_0 = model.encode_latent(x_0)
+
+    # Add noise at both timesteps
+    x_t_early, _ = model.noise_schedule.add_noise(z_0, t_early)
+    x_t_late, _ = model.noise_schedule.add_noise(z_0, t_late)
+
+    # Encode prompt
+    cond = model.encode_prompt(input_ids)
+    cond = model.project_conditioning(cond)
+
+    # Get timestep embeddings
+    time_emb_early = model.timestep_embed(t_early)
+    time_emb_late = model.timestep_embed(t_late)
+
+    # Predict at t_early (trainable)
+    z_pred_early = model.denoiser(x_t_early, cond, time_emb_early)
+
+    # Predict at t_late (stop-gradient target)
+    with torch.no_grad():
+        z_pred_late = model.denoiser(x_t_late, cond, time_emb_late)
+
+    # Weight by remaining noise level at t_late
+    # Positions with more remaining noise get higher weight
+    noise_level_late = model.noise_schedule.sqrt_one_minus_alphas_cumprod[t_late]
+    noise_level_late = noise_level_late.view(-1, 1, 1)
+    weights = noise_level_late.clamp(min=0.01)
+
+    # Compute weighted MSE
+    diff = (z_pred_early - z_pred_late.detach()) * weights
+    consistency_loss = (diff ** 2).mean()
+
+    return consistency_loss
 
 
 class DIMBALightningModule(pl.LightningModule):
     """PyTorch Lightning module for training DIMBA.
 
     Handles training loop, optimization, EMA, and logging.
+    Supports CDLM (Consistency Diffusion Language Model) training for faster inference.
+    Supports progressive checkpointing based on parameter milestones.
 
     Args:
         vocab_size: Size of vocabulary
@@ -27,6 +129,13 @@ class DIMBALightningModule(pl.LightningModule):
         use_ema: Whether to use EMA (default: True)
         ema_device: Optional device to store EMA weights; None keeps default Lightning placement
         ema_update_interval: Update EMA every N steps (default: 1)
+        use_consistency_training: Enable CDLM consistency loss (default: False)
+        consistency_loss_weight: Weight for consistency loss (default: 0.5)
+        consistency_delta_min: Minimum timestep delta for consistency pairs (default: 50)
+        consistency_delta_max: Maximum timestep delta for consistency pairs (default: 200)
+        progressive_milestones: List of parameter count milestones for progressive checkpointing
+        progressive_save_dir: Directory for progressive checkpoints
+        enable_progressive_checkpoints: Whether to enable progressive checkpointing
     """
 
     def __init__(
@@ -40,6 +149,13 @@ class DIMBALightningModule(pl.LightningModule):
         use_ema: bool = True,
         ema_device: Optional[str] = None,
         ema_update_interval: int = 1,
+        use_consistency_training: bool = False,
+        consistency_loss_weight: float = 0.5,
+        consistency_delta_min: int = 50,
+        consistency_delta_max: int = 200,
+        progressive_milestones: Optional[List[int]] = None,
+        progressive_save_dir: str = "./progressive_checkpoints",
+        enable_progressive_checkpoints: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -52,6 +168,21 @@ class DIMBALightningModule(pl.LightningModule):
         self.ema_decay = ema_decay
         self.ema_update_interval = max(1, int(ema_update_interval))
         self.ema_device = torch.device(ema_device) if ema_device is not None else None
+
+        # CDLM consistency training parameters
+        self.use_consistency_training = use_consistency_training
+        self.consistency_loss_weight = consistency_loss_weight
+        self.consistency_delta_min = consistency_delta_min
+        self.consistency_delta_max = consistency_delta_max
+
+        # Progressive checkpointing
+        self.progressive_checkpoint_manager = None
+        if enable_progressive_checkpoints and progressive_milestones:
+            self.progressive_checkpoint_manager = ProgressiveCheckpointManager(
+                milestones=progressive_milestones,
+                save_dir=progressive_save_dir,
+                enabled=True,
+            )
 
         # Build model
         self.model = DIMBA(vocab_size=vocab_size, **model_config)
@@ -126,38 +257,76 @@ class DIMBALightningModule(pl.LightningModule):
         return self.model(input_ids, t)
 
     def training_step(self, batch, batch_idx):
-        """Training step."""
+        """Training step with optional CDLM consistency loss and progressive checkpointing."""
         input_ids = batch["input_ids"]
         batch_size = input_ids.shape[0]
 
-        # Sample random timesteps
+        # Sample random timesteps for main denoising loss
         t = sample_timesteps(batch_size, self.model.num_diffusion_steps, self.device)
 
-        # Forward pass
+        # Forward pass for denoising loss
         x_pred, noise, latent_info = self.model(input_ids, t)
 
         # Get clean embeddings
         x_0 = self.model.token_embed(input_ids)
 
-        # Compute loss (predict clean embeddings or latent targets)
+        # Compute denoising loss (predict clean embeddings or latent targets)
         loss = self.loss_fn(x_pred, x_0) * self.model.recon_loss_weight
         if self.model.latent_diffusion and latent_info is not None:
             latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
             loss = loss + latent_loss * self.model.latent_loss_weight
 
+        # CDLM Consistency loss: align predictions at t with predictions at t-delta
+        consistency_loss = torch.tensor(0.0, device=self.device)
+        if self.use_consistency_training and self.consistency_loss_weight > 0:
+            consistency_loss = compute_consistency_loss(
+                model=self.model,
+                input_ids=input_ids,
+                x_0=x_0,
+                t_early=t,
+                delta_min=self.consistency_delta_min,
+                delta_max=self.consistency_delta_max,
+            )
+            loss = loss + self.consistency_loss_weight * consistency_loss
+
         # Update EMA periodically to reduce transfer overhead for CPU-offloaded EMA.
         if self.use_ema and (self.global_step + 1) % self.ema_update_interval == 0:
             self._update_ema_model()
 
+        # Check for progressive checkpoint milestones
+        if self.progressive_checkpoint_manager is not None:
+            should_save, milestone = self.progressive_checkpoint_manager.should_save_checkpoint(self.model)
+            if should_save and milestone is not None:
+                optimizer = self.optimizers()
+                checkpoint_path = self.progressive_checkpoint_manager.save_checkpoint(
+                    model=self.model,
+                    optimizer=optimizer,
+                    global_step=self.global_step,
+                    milestone=milestone,
+                    metadata={
+                        "epoch": self.current_epoch,
+                        "train_loss": loss.item(),
+                        "use_consistency_training": self.use_consistency_training,
+                    },
+                )
+                milestone_str = self.progressive_checkpoint_manager.format_param_count(milestone)
+                current_str = self.progressive_checkpoint_manager.format_param_count(
+                    self.progressive_checkpoint_manager.count_parameters(self.model)
+                )
+                self.log("train/progressive_checkpoint_saved", float(milestone), prog_bar=True)
+                print(f"\n🎯 Progressive checkpoint saved: {milestone_str} (current: {current_str}) at step {self.global_step}")
+                print(f"   Path: {checkpoint_path}")
+
         # Logging
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         self.log("train/learning_rate", self.optimizers().param_groups[0]["lr"], sync_dist=True)
+        if self.use_consistency_training:
+            self.log("train/consistency_loss", consistency_loss, prog_bar=False, sync_dist=True)
 
         self.train_loss = loss.item()
         self.num_training_steps += 1
 
         return loss
-
 
     def on_fit_start(self):
         """Ensure EMA stays on the configured device after Lightning device placement."""
@@ -218,8 +387,41 @@ class DIMBALightningModule(pl.LightningModule):
             pass
 
 
+def get_model_config(model: DIMBA) -> Dict[str, Any]:
+    """Extract configuration from a DIMBA model for creating replicas.
+    
+    Preserves all model configuration parameters including architecture-specific
+    settings like d_state, d_conv, expand, etc.
+    
+    Args:
+        model: DIMBA model instance
+        
+    Returns:
+        Dictionary with all model configuration parameters
+    """
+    config = {
+        'vocab_size': model.vocab_size,
+        'd_model': model.d_model,
+        'd_prompt': model.d_prompt,
+        'num_diffusion_steps': model.num_diffusion_steps,
+        # Extract from denoiser if available (simplified getattr)
+        'num_denoiser_layers': len(model.denoiser.layers) if hasattr(model, 'denoiser') and hasattr(model.denoiser, 'layers') else 6,
+        'd_state': getattr(getattr(model, 'denoiser', None), 'd_state', 16),
+        'd_conv': getattr(getattr(model, 'denoiser', None), 'd_conv', 4),
+        'expand': getattr(getattr(model, 'denoiser', None), 'expand', 2),
+        # Latent diffusion settings
+        'latent_diffusion': model.latent_diffusion,
+        'd_latent': getattr(model, 'd_latent', None),
+        'latent_loss_weight': getattr(model, 'latent_loss_weight', 1.0),
+        'recon_loss_weight': getattr(model, 'recon_loss_weight', 1.0),
+    }
+    return config
+
+
 class SimpleTrainer:
     """Simple training loop without PyTorch Lightning (for debugging/custom needs).
+
+    Supports CDLM consistency training and progressive checkpointing.
 
     Args:
         model: DIMBA model
@@ -230,6 +432,13 @@ class SimpleTrainer:
         learning_rate: Learning rate
         warmup_steps: Number of warmup steps
         ema_decay: EMA decay rate
+        use_consistency_training: Enable CDLM consistency loss (default: False)
+        consistency_loss_weight: Weight for consistency loss (default: 0.5)
+        consistency_delta_min: Minimum timestep delta (default: 50)
+        consistency_delta_max: Maximum timestep delta (default: 200)
+        progressive_milestones: List of parameter count milestones (default: None)
+        progressive_save_dir: Directory for progressive checkpoints (default: "./progressive_checkpoints")
+        enable_progressive_checkpoints: Enable progressive checkpointing (default: False)
     """
 
     def __init__(
@@ -242,6 +451,13 @@ class SimpleTrainer:
         learning_rate: float = 2e-5,
         warmup_steps: int = 500,
         ema_decay: float = 0.9999,
+        use_consistency_training: bool = False,
+        consistency_loss_weight: float = 0.5,
+        consistency_delta_min: int = 50,
+        consistency_delta_max: int = 200,
+        progressive_milestones: Optional[List[int]] = None,
+        progressive_save_dir: str = "./progressive_checkpoints",
+        enable_progressive_checkpoints: bool = False,
     ):
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
@@ -252,13 +468,24 @@ class SimpleTrainer:
         self.warmup_steps = warmup_steps
         self.ema_decay = ema_decay
 
-        # EMA model
-        self.ema_model = DIMBA(
-            vocab_size=model.vocab_size,
-            d_model=model.d_model,
-            d_prompt=model.d_prompt,
-            num_diffusion_steps=model.num_diffusion_steps,
-        ).to(device)
+        # CDLM parameters
+        self.use_consistency_training = use_consistency_training
+        self.consistency_loss_weight = consistency_loss_weight
+        self.consistency_delta_min = consistency_delta_min
+        self.consistency_delta_max = consistency_delta_max
+
+        # Progressive checkpointing
+        self.progressive_checkpoint_manager = None
+        if enable_progressive_checkpoints and progressive_milestones:
+            self.progressive_checkpoint_manager = ProgressiveCheckpointManager(
+                milestones=progressive_milestones,
+                save_dir=progressive_save_dir,
+                enabled=True,
+            )
+
+        # EMA model - preserve all config
+        ema_config = get_model_config(model)
+        self.ema_model = DIMBA(**ema_config).to(device)
         self._copy_model_weights()
 
         # Optimizer
@@ -286,12 +513,14 @@ class SimpleTrainer:
                 ema_param.data = ema_param.data * self.ema_decay + param.data * (1 - self.ema_decay)
 
     def train(self):
-        """Run training loop."""
+        """Run training loop with optional CDLM consistency training and progressive checkpointing."""
         total_steps = len(self.train_dataloader) * self.num_epochs
 
         for epoch in range(self.num_epochs):
             self.model.train()
             epoch_loss = 0.0
+            epoch_denoise_loss = 0.0
+            epoch_consistency_loss = 0.0
 
             for batch_idx, batch in enumerate(self.train_dataloader):
                 # Learning rate warmup
@@ -308,7 +537,22 @@ class SimpleTrainer:
                 x_pred, _, _ = self.model(input_ids, t)
                 x_0 = self.model.token_embed(input_ids)
 
-                loss = self.loss_fn(x_pred, x_0)
+                denoise_loss = self.loss_fn(x_pred, x_0)
+                loss = denoise_loss
+
+                # CDLM Consistency loss
+                consistency_loss = torch.tensor(0.0, device=self.device)
+                if self.use_consistency_training and self.consistency_loss_weight > 0:
+                    consistency_loss = compute_consistency_loss(
+                        model=self.model,
+                        input_ids=input_ids,
+                        x_0=x_0,
+                        t_early=t,
+                        delta_min=self.consistency_delta_min,
+                        delta_max=self.consistency_delta_max,
+                    )
+                    loss = loss + self.consistency_loss_weight * consistency_loss
+                    epoch_consistency_loss += consistency_loss.item()
 
                 # Backward
                 self.optimizer.zero_grad()
@@ -320,17 +564,49 @@ class SimpleTrainer:
                 self._update_ema()
 
                 epoch_loss += loss.item()
+                epoch_denoise_loss += denoise_loss.item()
                 self.global_step += 1
 
+                # Check for progressive checkpoint milestones
+                if self.progressive_checkpoint_manager is not None:
+                    should_save, milestone = self.progressive_checkpoint_manager.should_save_checkpoint(self.model)
+                    if should_save and milestone is not None:
+                        checkpoint_path = self.progressive_checkpoint_manager.save_checkpoint(
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            global_step=self.global_step,
+                            milestone=milestone,
+                            metadata={
+                                "epoch": epoch,
+                                "train_loss": loss.item(),
+                                "use_consistency_training": self.use_consistency_training,
+                            },
+                        )
+                        milestone_str = self.progressive_checkpoint_manager.format_param_count(milestone)
+                        current_str = self.progressive_checkpoint_manager.format_param_count(
+                            self.progressive_checkpoint_manager.count_parameters(self.model)
+                        )
+                        print(f"\n🎯 Progressive checkpoint saved: {milestone_str} (current: {current_str}) at step {self.global_step}")
+                        print(f"   Path: {checkpoint_path}")
+
                 if batch_idx % 100 == 0:
-                    print(
+                    log_msg = (
                         f"Epoch {epoch + 1}/{self.num_epochs} | "
                         f"Step {batch_idx}/{len(self.train_dataloader)} | "
                         f"Loss: {loss.item():.4f}"
                     )
+                    if self.use_consistency_training:
+                        log_msg += f" (Denoise: {denoise_loss.item():.4f}, Consistency: {consistency_loss.item():.4f})"
+                    print(log_msg)
 
             avg_epoch_loss = epoch_loss / len(self.train_dataloader)
-            print(f"Epoch {epoch + 1} | Avg Loss: {avg_epoch_loss:.4f}")
+            avg_denoise_loss = epoch_denoise_loss / len(self.train_dataloader)
+            print(f"Epoch {epoch + 1} | Avg Loss: {avg_epoch_loss:.4f} | Denoise: {avg_denoise_loss:.4f}", end="")
+            if self.use_consistency_training:
+                avg_consistency_loss = epoch_consistency_loss / len(self.train_dataloader)
+                print(f" | Consistency: {avg_consistency_loss:.4f}")
+            else:
+                print()
 
             # Validation
             if self.val_dataloader is not None:

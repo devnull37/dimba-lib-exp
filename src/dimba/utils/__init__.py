@@ -1,3 +1,11 @@
 """Utility functions for DIMBA."""
 
-__all__ = []
+from .checkpointing import (
+    ProgressiveCheckpointManager,
+    parse_milestone_input,
+)
+
+__all__ = [
+    "ProgressiveCheckpointManager",
+    "parse_milestone_input",
+]
