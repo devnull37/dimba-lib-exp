@@ -16,6 +16,7 @@ class DIMBALightningModule(pl.LightningModule):
     """PyTorch Lightning module for training DIMBA.
 
     Handles training loop, optimization, EMA, and logging.
+    Supports CDLM (Consistency Diffusion Language Model) training for faster inference.
 
     Args:
         vocab_size: Size of vocabulary
@@ -27,6 +28,10 @@ class DIMBALightningModule(pl.LightningModule):
         use_ema: Whether to use EMA (default: True)
         ema_device: Optional device to store EMA weights; None keeps default Lightning placement
         ema_update_interval: Update EMA every N steps (default: 1)
+        use_consistency_training: Enable CDLM consistency loss (default: False)
+        consistency_loss_weight: Weight for consistency loss (default: 0.5)
+        consistency_delta_min: Minimum timestep delta for consistency pairs (default: 50)
+        consistency_delta_max: Maximum timestep delta for consistency pairs (default: 200)
     """
 
     def __init__(
@@ -40,6 +45,10 @@ class DIMBALightningModule(pl.LightningModule):
         use_ema: bool = True,
         ema_device: Optional[str] = None,
         ema_update_interval: int = 1,
+        use_consistency_training: bool = False,
+        consistency_loss_weight: float = 0.5,
+        consistency_delta_min: int = 50,
+        consistency_delta_max: int = 200,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -52,6 +61,12 @@ class DIMBALightningModule(pl.LightningModule):
         self.ema_decay = ema_decay
         self.ema_update_interval = max(1, int(ema_update_interval))
         self.ema_device = torch.device(ema_device) if ema_device is not None else None
+
+        # CDLM consistency training parameters
+        self.use_consistency_training = use_consistency_training
+        self.consistency_loss_weight = consistency_loss_weight
+        self.consistency_delta_min = consistency_delta_min
+        self.consistency_delta_max = consistency_delta_max
 
         # Build model
         self.model = DIMBA(vocab_size=vocab_size, **model_config)
@@ -126,24 +141,30 @@ class DIMBALightningModule(pl.LightningModule):
         return self.model(input_ids, t)
 
     def training_step(self, batch, batch_idx):
-        """Training step."""
+        """Training step with optional CDLM consistency loss."""
         input_ids = batch["input_ids"]
         batch_size = input_ids.shape[0]
 
-        # Sample random timesteps
+        # Sample random timesteps for main denoising loss
         t = sample_timesteps(batch_size, self.model.num_diffusion_steps, self.device)
 
-        # Forward pass
+        # Forward pass for denoising loss
         x_pred, noise, latent_info = self.model(input_ids, t)
 
         # Get clean embeddings
         x_0 = self.model.token_embed(input_ids)
 
-        # Compute loss (predict clean embeddings or latent targets)
+        # Compute denoising loss (predict clean embeddings or latent targets)
         loss = self.loss_fn(x_pred, x_0) * self.model.recon_loss_weight
         if self.model.latent_diffusion and latent_info is not None:
             latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
             loss = loss + latent_loss * self.model.latent_loss_weight
+
+        # CDLM Consistency loss: align predictions at t with predictions at t-delta
+        consistency_loss = torch.tensor(0.0, device=self.device)
+        if self.use_consistency_training and self.consistency_loss_weight > 0:
+            consistency_loss = self._compute_consistency_loss(input_ids, x_0, t)
+            loss = loss + self.consistency_loss_weight * consistency_loss
 
         # Update EMA periodically to reduce transfer overhead for CPU-offloaded EMA.
         if self.use_ema and (self.global_step + 1) % self.ema_update_interval == 0:
@@ -152,11 +173,91 @@ class DIMBALightningModule(pl.LightningModule):
         # Logging
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         self.log("train/learning_rate", self.optimizers().param_groups[0]["lr"], sync_dist=True)
+        if self.use_consistency_training:
+            self.log("train/consistency_loss", consistency_loss, prog_bar=False, sync_dist=True)
 
         self.train_loss = loss.item()
         self.num_training_steps += 1
 
         return loss
+
+    def _compute_consistency_loss(
+        self,
+        input_ids: torch.Tensor,
+        x_0: torch.Tensor,
+        t_early: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute CDLM consistency loss.
+
+        Aligns predictions at timestep t with predictions at t-delta (later, less noisy state).
+        Uses stop-gradient on the t-delta prediction as the target.
+
+        Args:
+            input_ids: Target token IDs [batch_size, seq_len]
+            x_0: Clean embeddings [batch_size, seq_len, d_model]
+            t_early: Timesteps for early (noisier) state [batch_size]
+
+        Returns:
+            consistency_loss: MSE between predictions at t and t-delta
+        """
+        batch_size = input_ids.shape[0]
+
+        # Sample delta timesteps (how far ahead to look)
+        delta = torch.randint(
+            self.consistency_delta_min,
+            self.consistency_delta_max + 1,
+            (batch_size,),
+            device=self.device
+        )
+
+        # t_late = t_early - delta (but not less than 0)
+        t_late = torch.clamp(t_early - delta, min=0)
+
+        # Ensure we only compute consistency when t_early > t_late
+        valid_mask = t_early > t_late
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=self.device)
+
+        # Get noisy embeddings at both timesteps
+        z_0 = self.model.encode_latent(x_0)
+
+        # Add noise at t_early (more noise)
+        x_t_early, _ = self.model.noise_schedule.add_noise(z_0, t_early)
+
+        # Add noise at t_late (less noise)
+        x_t_late, _ = self.model.noise_schedule.add_noise(z_0, t_late)
+
+        # Encode prompt
+        cond = self.model.encode_prompt(input_ids)
+        cond = self.model.project_conditioning(cond)
+
+        # Get timestep embeddings
+        time_emb_early = self.model.timestep_embed(t_early)
+        time_emb_late = self.model.timestep_embed(t_late)
+
+        # Predict at t_early (trainable)
+        z_pred_early = self.model.denoiser(x_t_early, cond, time_emb_early)
+
+        # Predict at t_late (stop-gradient target)
+        with torch.no_grad():
+            z_pred_late = self.model.denoiser(x_t_late, cond, time_emb_late)
+
+        # Consistency loss: align predictions where positions are still masked at t_late
+        # For continuous diffusion, we use the full prediction alignment
+        # (Unlike discrete token diffusion, we don't have a MASK_TOKEN)
+        # Instead, we weight by how much noise remains at t_late
+        noise_level_late = self.model.noise_schedule.sqrt_one_minus_alphas_cumprod[t_late]
+        noise_level_late = noise_level_late.view(-1, 1, 1)
+
+        # Weight consistency loss by remaining noise level
+        # Positions with less noise should have more consistent predictions
+        weights = noise_level_late.clamp(min=0.01)  # Avoid zero weights
+
+        # Compute weighted MSE
+        diff = (z_pred_early - z_pred_late.detach()) * weights
+        consistency_loss = (diff ** 2).mean()
+
+        return consistency_loss
 
 
     def on_fit_start(self):
@@ -221,6 +322,8 @@ class DIMBALightningModule(pl.LightningModule):
 class SimpleTrainer:
     """Simple training loop without PyTorch Lightning (for debugging/custom needs).
 
+    Supports CDLM consistency training for faster inference.
+
     Args:
         model: DIMBA model
         train_dataloader: Training data loader
@@ -230,6 +333,10 @@ class SimpleTrainer:
         learning_rate: Learning rate
         warmup_steps: Number of warmup steps
         ema_decay: EMA decay rate
+        use_consistency_training: Enable CDLM consistency loss (default: False)
+        consistency_loss_weight: Weight for consistency loss (default: 0.5)
+        consistency_delta_min: Minimum timestep delta (default: 50)
+        consistency_delta_max: Maximum timestep delta (default: 200)
     """
 
     def __init__(
@@ -242,6 +349,10 @@ class SimpleTrainer:
         learning_rate: float = 2e-5,
         warmup_steps: int = 500,
         ema_decay: float = 0.9999,
+        use_consistency_training: bool = False,
+        consistency_loss_weight: float = 0.5,
+        consistency_delta_min: int = 50,
+        consistency_delta_max: int = 200,
     ):
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
@@ -251,6 +362,12 @@ class SimpleTrainer:
         self.learning_rate = learning_rate
         self.warmup_steps = warmup_steps
         self.ema_decay = ema_decay
+
+        # CDLM parameters
+        self.use_consistency_training = use_consistency_training
+        self.consistency_loss_weight = consistency_loss_weight
+        self.consistency_delta_min = consistency_delta_min
+        self.consistency_delta_max = consistency_delta_max
 
         # EMA model
         self.ema_model = DIMBA(
@@ -286,12 +403,14 @@ class SimpleTrainer:
                 ema_param.data = ema_param.data * self.ema_decay + param.data * (1 - self.ema_decay)
 
     def train(self):
-        """Run training loop."""
+        """Run training loop with optional CDLM consistency training."""
         total_steps = len(self.train_dataloader) * self.num_epochs
 
         for epoch in range(self.num_epochs):
             self.model.train()
             epoch_loss = 0.0
+            epoch_denoise_loss = 0.0
+            epoch_consistency_loss = 0.0
 
             for batch_idx, batch in enumerate(self.train_dataloader):
                 # Learning rate warmup
@@ -308,7 +427,15 @@ class SimpleTrainer:
                 x_pred, _, _ = self.model(input_ids, t)
                 x_0 = self.model.token_embed(input_ids)
 
-                loss = self.loss_fn(x_pred, x_0)
+                denoise_loss = self.loss_fn(x_pred, x_0)
+                loss = denoise_loss
+
+                # CDLM Consistency loss
+                consistency_loss = torch.tensor(0.0, device=self.device)
+                if self.use_consistency_training and self.consistency_loss_weight > 0:
+                    consistency_loss = self._compute_consistency_loss(input_ids, x_0, t)
+                    loss = loss + self.consistency_loss_weight * consistency_loss
+                    epoch_consistency_loss += consistency_loss.item()
 
                 # Backward
                 self.optimizer.zero_grad()
@@ -320,22 +447,87 @@ class SimpleTrainer:
                 self._update_ema()
 
                 epoch_loss += loss.item()
+                epoch_denoise_loss += denoise_loss.item()
                 self.global_step += 1
 
                 if batch_idx % 100 == 0:
-                    print(
+                    log_msg = (
                         f"Epoch {epoch + 1}/{self.num_epochs} | "
                         f"Step {batch_idx}/{len(self.train_dataloader)} | "
                         f"Loss: {loss.item():.4f}"
                     )
+                    if self.use_consistency_training:
+                        log_msg += f" (Denoise: {denoise_loss.item():.4f}, Consistency: {consistency_loss.item():.4f})"
+                    print(log_msg)
 
             avg_epoch_loss = epoch_loss / len(self.train_dataloader)
-            print(f"Epoch {epoch + 1} | Avg Loss: {avg_epoch_loss:.4f}")
+            avg_denoise_loss = epoch_denoise_loss / len(self.train_dataloader)
+            print(f"Epoch {epoch + 1} | Avg Loss: {avg_epoch_loss:.4f} | Denoise: {avg_denoise_loss:.4f}", end="")
+            if self.use_consistency_training:
+                avg_consistency_loss = epoch_consistency_loss / len(self.train_dataloader)
+                print(f" | Consistency: {avg_consistency_loss:.4f}")
+            else:
+                print()
 
             # Validation
             if self.val_dataloader is not None:
                 val_loss = self.validate()
                 print(f"Validation Loss: {val_loss:.4f}")
+
+    def _compute_consistency_loss(
+        self,
+        input_ids: torch.Tensor,
+        x_0: torch.Tensor,
+        t_early: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute CDLM consistency loss for SimpleTrainer."""
+        batch_size = input_ids.shape[0]
+
+        # Sample delta timesteps
+        delta = torch.randint(
+            self.consistency_delta_min,
+            self.consistency_delta_max + 1,
+            (batch_size,),
+            device=self.device
+        )
+
+        # t_late = t_early - delta (but not less than 0)
+        t_late = torch.clamp(t_early - delta, min=0)
+
+        # Only compute when t_early > t_late
+        valid_mask = t_early > t_late
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=self.device)
+
+        # Get noisy embeddings
+        z_0 = self.model.encode_latent(x_0)
+        x_t_early, _ = self.model.noise_schedule.add_noise(z_0, t_early)
+        x_t_late, _ = self.model.noise_schedule.add_noise(z_0, t_late)
+
+        # Encode prompt
+        cond = self.model.encode_prompt(input_ids)
+        cond = self.model.project_conditioning(cond)
+
+        # Get timestep embeddings
+        time_emb_early = self.model.timestep_embed(t_early)
+        time_emb_late = self.model.timestep_embed(t_late)
+
+        # Predict at t_early (trainable)
+        z_pred_early = self.model.denoiser(x_t_early, cond, time_emb_early)
+
+        # Predict at t_late (stop-gradient target)
+        with torch.no_grad():
+            z_pred_late = self.model.denoiser(x_t_late, cond, time_emb_late)
+
+        # Weight by remaining noise level
+        noise_level_late = self.model.noise_schedule.sqrt_one_minus_alphas_cumprod[t_late]
+        noise_level_late = noise_level_late.view(-1, 1, 1)
+        weights = noise_level_late.clamp(min=0.01)
+
+        diff = (z_pred_early - z_pred_late.detach()) * weights
+        consistency_loss = (diff ** 2).mean()
+
+        return consistency_loss
 
     def validate(self):
         """Run validation."""

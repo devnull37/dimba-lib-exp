@@ -49,6 +49,11 @@ training:
   max_steps: null           # Set to limit training steps (null = no limit)
   log_interval: 100
   val_interval: 500
+  # CDLM Consistency Training (Together AI paper)
+  use_consistency_training: false  # Enable for up to 14x faster inference
+  consistency_loss_weight: 0.5    # Lambda weight for consistency loss (0.5-1.0)
+  consistency_delta_min: 50       # Minimum timestep gap for consistency pairs
+  consistency_delta_max: 200      # Maximum timestep gap for consistency pairs
 
 # GPU/Device configuration
 device:
