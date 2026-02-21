@@ -70,26 +70,75 @@ except ImportError as e:
 # =============================================================================
 
 def detect_gpus() -> list[dict]:
-    """Detect available GPUs and return their specs."""
+    """Detect available GPUs and return their specs.
+
+    Supports CUDA (NVIDIA) and MPS (Apple Silicon) devices.
+    """
     gpus = []
 
-    if not torch.cuda.is_available():
-        return gpus
+    # Check for CUDA GPUs (NVIDIA)
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            name = torch.cuda.get_device_name(i)
+            memory_gb = props.total_memory / 1e9
 
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        name = torch.cuda.get_device_name(i)
-        memory_gb = props.total_memory / 1e9
+            # Classify GPU tier
+            tier = classify_gpu(name, memory_gb)
 
-        # Classify GPU tier
-        tier = classify_gpu(name, memory_gb)
+            gpus.append({
+                'index': i,
+                'name': name,
+                'memory_gb': memory_gb,
+                'tier': tier,
+                'compute_capability': f"{props.major}.{props.minor}",
+                'backend': 'cuda',
+            })
+
+    # Check for MPS (Apple Silicon)
+    if torch.backends.mps.is_available():
+        import platform
+        import subprocess
+
+        # Try to get Apple Silicon info
+        memory_gb = 16.0  # Default assumption
+        chip_name = "Apple Silicon"
+
+        try:
+            if platform.system() == "Darwin":
+                # Get chip name
+                result = subprocess.run(
+                    ["sysctl", "-n", "machdep.cpu.brand_string"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    chip_name = result.stdout.strip()
+
+                # Try to get memory info (hw.memsize gives bytes)
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    memory_bytes = int(result.stdout.strip())
+                    memory_gb = memory_bytes / (1024**3) * 0.8  # Estimate 80% available for GPU
+        except Exception:
+            pass
+
+        # Determine tier based on chip
+        tier = 'mid'
+        if 'M3' in chip_name or ('M2' in chip_name and ('Max' in chip_name or 'Ultra' in chip_name)):
+            tier = 'high'
+        elif 'M1' in chip_name and ('Max' in chip_name or 'Ultra' in chip_name):
+            tier = 'mid-high'
 
         gpus.append({
-            'index': i,
-            'name': name,
+            'index': 0,
+            'name': f"{chip_name} (MPS)",
             'memory_gb': memory_gb,
             'tier': tier,
-            'compute_capability': f"{props.major}.{props.minor}",
+            'compute_capability': 'N/A',
+            'backend': 'mps',
         })
 
     return gpus
@@ -456,6 +505,76 @@ What would you like to train?
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
+def interactive_dataset_selection() -> dict:
+    """Let user select a dataset from common options or enter a custom one.
+
+    Returns:
+        dict with 'dataset_name', 'dataset_config', and 'streaming' keys
+    """
+    print_header("Select Dataset")
+
+    # Common datasets with their configs
+    DATASET_OPTIONS = {
+        '1': {
+            'name': 'FineWeb (HuggingFaceFW/fineweb)',
+            'dataset_name': 'HuggingFaceFW/fineweb',
+            'dataset_config': 'sample-10BT',
+            'description': 'Large-scale web text corpus (10B tokens)',
+        },
+        '2': {
+            'name': 'WikiText-2',
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-2-raw-v1',
+            'description': 'Small Wikipedia dataset (~2M tokens)',
+        },
+        '3': {
+            'name': 'WikiText-103',
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-103-raw-v1',
+            'description': 'Large Wikipedia dataset (~103M tokens)',
+        },
+        '4': {
+            'name': 'OpenAssistant Conversations',
+            'dataset_name': 'OpenAssistant/oasst1',
+            'dataset_config': None,
+            'description': 'Conversational dataset for chat models',
+        },
+        '5': {
+            'name': 'Custom (manual entry)',
+            'dataset_name': None,
+            'dataset_config': None,
+            'description': 'Manually enter any HuggingFace dataset',
+        }
+    }
+
+    print("\nCommon datasets:")
+    for key, opt in DATASET_OPTIONS.items():
+        print(f"  [{key}] {opt['name']}")
+        print(f"      {opt['description']}")
+    print()
+
+    while True:
+        choice = input("Select dataset [1]: ").strip() or '1'
+        if choice in DATASET_OPTIONS:
+            selected = DATASET_OPTIONS[choice]
+            if selected['dataset_name'] is None:
+                # Custom entry
+                dataset_name = input("HuggingFace dataset name (e.g. 'wikitext'): ").strip()
+                dataset_config = input("Dataset config (optional): ").strip() or None
+            else:
+                dataset_name = selected['dataset_name']
+                dataset_config = selected['dataset_config']
+
+            streaming = input("Use streaming mode? [y/N]: ").strip().lower() == 'y'
+            return {
+                'dataset_name': dataset_name,
+                'dataset_config': dataset_config,
+                'streaming': streaming
+            }
+        else:
+            print("Invalid choice. Please enter 1-5.")
+
+
 def interactive_vae_preset_selection() -> dict:
     """Let user select a VAE preset."""
     print_header("Select VAE Configuration")
@@ -507,10 +626,12 @@ def interactive_custom_vae_config() -> dict:
     # Data config
     print("\n2. Data Configuration:")
     config['data']['type'] = input("Dataset type [huggingface/dummy] [huggingface]: ").strip() or 'huggingface'
-    
+
     if config['data']['type'] == 'huggingface':
-        config['data']['dataset_name'] = input("Dataset name [HuggingFaceFW/fineweb]: ").strip() or 'HuggingFaceFW/fineweb'
-        config['data']['dataset_config'] = input("Dataset config [sample-10BT]: ").strip() or 'sample-10BT'
+        dataset_info = interactive_dataset_selection()
+        config['data']['dataset_name'] = dataset_info['dataset_name']
+        config['data']['dataset_config'] = dataset_info['dataset_config']
+        config['data']['streaming'] = dataset_info['streaming']
     else:
         config['data']['num_examples'] = int(input("Number of examples [1000]: ") or 1000)
     
@@ -537,37 +658,47 @@ def print_gpu_info(gpus: list[dict]):
     print(f"\n🖥️  Detected {len(gpus)} GPU(s):")
     print("-" * 60)
     for gpu in gpus:
-        print(f"  GPU {gpu['index']}: {gpu['name']}")
+        backend_tag = f"[{gpu.get('backend', 'cuda').upper()}]"
+        print(f"  GPU {gpu['index']}: {gpu['name']} {backend_tag}")
         print(f"    Memory: {gpu['memory_gb']:.1f} GB")
         print(f"    Tier: {gpu['tier']}")
-        print(f"    Compute: {gpu['compute_capability']}")
+        if gpu.get('compute_capability') != 'N/A':
+            print(f"    Compute: {gpu['compute_capability']}")
     print("-" * 60)
 
 
-def interactive_gpu_selection(gpus: list[dict]) -> tuple[int, list[int]]:
-    """Let user select which GPUs to use."""
+def interactive_gpu_selection(gpus: list[dict]) -> tuple[int, list[int], str]:
+    """Let user select which GPUs to use.
+
+    Returns:
+        (num_gpus, gpu_indices, accelerator_type)
+        accelerator_type: 'cuda', 'mps', or 'cpu'
+    """
     if not gpus:
-        return 0, []
+        return 0, [], 'cpu'
 
     print_gpu_info(gpus)
 
     if len(gpus) == 1:
-        use = input(f"\nUse GPU 0? [Y/n]: ").strip().lower()
+        backend = gpus[0].get('backend', 'cuda')
+        use = input(f"\nUse {backend.upper()} GPU? [Y/n]: ").strip().lower()
         if use in ('n', 'no'):
-            return 0, []
-        return 1, [0]
+            return 0, [], 'cpu'
+        return 1, [0], backend
 
     print("\nOptions:")
     print("  a) Use all GPUs")
     print("  s) Use specific GPU(s)")
-    print("  c) Use CPU only")
+    print("  n) Use CPU only")
 
     choice = input("\nSelect option [a]: ").strip().lower() or 'a'
 
-    if choice == 'c':
-        return 0, []
+    if choice == 'n':
+        return 0, [], 'cpu'
     elif choice == 'a':
-        return len(gpus), list(range(len(gpus)))
+        # Default backend from the first GPU if all are picked
+        backend = gpus[0].get('backend', 'cuda')
+        return len(gpus), list(range(len(gpus))), backend
     else:
         indices = input("Enter GPU indices to use (comma-separated, e.g., 0,1): ").strip()
         try:
@@ -575,11 +706,13 @@ def interactive_gpu_selection(gpus: list[dict]) -> tuple[int, list[int]]:
             valid = [i for i in selected if 0 <= i < len(gpus)]
             if not valid:
                 print("No valid GPUs selected. Using CPU.")
-                return 0, []
-            return len(valid), valid
+                return 0, [], 'cpu'
+            # Determine backend from first selected
+            backend = gpus[valid[0]].get('backend', 'cuda')
+            return len(valid), valid, backend
         except ValueError:
             print("Invalid input. Using first GPU.")
-            return 1, [0]
+            return 1, [0], gpus[0].get('backend', 'cuda')
 
 
 def interactive_preset_selection(gpus: list[dict]) -> dict:
@@ -680,9 +813,10 @@ def interactive_custom_config(gpus: list[dict]) -> dict:
     config['data']['type'] = dataset_type
 
     if dataset_type == 'huggingface':
-        config['data']['dataset_name'] = input("Dataset name [HuggingFaceFW/fineweb]: ").strip() or 'HuggingFaceFW/fineweb'
-        config['data']['dataset_config'] = input("Dataset config [sample-10BT]: ").strip() or 'sample-10BT'
-        config['data']['streaming'] = input("Use streaming? [y/N]: ").strip().lower() == 'y'
+        dataset_info = interactive_dataset_selection()
+        config['data']['dataset_name'] = dataset_info['dataset_name']
+        config['data']['dataset_config'] = dataset_info['dataset_config']
+        config['data']['streaming'] = dataset_info['streaming']
     else:
         config['data']['num_examples'] = int(input("Number of examples [1000]: ") or 1000)
 
@@ -1020,6 +1154,25 @@ def run_vae_training(vae_config: dict, num_gpus: int, gpu_indices: list[int],
         save_last=True,
     )
 
+    # Determine accelerator
+    accelerator = 'cpu'
+    devices = 1
+    precision = '32'
+
+    if num_gpus > 0:
+        # Determine from the first GPU backend
+        gpu = detect_gpus()[gpu_indices[0]] if gpu_indices else None
+        backend = gpu.get('backend', 'cuda') if gpu else 'cuda'
+        
+        if backend == 'mps':
+            accelerator = 'mps'
+            devices = 1  # MPS only supports 1 device
+            precision = '32' # MPS doesn't support 16-mixed commonly
+        else:
+            accelerator = 'gpu'
+            devices = len(gpu_indices) if len(gpu_indices) > 1 else 1
+            precision = '16-mixed'
+
     # Trainer setup
     trainer_kwargs = {
         'max_steps': int(vae_config['training']['max_steps']),
@@ -1028,19 +1181,15 @@ def run_vae_training(vae_config: dict, num_gpus: int, gpu_indices: list[int],
         'log_every_n_steps': 50,
         'val_check_interval': 500,
         'gradient_clip_val': 1.0,
+        'accelerator': accelerator,
+        'devices': devices,
+        'precision': precision,
     }
 
-    if num_gpus > 0:
-        trainer_kwargs['accelerator'] = 'gpu'
-        trainer_kwargs['devices'] = len(gpu_indices) if len(gpu_indices) > 1 else 1
-        if len(gpu_indices) > 1:
-            trainer_kwargs['strategy'] = 'ddp'
-        trainer_kwargs['precision'] = '16-mixed'
-    else:
-        trainer_kwargs['accelerator'] = 'cpu'
-        trainer_kwargs['devices'] = 1
+    if num_gpus > 1 and accelerator == 'gpu':
+        trainer_kwargs['strategy'] = 'ddp'
 
-    print(f"\nTraining on: {trainer_kwargs.get('accelerator', 'cpu').upper()}")
+    print(f"\nTraining on: {accelerator.upper()}")
 
     if input("\nStart VAE training? [Y/n]: ").strip().lower() == 'n':
         print("Training cancelled.")
@@ -1144,6 +1293,25 @@ def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int],
     else:
         callbacks = [checkpoint_callback]
 
+    # Determine accelerator
+    accelerator = 'cpu'
+    devices = 1
+    precision = '32'
+
+    if num_gpus > 0:
+        # Determine from the first GPU backend
+        gpu = detect_gpus()[gpu_indices[0]] if gpu_indices else None
+        backend = gpu.get('backend', 'cuda') if gpu else 'cuda'
+        
+        if backend == 'mps':
+            accelerator = 'mps'
+            devices = 1  # MPS only supports 1 device
+            precision = '32' # MPS doesn't support 16-mixed commonly
+        else:
+            accelerator = 'gpu'
+            devices = len(gpu_indices) if len(gpu_indices) > 1 else 1
+            precision = '16-mixed'
+
     # Trainer setup
     trainer_kwargs = {
         'max_steps': int(train_cfg['max_steps']),
@@ -1153,19 +1321,15 @@ def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int],
         'val_check_interval': int(train_cfg.get('val_interval', 500)),
         'gradient_clip_val': float(train_cfg.get('gradient_clip', 1.0)),
         'accumulate_grad_batches': int(train_cfg.get('accumulate_grad_batches', 1)),
+        'accelerator': accelerator,
+        'devices': devices,
+        'precision': precision,
     }
 
-    if num_gpus > 0:
-        trainer_kwargs['accelerator'] = 'gpu'
-        trainer_kwargs['devices'] = len(gpu_indices) if len(gpu_indices) > 1 else 1
-        if len(gpu_indices) > 1:
-            trainer_kwargs['strategy'] = 'ddp'
-        trainer_kwargs['precision'] = '16-mixed'
-    else:
-        trainer_kwargs['accelerator'] = 'cpu'
-        trainer_kwargs['devices'] = 1
+    if num_gpus > 1 and accelerator == 'gpu':
+        trainer_kwargs['strategy'] = 'ddp'
 
-    print(f"\nTraining on: {trainer_kwargs.get('accelerator', 'cpu').upper()}")
+    print(f"\nTraining on: {accelerator.upper()}")
 
     if input("\nStart training? [Y/n]: ").strip().lower() == 'n':
         print("Training cancelled.")
@@ -1277,7 +1441,7 @@ Examples:
             num_gpus = len(gpus)
             gpu_indices = list(range(len(gpus)))
         else:
-            num_gpus, gpu_indices = interactive_gpu_selection(gpus)
+            num_gpus, gpu_indices, _ = interactive_gpu_selection(gpus)
 
     # Select training mode
     if args.train_mode:
