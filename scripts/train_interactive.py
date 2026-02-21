@@ -70,26 +70,75 @@ except ImportError as e:
 # =============================================================================
 
 def detect_gpus() -> list[dict]:
-    """Detect available GPUs and return their specs."""
+    """Detect available GPUs and return their specs.
+
+    Supports CUDA (NVIDIA) and MPS (Apple Silicon) devices.
+    """
     gpus = []
 
-    if not torch.cuda.is_available():
-        return gpus
+    # Check for CUDA GPUs (NVIDIA)
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            name = torch.cuda.get_device_name(i)
+            memory_gb = props.total_memory / 1e9
 
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        name = torch.cuda.get_device_name(i)
-        memory_gb = props.total_memory / 1e9
+            # Classify GPU tier
+            tier = classify_gpu(name, memory_gb)
 
-        # Classify GPU tier
-        tier = classify_gpu(name, memory_gb)
+            gpus.append({
+                'index': i,
+                'name': name,
+                'memory_gb': memory_gb,
+                'tier': tier,
+                'compute_capability': f"{props.major}.{props.minor}",
+                'backend': 'cuda',
+            })
+
+    # Check for MPS (Apple Silicon)
+    if torch.backends.mps.is_available():
+        import platform
+        import subprocess
+
+        # Try to get Apple Silicon info
+        memory_gb = 16.0  # Default assumption
+        chip_name = "Apple Silicon"
+
+        try:
+            if platform.system() == "Darwin":
+                # Get chip name
+                result = subprocess.run(
+                    ["sysctl", "-n", "machdep.cpu.brand_string"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    chip_name = result.stdout.strip()
+
+                # Try to get memory info (hw.memsize gives bytes)
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    memory_bytes = int(result.stdout.strip())
+                    memory_gb = memory_bytes / (1024**3) * 0.8  # Estimate 80% available for GPU
+        except Exception:
+            pass
+
+        # Determine tier based on chip
+        tier = 'mid'
+        if 'M3' in chip_name or ('M2' in chip_name and ('Max' in chip_name or 'Ultra' in chip_name)):
+            tier = 'high'
+        elif 'M1' in chip_name and ('Max' in chip_name or 'Ultra' in chip_name):
+            tier = 'mid-high'
 
         gpus.append({
-            'index': i,
-            'name': name,
+            'index': 0,
+            'name': f"{chip_name} (MPS)",
             'memory_gb': memory_gb,
             'tier': tier,
-            'compute_capability': f"{props.major}.{props.minor}",
+            'compute_capability': 'N/A',
+            'backend': 'mps',
         })
 
     return gpus
@@ -167,6 +216,47 @@ PRESETS = {
         'tokenizer': {
             'type': 'simple',
             'vocab_size': 1000,
+        },
+    },
+
+    'mps-small': {
+        'name': 'Apple Silicon MPS (Small Model)',
+        'description': 'Optimized for Apple Silicon Macs (M1/M2/M3)',
+        'model': {
+            'd_model': 768,
+            'd_prompt': 768,
+            'num_diffusion_steps': 1000,
+            'num_denoiser_layers': 8,
+            'd_state': 32,
+            'd_conv': 4,
+            'expand': 2,
+            'conditioning_type': 'film',
+            'dropout': 0.1,
+            'use_weight_tying': True,
+        },
+        'data': {
+            'type': 'huggingface',
+            'dataset_name': 'HuggingFaceFW/fineweb',
+            'dataset_config': 'sample-10BT',
+            'batch_size': 8,
+            'max_length': 512,
+            'num_workers': 4,
+            'streaming': False,
+        },
+        'training': {
+            'learning_rate': 1e-4,
+            'warmup_steps': 500,
+            'weight_decay': 0.01,
+            'ema_decay': 0.9999,
+            'use_ema': True,
+            'ema_device': 'cpu',
+            'max_steps': 10000,
+            'gradient_clip': 1.0,
+            'accumulate_grad_batches': 1,
+        },
+        'tokenizer': {
+            'type': 'bpe',
+            'vocab_size': 32000,
         },
     },
 
@@ -381,6 +471,62 @@ VAE_PRESETS = {
 
 
 # =============================================================================
+# Dataset Presets
+# =============================================================================
+
+DATASET_PRESETS = {
+    'fineweb': {
+        'name': 'FineWeb (10B sample)',
+        'description': 'High-quality web text dataset by HuggingFace',
+        'dataset_name': 'HuggingFaceFW/fineweb',
+        'dataset_config': 'sample-10BT',
+    },
+    'fineweb-edu': {
+        'name': 'FineWeb-Edu',
+        'description': 'Educational content subset of FineWeb',
+        'dataset_name': 'HuggingFaceFW/fineweb-edu',
+        'dataset_config': 'default',
+    },
+    'wikitext': {
+        'name': 'WikiText-103',
+        'description': 'Wikipedia articles (long-form text)',
+        'dataset_name': 'wikitext',
+        'dataset_config': 'wikitext-103-v1',
+    },
+    'wikitext-2': {
+        'name': 'WikiText-2 (small)',
+        'description': 'Small Wikipedia dataset for testing',
+        'dataset_name': 'wikitext',
+        'dataset_config': 'wikitext-2-raw-v1',
+    },
+    'openwebtext': {
+        'name': 'OpenWebText',
+        'description': 'Open-source replication of WebText dataset',
+        'dataset_name': 'Skylion007/openwebtext',
+        'dataset_config': None,
+    },
+    'c4': {
+        'name': 'C4 (Colossal Clean Crawled Corpus)',
+        'description': 'Large-scale web text dataset by Google',
+        'dataset_name': 'allenai/c4',
+        'dataset_config': 'en',
+    },
+    'tinyshakespeare': {
+        'name': 'Tiny Shakespeare',
+        'description': 'Small dataset for quick testing/debugging',
+        'dataset_name': 'karpathy/tiny_shakespeare',
+        'dataset_config': None,
+    },
+    'custom': {
+        'name': 'Custom Dataset',
+        'description': 'Enter your own HuggingFace dataset',
+        'dataset_name': None,
+        'dataset_config': None,
+    },
+}
+
+
+# =============================================================================
 # Interactive UI
 # =============================================================================
 
@@ -456,6 +602,98 @@ What would you like to train?
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
+def interactive_dataset_selection() -> dict:
+    """Let user select a dataset from common options or enter a custom one.
+
+    Returns:
+        dict with 'dataset_name', 'dataset_config', and 'streaming' keys
+    """
+    print_header("Select Dataset")
+
+    # Common datasets with their configs
+    DATASET_OPTIONS = {
+        '1': {
+            'name': 'FineWeb (HuggingFaceFW/fineweb)',
+            'dataset_name': 'HuggingFaceFW/fineweb',
+            'dataset_config': 'sample-10BT',
+            'description': 'Large-scale web text corpus (10B tokens)',
+        },
+        '2': {
+            'name': 'WikiText-2',
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-2-raw-v1',
+            'description': 'Small Wikipedia dataset (~2M tokens)',
+        },
+        '3': {
+            'name': 'WikiText-103',
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-103-raw-v1',
+            'description': 'Large Wikipedia dataset (~103M tokens)',
+        },
+        '4': {
+            'name': 'OpenAssistant Conversations',
+            'dataset_name': 'OpenAssistant/oasst1',
+            'dataset_config': None,
+            'description': 'Conversational dataset for chat models',
+        },
+        '5': {
+            'name': 'C4 (Colossal Clean Crawled Corpus)',
+            'dataset_name': 'c4',
+            'dataset_config': 'en',
+            'description': 'Large web crawl dataset (~750GB)',
+        },
+        '6': {
+            'name': 'The Pile',
+            'dataset_name': 'EleutherAI/pile',
+            'dataset_config': None,
+            'description': 'Diverse 800GB English text corpus',
+        },
+        '7': {
+            'name': 'TinyStories',
+            'dataset_name': 'roneneldan/TinyStories',
+            'dataset_config': None,
+            'description': 'Short stories generated by GPT (~2.8M stories)',
+        },
+        '8': {
+            'name': 'RedPajama (Sample)',
+            'dataset_name': 'togethercomputer/RedPajama-Data-1T-Sample',
+            'dataset_config': None,
+            'description': '1 trillion token dataset sample',
+        },
+    }
+
+    print("\nAvailable datasets:")
+    print("-" * 60)
+    for key, info in DATASET_OPTIONS.items():
+        print(f"  [{key}] {info['name']}")
+        print(f"      {info['description']}")
+        print()
+    print("  [c] Custom dataset")
+    print("-" * 60)
+
+    while True:
+        choice = input("Select dataset [1]: ").strip() or '1'
+
+        if choice in DATASET_OPTIONS:
+            selected = DATASET_OPTIONS[choice]
+            result = {
+                'dataset_name': selected['dataset_name'],
+                'dataset_config': selected['dataset_config'],
+            }
+            print(f"\n✓ Selected: {selected['name']}")
+            return result
+        elif choice.lower() == 'c':
+            print("\nEnter custom dataset details:")
+            dataset_name = input("Dataset name (e.g., 'username/dataset-name'): ").strip()
+            dataset_config = input("Dataset config (press Enter if none): ").strip() or None
+            return {
+                'dataset_name': dataset_name,
+                'dataset_config': dataset_config if dataset_config else None,
+            }
+        else:
+            print(f"Invalid choice: {choice}")
+
+
 def interactive_vae_preset_selection() -> dict:
     """Let user select a VAE preset."""
     print_header("Select VAE Configuration")
@@ -509,8 +747,11 @@ def interactive_custom_vae_config() -> dict:
     config['data']['type'] = input("Dataset type [huggingface/dummy] [huggingface]: ").strip() or 'huggingface'
     
     if config['data']['type'] == 'huggingface':
-        config['data']['dataset_name'] = input("Dataset name [HuggingFaceFW/fineweb]: ").strip() or 'HuggingFaceFW/fineweb'
-        config['data']['dataset_config'] = input("Dataset config [sample-10BT]: ").strip() or 'sample-10BT'
+        # Use interactive dataset selection
+        dataset_info = interactive_dataset_selection()
+        config['data']['dataset_name'] = dataset_info['dataset_name']
+        if dataset_info['dataset_config']:
+            config['data']['dataset_config'] = dataset_info['dataset_config']
     else:
         config['data']['num_examples'] = int(input("Number of examples [1000]: ") or 1000)
     
@@ -537,37 +778,68 @@ def print_gpu_info(gpus: list[dict]):
     print(f"\n🖥️  Detected {len(gpus)} GPU(s):")
     print("-" * 60)
     for gpu in gpus:
-        print(f"  GPU {gpu['index']}: {gpu['name']}")
+        backend_label = f"[{gpu.get('backend', 'cuda').upper()}]"
+        print(f"  GPU {gpu['index']}: {gpu['name']} {backend_label}")
         print(f"    Memory: {gpu['memory_gb']:.1f} GB")
         print(f"    Tier: {gpu['tier']}")
-        print(f"    Compute: {gpu['compute_capability']}")
+        if gpu.get('compute_capability'):
+            print(f"    Compute: {gpu['compute_capability']}")
     print("-" * 60)
 
 
-def interactive_gpu_selection(gpus: list[dict]) -> tuple[int, list[int]]:
-    """Let user select which GPUs to use."""
+def interactive_gpu_selection(gpus: list[dict]) -> tuple[int, list[int], str]:
+    """Let user select which GPUs to use.
+    
+    Returns:
+        (num_gpus, gpu_indices, accelerator_type)
+        accelerator_type: 'cuda', 'mps', or 'cpu'
+    """
     if not gpus:
-        return 0, []
+        print("\n⚠️  No GPUs detected. Will use CPU.")
+        return 0, [], 'cpu'
 
     print_gpu_info(gpus)
+    
+    # Check if we have MPS (Apple Silicon)
+    has_mps = any(g.get('backend') == 'mps' for g in gpus)
+    has_cuda = any(g.get('backend') == 'cuda' for g in gpus)
 
     if len(gpus) == 1:
-        use = input(f"\nUse GPU 0? [Y/n]: ").strip().lower()
+        gpu = gpus[0]
+        backend = gpu.get('backend', 'cuda')
+        use = input(f"\nUse {backend.upper()} GPU? [Y/n]: ").strip().lower()
         if use in ('n', 'no'):
-            return 0, []
-        return 1, [0]
+            return 0, [], 'cpu'
+        return 1, [0], backend
 
     print("\nOptions:")
     print("  a) Use all GPUs")
     print("  s) Use specific GPU(s)")
-    print("  c) Use CPU only")
+    if has_mps:
+        print("  m) Use Apple Silicon (MPS) only")
+    if has_cuda and has_mps:
+        print("  c) Use CUDA only")
+    print("  n) Use CPU only")
 
     choice = input("\nSelect option [a]: ").strip().lower() or 'a'
 
-    if choice == 'c':
-        return 0, []
+    if choice == 'n':
+        return 0, [], 'cpu'
     elif choice == 'a':
-        return len(gpus), list(range(len(gpus)))
+        # Use all available GPUs (prefer CUDA if mixed)
+        cuda_gpus = [i for i, g in enumerate(gpus) if g.get('backend') == 'cuda']
+        mps_gpus = [i for i, g in enumerate(gpus) if g.get('backend') == 'mps']
+        if cuda_gpus:
+            return len(cuda_gpus), cuda_gpus, 'cuda'
+        elif mps_gpus:
+            return len(mps_gpus), mps_gpus, 'mps'
+        return len(gpus), list(range(len(gpus))), 'cuda'
+    elif choice == 'm' and has_mps:
+        mps_indices = [i for i, g in enumerate(gpus) if g.get('backend') == 'mps']
+        return len(mps_indices), mps_indices, 'mps'
+    elif choice == 'c' and has_cuda:
+        cuda_indices = [i for i, g in enumerate(gpus) if g.get('backend') == 'cuda']
+        return len(cuda_indices), cuda_indices, 'cuda'
     else:
         indices = input("Enter GPU indices to use (comma-separated, e.g., 0,1): ").strip()
         try:
@@ -575,11 +847,14 @@ def interactive_gpu_selection(gpus: list[dict]) -> tuple[int, list[int]]:
             valid = [i for i in selected if 0 <= i < len(gpus)]
             if not valid:
                 print("No valid GPUs selected. Using CPU.")
-                return 0, []
-            return len(valid), valid
+                return 0, [], 'cpu'
+            # Determine backend from first selected GPU
+            backend = gpus[valid[0]].get('backend', 'cuda')
+            return len(valid), valid, backend
         except ValueError:
             print("Invalid input. Using first GPU.")
-            return 1, [0]
+            backend = gpus[0].get('backend', 'cuda')
+            return 1, [0], backend
 
 
 def interactive_preset_selection(gpus: list[dict]) -> dict:
@@ -589,17 +864,27 @@ def interactive_preset_selection(gpus: list[dict]) -> dict:
     # Auto-suggest based on GPU
     suggested = None
     if gpus:
-        total_memory = sum(g['memory_gb'] for g in gpus)
-        max_tier = max(g['tier'] for g in gpus) if gpus else 'unknown'
+        # Check for MPS (Apple Silicon)
+        has_mps = any(g.get('backend') == 'mps' for g in gpus)
+        has_cuda = any(g.get('backend') == 'cuda' for g in gpus)
+        
+        if has_mps and not has_cuda:
+            suggested = 'mps-small'
+        elif has_cuda:
+            total_memory = sum(g['memory_gb'] for g in gpus if g.get('backend') == 'cuda')
+            max_tier = max((g['tier'] for g in gpus if g.get('backend') == 'cuda'), default='unknown')
 
-        if max_tier == 'high' and total_memory > 70:
-            suggested = 'a100-3b'
-        elif max_tier in ('high', 'mid-high') or total_memory > 40:
-            suggested = 'l40s-1b'
-        elif max_tier == 'mid' or total_memory > 12:
-            suggested = 'a4000-500m'
-        else:
-            suggested = 'cpu-small'
+            if max_tier == 'high' and total_memory > 70:
+                suggested = 'a100-3b'
+            elif max_tier in ('high', 'mid-high') or total_memory > 40:
+                suggested = 'l40s-1b'
+            elif max_tier == 'mid' or total_memory > 12:
+                suggested = 'a4000-500m'
+            else:
+                suggested = 'cpu-small'
+    
+    if not suggested:
+        suggested = 'cpu-small'
 
     print("\nAvailable presets:")
     for key, preset in PRESETS.items():
@@ -680,8 +965,11 @@ def interactive_custom_config(gpus: list[dict]) -> dict:
     config['data']['type'] = dataset_type
 
     if dataset_type == 'huggingface':
-        config['data']['dataset_name'] = input("Dataset name [HuggingFaceFW/fineweb]: ").strip() or 'HuggingFaceFW/fineweb'
-        config['data']['dataset_config'] = input("Dataset config [sample-10BT]: ").strip() or 'sample-10BT'
+        # Use interactive dataset selection
+        dataset_info = interactive_dataset_selection()
+        config['data']['dataset_name'] = dataset_info['dataset_name']
+        if dataset_info['dataset_config']:
+            config['data']['dataset_config'] = dataset_info['dataset_config']
         config['data']['streaming'] = input("Use streaming? [y/N]: ").strip().lower() == 'y'
     else:
         config['data']['num_examples'] = int(input("Number of examples [1000]: ") or 1000)
@@ -804,11 +1092,19 @@ def print_memory_estimate(est: dict, gpus: list[dict], selected_gpus: list[int])
 
     if gpus and selected_gpus:
         for idx in selected_gpus:
+            if idx >= len(gpus):
+                continue
             gpu = gpus[idx]
-            headroom = gpu['memory_gb'] - est['total_per_gpu_gb']
-            status = "✅ OK" if headroom > 2 else "⚠️  TIGHT" if headroom > 0 else "❌ EXCEEDS"
-            print(f"\n  GPU {idx} ({gpu['name']}): {gpu['memory_gb']:.1f} GB")
-            print(f"    Headroom: {headroom:.1f} GB {status}")
+            backend = gpu.get('backend', 'cuda')
+            if backend == 'mps':
+                # MPS uses unified memory, so the estimate is different
+                print(f"\n  MPS ({gpu['name']}): Unified memory (estimated {gpu['memory_gb']:.1f} GB available)")
+                print(f"    Note: MPS uses unified memory architecture")
+            else:
+                headroom = gpu['memory_gb'] - est['total_per_gpu_gb']
+                status = "✅ OK" if headroom > 2 else "⚠️  TIGHT" if headroom > 0 else "❌ EXCEEDS"
+                print(f"\n  GPU {idx} ({gpu['name']}): {gpu['memory_gb']:.1f} GB")
+                print(f"    Headroom: {headroom:.1f} GB {status}")
 
 
 # =============================================================================
@@ -916,7 +1212,7 @@ def upload_to_huggingface(checkpoint_dir: str, repo_id: Optional[str] = None,
         return False
 
 
-def run_vae_training(vae_config: dict, num_gpus: int, gpu_indices: list[int],
+def run_vae_training(vae_config: dict, num_gpus: int, gpu_indices: list[int], gpus: list[dict] = None,
                      hf_repo_id: Optional[str] = None, hf_token: Optional[str] = None,
                      hf_private: bool = False) -> Optional[str]:
     """Run VAE training and return the path to the best checkpoint."""
@@ -1030,7 +1326,17 @@ def run_vae_training(vae_config: dict, num_gpus: int, gpu_indices: list[int],
         'gradient_clip_val': 1.0,
     }
 
-    if num_gpus > 0:
+    # Determine accelerator type from gpu_indices
+    accelerator_type = 'cpu'
+    if gpu_indices and gpus:
+        accelerator_type = gpus[gpu_indices[0]].get('backend', 'cuda')
+
+    if accelerator_type == 'mps':
+        trainer_kwargs['accelerator'] = 'mps'
+        trainer_kwargs['devices'] = 1
+        # MPS doesn't support 16-mixed precision yet
+        trainer_kwargs['precision'] = '32'
+    elif num_gpus > 0:
         trainer_kwargs['accelerator'] = 'gpu'
         trainer_kwargs['devices'] = len(gpu_indices) if len(gpu_indices) > 1 else 1
         if len(gpu_indices) > 1:
@@ -1072,7 +1378,7 @@ def run_vae_training(vae_config: dict, num_gpus: int, gpu_indices: list[int],
         raise
 
 
-def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int],
+def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int], gpus: list[dict] = None,
                        vae_checkpoint: Optional[str] = None,
                        hf_repo_id: Optional[str] = None, hf_token: Optional[str] = None,
                        hf_private: bool = False):
@@ -1155,7 +1461,17 @@ def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int],
         'accumulate_grad_batches': int(train_cfg.get('accumulate_grad_batches', 1)),
     }
 
-    if num_gpus > 0:
+    # Determine accelerator type from gpu_indices
+    accelerator_type = 'cpu'
+    if gpu_indices and gpus:
+        accelerator_type = gpus[gpu_indices[0]].get('backend', 'cuda')
+
+    if accelerator_type == 'mps':
+        trainer_kwargs['accelerator'] = 'mps'
+        trainer_kwargs['devices'] = 1
+        # MPS doesn't support 16-mixed precision yet
+        trainer_kwargs['precision'] = '32'
+    elif num_gpus > 0:
         trainer_kwargs['accelerator'] = 'gpu'
         trainer_kwargs['devices'] = len(gpu_indices) if len(gpu_indices) > 1 else 1
         if len(gpu_indices) > 1:
@@ -1265,19 +1581,26 @@ Examples:
     gpus = detect_gpus()
 
     # Determine GPU configuration
+    accelerator_type = 'cpu'
     if args.gpus:
         gpu_indices = [int(x.strip()) for x in args.gpus.split(',')]
         gpu_indices = [i for i in gpu_indices if i < len(gpus)]
         num_gpus = len(gpu_indices)
+        if gpu_indices:
+            accelerator_type = gpus[gpu_indices[0]].get('backend', 'cuda')
     elif args.auto_gpu:
         num_gpus = len(gpus)
         gpu_indices = list(range(len(gpus)))
+        if gpu_indices:
+            accelerator_type = gpus[gpu_indices[0]].get('backend', 'cuda')
     else:
         if args.yes:
             num_gpus = len(gpus)
             gpu_indices = list(range(len(gpus)))
+            if gpu_indices:
+                accelerator_type = gpus[gpu_indices[0]].get('backend', 'cuda')
         else:
-            num_gpus, gpu_indices = interactive_gpu_selection(gpus)
+            num_gpus, gpu_indices, accelerator_type = interactive_gpu_selection(gpus)
 
     # Select training mode
     if args.train_mode:
@@ -1300,7 +1623,7 @@ Examples:
         if not args.yes:
             vae_config = interactive_config_review(vae_config, gpus)
         
-        run_vae_training(vae_config, num_gpus, gpu_indices,
+        run_vae_training(vae_config, num_gpus, gpu_indices, gpus=gpus,
                         hf_repo_id=args.hf_repo_id, hf_token=args.hf_token, hf_private=args.hf_private)
 
     elif train_mode in ('dimba-embedding', 'dimba-latent'):
@@ -1316,7 +1639,7 @@ Examples:
         if not args.yes:
             config = interactive_config_review(config, gpus)
         
-        run_dimba_training(config, num_gpus, gpu_indices, vae_checkpoint=vae_checkpoint,
+        run_dimba_training(config, num_gpus, gpu_indices, gpus=gpus, vae_checkpoint=vae_checkpoint,
                           hf_repo_id=args.hf_repo_id, hf_token=args.hf_token, hf_private=args.hf_private)
 
     elif train_mode == 'both':
@@ -1334,7 +1657,7 @@ Examples:
             vae_config = interactive_config_review(vae_config, gpus)
         
         # Train VAE
-        vae_ckpt = run_vae_training(vae_config, num_gpus, gpu_indices,
+        vae_ckpt = run_vae_training(vae_config, num_gpus, gpu_indices, gpus=gpus,
                                     hf_repo_id=args.hf_repo_id, 
                                     hf_token=args.hf_token, 
                                     hf_private=args.hf_private)
@@ -1360,7 +1683,7 @@ Examples:
             config = interactive_config_review(config, gpus)
         
         # Train DIMBA with the VAE
-        run_dimba_training(config, num_gpus, gpu_indices, vae_checkpoint=vae_ckpt,
+        run_dimba_training(config, num_gpus, gpu_indices, gpus=gpus, vae_checkpoint=vae_ckpt,
                           hf_repo_id=args.hf_repo_id, hf_token=args.hf_token, hf_private=args.hf_private)
 
 
