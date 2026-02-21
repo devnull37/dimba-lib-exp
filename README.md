@@ -1,36 +1,141 @@
-# DIMBA: Diffusion-based Mamba for Non-Autoregressive Text Generation
+# DIMBA 🐍✨
 
-A PyTorch implementation of **DIMBA** (Diffusion + Mamba-based Architecture) - a non-autoregressive language model combining cosine-scheduled diffusion with Mamba-2 state-space models for parallel text generation.
+[![PyPI version](https://badge.fury.io/py/dimba-lib.svg)](https://badge.fury.io/py/dimba-lib)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 
-## Overview
+> **Diffusion-based Mamba Architecture for Non-Autoregressive Text Generation**
 
-DIMBA generates entire token sequences in parallel using iterative denoising, enabling controllable speed-quality trade-offs by adjusting diffusion steps T. It leverages Mamba-2's efficient long-range dependency modeling for linear-time sequence processing.
+DIMBA is a research-grade language model that combines the power of diffusion models with Mamba-2 State Space Models (SSM) to enable **fast, parallel text generation**. Unlike traditional autoregressive models that generate tokens one-by-one, DIMBA generates entire sequences simultaneously through iterative denoising.
 
-## Installation
+🔬 **Research Paper**: *"DIMBA: Revolutionizing Theoretical Ultra-Fast Inference and Advanced Reasoning with Mamba-Based Diffusion"* — Faris Allafi (2025)
 
-### Requirements
-- Python 3.9+
-- CUDA 11.6+ (optional, for GPU acceleration)
+🌐 **Website**: [dimbalabs.xyz](https://dimbalabs.xyz)  
+👤 **Author**: [farisallafi.xyz](https://farisallafi.xyz)
 
-### Install
+---
+
+## 🚀 Key Features
+
+### ⚡ Pure PyTorch Mamba-2 Implementation
+- **No CUDA dependencies required** — runs on CPU, GPU, and Apple Silicon
+- Custom `SimpleMamba2` fallback implementation when `mamba-ssm` is unavailable
+- Seamlessly switches between high-performance CUDA kernels and pure PyTorch
+
+### 🎯 Latent Space Diffusion with VAE
+- Optional Variational Autoencoder for compressing token embeddings
+- Trainable latent spaces with KL-regularization (β-VAE)
+- Improves diffusion efficiency and model capacity
+
+### 🍎 Native Apple Silicon (MPS) Support
+- First-class Metal Performance Shaders support
+- Optimized for M1/M2/M3 Macs without CUDA
+
+### 🎮 Interactive Training Scripts
+- `train_interactive.py` — guided wizard for easy configuration
+- Automatic hardware detection and optimization recommendations
+- One-command training for various GPU tiers (A4000, L40S, etc.)
+
+### 🔧 Multiple Decoding Strategies
+- **Standard diffusion sampling** — flexible step counts
+- **DDIM sampling** — faster inference with fewer steps
+- **Consistency training** (CDLM) — up to 14× faster inference
+- Top-k, top-p, and temperature-based sampling
+
+---
+
+## 📐 Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     DIMBA Architecture                       │
+├─────────────────────────────────────────────────────────────┤
+│  Input Tokens                                               │
+│       ↓                                                     │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐ │
+│  │   Token     │───→│   Prompt    │───→│  Conditioning   │ │
+│  │ Embeddings  │    │  Encoder    │    │      (C)        │ │
+│  └─────────────┘    └─────────────┘    └─────────────────┘ │
+│       ↓                                      ↓              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │           Latent Projection (Optional VAE)          │   │
+│  │     z = μ + σ·ε  (reparameterization trick)         │   │
+│  └─────────────────────────────────────────────────────┘   │
+│       ↓                                                     │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              Cosine Noise Schedule                   │   │
+│  │     ᾱ(t) = cos²((t/T + s)/(1+s)·π/2)               │   │
+│  │     x_t = √ᾱ(t)·x₀ + √(1-ᾱ(t))·ε                  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│       ↓                                                     │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │         Mamba-2 Denoiser (T iterations)             │   │
+│  │  ┌─────────────────────────────────────────────┐   │   │
+│  │  │  Mamba-2 SSM Block × N layers              │   │   │
+│  │  │  - Linear-time sequence processing         │   │   │
+│  │  │  - Selective state spaces (S6)             │   │   │
+│  │  │  - FiLM/Additive conditioning              │   │   │
+│  │  └─────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│       ↓                                                     │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐ │
+│  │   Output    │───→│   Latent    │───→│  Token Logits   │ │
+│  │ Projection  │    │    Decode   │    │   (Softmax)     │ │
+│  └─────────────┘    └─────────────┘    └─────────────────┘ │
+│                                                  ↓          │
+│                                          Generated Text     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Core Components
+
+| Component | Description |
+|-----------|-------------|
+| **Token Embeddings** | Learnable embeddings mapping discrete tokens to continuous space |
+| **Prompt Encoder** | Lightweight MLP for conditioning on prefix tokens |
+| **Noise Schedule** | Cosine schedule following Nichol & Dhariwal (2021) |
+| **Timestep Embeddings** | Sinusoidal encodings with MLP projection |
+| **Mamba-2 Denoiser** | Stack of SSM blocks with FiLM/additive conditioning |
+| **VAE (Optional)** | Token-level variational autoencoder for latent diffusion |
+
+---
+
+## 🚀 Getting Started
+
+### Installation
 
 ```bash
+# Clone the repository
 git clone https://github.com/devnull37/dimba-lib-exp.git
 cd dimba-lib-exp
 
 # Basic installation (CPU + SimpleMamba fallback)
 pip install -e .
 
-# With GPU support (full Mamba-2)
+# With GPU support (full Mamba-2 with CUDA)
 pip install -e ".[gpu]"
 
-# Full development setup
+# Full development setup (includes all extras)
 pip install -e ".[all]"
 ```
 
-## Quick Start
+### Quick Start
 
-### Training
+#### Option 1: Interactive Setup (Recommended)
+
+```bash
+# Launch the interactive training wizard
+python scripts/train_interactive.py
+```
+
+The wizard will guide you through:
+- Hardware detection (CUDA, MPS, or CPU)
+- Model size selection
+- Dataset configuration
+- Training hyperparameters
+
+#### Option 2: Command-Line Training
 
 ```bash
 # Train on GPU
@@ -38,49 +143,70 @@ python scripts/train.py --config config.yaml --gpus 1 --max-epochs 10
 
 # Train on CPU (uses SimpleMamba)
 python scripts/train.py --config config.yaml
+
+# Train on Apple Silicon
+python scripts/train.py --config config.yaml --mps
 ```
 
-### Generation
-
-```bash
-python scripts/generate.py --checkpoint checkpoints/best.pt --prompt "Hello world"
-```
-
-### Evaluation
-
-```bash
-python scripts/evaluate.py --checkpoint checkpoints/best.pt --eval-speed
-```
-
-### Python API
+#### Option 3: Python API
 
 ```python
 import torch
 from dimba import DIMBA, sample_from_model
 
-# Create model
-model = DIMBA(vocab_size=50000, d_model=512, num_diffusion_steps=1000)
+# Create a DIMBA model
+model = DIMBA(
+    vocab_size=50000,
+    d_model=512,
+    num_diffusion_steps=1000,
+    num_denoiser_layers=8,
+)
 
 # Generate text
-prompt_ids = torch.tensor([[10, 20, 30]])
-generated = sample_from_model(model, prompt_ids, seq_len=100, num_steps=50)
+prompt_ids = torch.tensor([[10, 20, 30]])  # Tokenized prompt
+generated = sample_from_model(
+    model, 
+    prompt_ids, 
+    seq_len=100, 
+    num_steps=50,  # Fewer steps = faster, more steps = better quality
+    temperature=1.0,
+    top_p=0.95
+)
+
+print(generated)
 ```
 
-## VAE Pre-training for Latent Diffusion
+---
 
-DIMBA supports Variational Autoencoder (VAE) based latent diffusion, which compresses token embeddings into a probabilistic latent space. This can improve diffusion efficiency and model capacity.
+## 🖥️ Hardware Support
 
-### VAE Architecture
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **NVIDIA CUDA** | ✅ Full support | Best performance with `mamba-ssm>=2.2.0` |
+| **Apple Silicon (MPS)** | ✅ Full support | Native Metal backend for M1/M2/M3 |
+| **CPU** | ✅ Supported | Uses pure PyTorch `SimpleMamba2` fallback |
+| **AMD ROCm** | ⚠️ Experimental | Via PyTorch ROCm builds |
 
-The `TokenVAE` class implements:
-- **Encoder**: Maps token embeddings to latent distribution (μ, log σ²)
-- **Reparameterization**: Stochastic sampling z = μ + σ·ε where ε ~ N(0,I)
-- **Decoder**: Maps latent z back to embedding space
-- **ELBO Loss**: Reconstruction loss + β·KL divergence
+### Hardware-Specific Training Scripts
 
-### Pre-training the VAE
+```bash
+# RTX A4000 (16GB VRAM) - 500M parameter model
+python scripts/train_fineweb_500m_a4000.py
 
-Pre-train the VAE before full diffusion training:
+# L40S / A100 - 1.5B parameter model  
+python scripts/train_fineweb_1b.py
+
+# CDLM (Consistency Training) - up to 14× faster inference
+python scripts/train_cdlm.py
+```
+
+---
+
+## 🧪 Advanced Features
+
+### VAE Pre-training for Latent Diffusion
+
+Pre-train a Variational Autoencoder to compress token embeddings:
 
 ```bash
 # Basic VAE training
@@ -89,211 +215,130 @@ python scripts/train_vae.py \
     --dataset-config wikitext-2-raw-v1 \
     --latent-dim 256 \
     --kl-weight 1.0 \
-    --learning-rate 1e-4 \
-    --batch-size 64 \
     --epochs 10
-
-# With PyTorch Lightning (multi-GPU support)
-python scripts/train_vae.py \
-    --use-lightning \
-    --dataset wikitext \
-    --gpus 1 \
-    --latent-dim 256 \
-    --kl-weight 0.1 \
-    --max-steps 100000
-
-# Resume from checkpoint
-python scripts/train_vae.py \
-    --resume-from checkpoints/vae/last.ckpt \
-    --epochs 20
 ```
 
-### Using VAE in DIMBA
-
-After pre-training, use the VAE checkpoint for latent diffusion:
+Use the pre-trained VAE in DIMBA:
 
 ```python
-from dimba import DIMBA
-
 model = DIMBA(
     vocab_size=50000,
     d_model=512,
     latent_diffusion=True,
     d_latent=256,
-    use_vae_latent=True,           # Use VAE instead of deterministic projector
-    vae_kl_weight=1.0,             # KL weight for VAE
-    vae_checkpoint_path='checkpoints/vae/final.ckpt',  # Load pre-trained VAE
+    use_vae_latent=True,
+    vae_checkpoint_path='checkpoints/vae/final.ckpt',
 )
 ```
 
-### VAE Training Parameters
+### Consistency Training (CDLM)
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--latent-dim` | Dimension of latent space | 256 |
-| `--kl-weight` | Weight for KL divergence (β-VAE) | 1.0 |
-| `--hidden-dim` | Hidden layer dimension | max(d_model, latent_dim) |
-| `--num-layers` | Number of encoder/decoder layers | 2 |
-| `--dropout` | Dropout rate | 0.1 |
-
-### Key Features
-
-- **Deterministic inference**: Use μ for encoding during diffusion, sample z only during training
-- **Pre-training**: Train VAE independently to learn a good latent space
-- **Checkpoint loading**: Load pre-trained VAE weights into DIMBA
-- **KL regularization**: β-VAE formulation allows controlling latent space structure
-
-## Architecture
-
-### Core Components
-
-1. **Token Embeddings**: Learnable embedding matrix mapping tokens to continuous space
-2. **Prompt Encoder**: Lightweight MLP encoding prompt to conditioning vectors
-3. **Cosine Noise Schedule**: Following Nichol & Dhariwal (2021) with formula `ᾱ(t) = cos²((t/T + s)/(1+s)·π/2)`
-4. **Timestep Embeddings**: Sinusoidal encodings with MLP to condition on noise level
-5. **Mamba-2 Denoiser**: Stack of Mamba-2 SSM blocks with FiLM/additive conditioning
-6. **Output Projection**: Linear layer (optionally weight-tied) projecting to token logits
-
-### Training Procedure
-
-```
-For each batch:
-  1. Sample random timestep t ~ Uniform(1, T)
-  2. Add noise: x_t = √ᾱ(t)·x₀ + √(1-ᾱ(t))·ε  where ε ~ N(0,I)
-  3. Encode prompt: C = PromptEncoder(x₀)
-  4. Get timestep embedding: τ = MLP(t)
-  5. Predict: x_pred = Denoiser(x_t, C, τ)
-  6. Compute loss: L = ||x_pred - x₀||²
-  7. Update parameters with AdamW + warmup
-```
-
-### Inference Procedure
-
-```
-1. Compute prompt conditioning: C = PromptEncoder(prompt_ids)
-2. Initialize with noise: x_T ~ N(0, I)
-3. Iterative denoising (t = T down to 1):
-   - τ = MLP(t)
-   - x_{t-1} = Denoiser(x_t, C, τ)
-4. Project to logits: logits = Linear(x_0)
-5. Sample tokens with top-k/top-p
-```
-
-## Configuration
-
-Edit `config.yaml`:
-
-```yaml
-model:
-  d_model: 512
-  num_diffusion_steps: 1000  # Controls speed/quality: T=50 for fast, T=1000 for best
-  num_denoiser_layers: 6
-  conditioning_type: "film"  # or "additive"
-  use_simple_mamba: false    # Set true for CPU or if mamba-ssm not installed
-
-training:
-  learning_rate: 2e-5
-  warmup_steps: 500
-  ema_decay: 0.9999
-  num_epochs: 10
-
-data:
-  type: "huggingface"  # "dummy", "huggingface", or "text"
-  dataset_name: "wikitext"
-  batch_size: 32
-  max_length: 256
-```
-
-## GPU Training
-
-### Setup on Cloud GPU (e.g., TensorDock)
+Train with Consistency Models for ultra-fast inference:
 
 ```bash
-# On your local machine
-git push origin main
-
-# On cloud GPU
-git clone https://github.com/your-username/dimba-lib-exp.git
-cd dimba-lib-exp
-pip install -e ".[gpu]"
-python scripts/train.py --config config.yaml --gpus 1
+python scripts/train_cdlm.py \
+    --config config.yaml \
+    --consistency-weight 0.5 \
+    --delta-min 50 \
+    --delta-max 200
 ```
 
-### Verify GPU Works
+---
 
-```python
-import torch
-print(torch.cuda.is_available())  # Should be True
-print(torch.cuda.get_device_name(0))  # GPU name
-```
+## 📊 Project Status
 
-### Performance Tips
+### ✅ What's Working
 
-- Increase batch size on GPU (32 → 64 → 128)
-- Use larger learning rates with GPU
-- Enable mixed precision with `--precision 16-mixed`
-- Use T=50 for fast inference, T=1000 for best quality
+- [x] Core diffusion training pipeline
+- [x] Mamba-2 denoiser with FiLM conditioning
+- [x] Pure PyTorch SimpleMamba2 fallback
+- [x] VAE-based latent diffusion
+- [x] DDIM sampling for faster inference
+- [x] Interactive training wizard
+- [x] Multi-GPU training (PyTorch Lightning)
+- [x] Apple Silicon (MPS) support
+- [x] HuggingFace datasets integration
+- [x] BPE tokenization
+- [x] EMA (Exponential Moving Average) training
+- [x] Checkpointing and resumption
 
-## Project Structure
+### 🚧 Experimental / In Progress
+
+- [ ] Consistency model training (CDLM)
+- [ ] Multi-modal extensions
+- [ ] Quantization support (INT8, INT4)
+- [ ] ONNX export
+- [ ] Flash Attention integration
+- [ ] Rotary Position Embeddings (RoPE)
+
+### ⚠️ Known Limitations
+
+1. **Training cost**: Diffusion models require substantial compute for pre-training
+2. **Discrete-continuous gap**: Mapping between discrete tokens and continuous embeddings affects rare token handling
+3. **Hyperparameter sensitivity**: Performance varies significantly with diffusion steps (T), architecture depth
+4. **Conditioning robustness**: Long-context conditioning requires careful tuning
+
+---
+
+## 📁 Project Structure
 
 ```
 dimba-lib-exp/
-├── src/dimba/
-│   ├── models/
-│   │   ├── diffusion.py       # DIMBA model wrapper
-│   │   ├── denoiser.py        # Mamba-2 denoiser
-│   │   ├── embeddings.py      # Token, timestep, prompt embeddings
-│   │   ├── vae.py             # TokenVAE for latent diffusion
-│   │   └── simple_mamba.py    # CPU fallback implementation
-│   ├── diffusion/
-│   │   ├── schedules.py       # Cosine noise schedule
-│   │   └── sampling.py        # Inference and sampling
-│   ├── data/
-│   │   └── dataset.py         # Dataset loaders
-│   ├── training/
-│   │   └── trainer.py         # PyTorch Lightning training
-│   └── evaluation/
-│       └── metrics.py         # BLEU, ROUGE, METEOR, perplexity
-├── scripts/                   # All training and utility scripts
-│   ├── train_interactive.py   # Interactive wizard (RECOMMENDED)
-│   ├── train.py               # Generic training script
-│   ├── train_vae.py           # VAE pre-training
-│   ├── train_fineweb_1b.py    # 1.5B model on FineWeb
-│   ├── train_fineweb_500m_a4000.py  # 500M model for A4000
-│   ├── generate.py            # Text generation
-│   ├── evaluate.py            # Model evaluation
-│   ├── upload_to_hf.py        # HuggingFace upload
-│   ├── README.md              # Detailed script documentation
-│   ├── setup/                 # Installation scripts
-│   │   ├── install_a4000.sh
-│   │   ├── install_l40s.sh
-│   │   ├── install_deps.sh
-│   │   └── setup_training.sh
-│   └── utils/                 # Utility scripts
-│       ├── calculate_memory.py
-│       ├── test_config.py
-│       └── test_dataset_loading.py
-├── tests/
-├── config.yaml
-├── README.md
-└── AGENTS.md
+├── src/dimba/                 # Core library
+│   ├── models/               # Model implementations
+│   │   ├── diffusion.py      # Main DIMBA model
+│   │   ├── denoiser.py       # Mamba-2 denoiser
+│   │   ├── vae.py            # Token VAE
+│   │   ├── embeddings.py     # Embedding layers
+│   │   └── simple_mamba.py   # Pure PyTorch Mamba
+│   ├── diffusion/            # Diffusion utilities
+│   │   ├── schedules.py      # Noise schedules
+│   │   └── sampling.py       # Sampling algorithms
+│   ├── data/                 # Dataset loaders
+│   ├── training/             # Training utilities
+│   ├── evaluation/           # Metrics (BLEU, ROUGE, etc.)
+│   └── tokenizers/           # Tokenization
+├── scripts/                  # Training & utility scripts
+│   ├── train_interactive.py  # Interactive wizard ⭐
+│   ├── train.py              # Generic training
+│   ├── train_vae.py          # VAE pre-training
+│   ├── train_cdlm.py         # Consistency training
+│   ├── generate.py           # Text generation
+│   ├── evaluate.py           # Evaluation
+│   └── setup/                # Installation scripts
+├── configs/                  # Configuration files
+├── tests/                    # Unit tests
+├── notebooks/                # Jupyter notebooks
+├── paper/                    # Research paper
+└── docs/                     # Documentation
 ```
 
-## Known Limitations
+---
 
-1. **Training cost**: Diffusion requires substantial compute
-2. **Discrete-continuous gap**: Embedding mapping affects rare tokens
-3. **Hyperparameter sensitivity**: Performance varies with T, architecture
-4. **Conditioning robustness**: Needs empirical validation across prompts
+## 🤝 Contributing
 
-## Next Steps
+We welcome contributions! Here's how to get started:
 
-1. **Train on real data**: Swap DummyDataset for HuggingFace datasets
-2. **Optimize hyperparameters**: Tune d_model, num_layers, T for your task
-3. **Benchmark**: Compare against autoregressive baselines
-4. **Evaluate**: Test on diverse prompts for conditioning robustness
+1. **Fork** the repository
+2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
+3. **Install** development dependencies: `pip install -e ".[dev]"`
+4. **Make** your changes
+5. **Run** tests: `pytest`
+6. **Format** code: `black src/ && isort src/`
+7. **Submit** a Pull Request
 
-## Citation
+### Development Setup
+
+```bash
+pip install -e ".[all]"
+pre-commit install  # Optional: for automated formatting
+```
+
+---
+
+## 📖 Citation
+
+If you use DIMBA in your research, please cite:
 
 ```bibtex
 @article{allafi2025dimba,
@@ -303,58 +348,33 @@ dimba-lib-exp/
 }
 ```
 
-## License
+---
 
-MIT License - See LICENSE file for details.
-## RTX A4000 (16GB) recipe: FineWeb + FiLM + embedding diffusion (~500M)
+## 📜 License
 
-This profile matches your requested setup: **single RTX A4000 16GB**, **embedding diffusion**, **FiLM conditioning**, and a **~500M parameter target**.
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
 
-### 1) Instance setup (A4000 specific)
+---
 
-```bash
-bash scripts/setup/install_a4000.sh
-```
+## 🔗 Links
 
-### 2) Train the 500M profile
+- 🌐 **Website**: [dimbalabs.xyz](https://dimbalabs.xyz)
+- 👤 **Author**: [farisallafi.xyz](https://farisallafi.xyz)
+- 📄 **Paper**: Available in the `paper/` directory
+- 💻 **Repository**: [github.com/devnull37/dimba-lib-exp](https://github.com/devnull37/dimba-lib-exp)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/devnull37/dimba-lib-exp/issues)
 
-```bash
-python scripts/train_fineweb_500m_a4000.py --config configs/fineweb_500m_a4000.yaml
-```
+---
 
-Optional: auto-upload to Hugging Face when training finishes:
+## 💡 Acknowledgments
 
-```bash
-export HF_TOKEN=hf_xxx
-python scripts/train_fineweb_500m_a4000.py \
-  --config configs/fineweb_500m_a4000.yaml \
-  --repo-id your-username/dimba-500m-fineweb-a4000
-```
+- **Mamba** — [State Space Models](https://github.com/state-spaces/mamba) by Tri Dao and Albert Gu
+- **Diffusion Models** — Inspired by works from OpenAI, Google Research, and the broader diffusion community
+- **PyTorch Lightning** — For the excellent training framework
+- **HuggingFace** — For datasets and transformers infrastructure
 
-Notes for 16GB VRAM:
-- Uses `batch_size=2` with `accumulate_grad_batches=16` (effective batch size 32)
-- Uses mixed precision (`16-mixed`) on CUDA
-- Uses sequence length 512 to fit A4000 memory more reliably
+---
 
-### 3) Upload to Hugging Face when finished
-
-```bash
-export HF_TOKEN=hf_xxx
-python scripts/upload_to_hf.py \
-  --repo-id your-username/dimba-500m-fineweb-a4000 \
-  --artifacts-dir ./checkpoints/fineweb_500m_a4000
-```
-
-Optional private repo:
-
-```bash
-python scripts/upload_to_hf.py \
-  --repo-id your-username/dimba-500m-fineweb-a4000 \
-  --artifacts-dir ./checkpoints/fineweb_500m_a4000 \
-  --private
-```
-
-Expected artifacts in `./checkpoints/fineweb_500m_a4000`:
-- `last.ckpt` and top-k validation checkpoints
-- `tokenizer.json`
-- `train_config.yaml`
+<p align="center">
+  <i>Built with ❤️ by Faris Allafi</i>
+</p>
