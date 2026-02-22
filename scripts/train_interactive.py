@@ -34,6 +34,7 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -95,8 +96,9 @@ def detect_gpus() -> list[dict]:
                 'backend': 'cuda',
             })
 
-    # Check for MPS (Apple Silicon)
-    if torch.backends.mps.is_available():
+    # Check for MPS (Apple Silicon); guard builds where torch.backends.mps is absent
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
         import platform
         import subprocess
 
@@ -535,6 +537,38 @@ def print_header(text: str):
     print("\n" + "=" * 60)
     print(f"  {text}")
     print("=" * 60)
+
+
+def interactive_main_menu_selection() -> str:
+    """Display top-level training wizard menu and return selected option."""
+    print("Welcome to DIMBA Training Wizard")
+    print("================================")
+    print("1. Train from scratch")
+    print("2. Finetune existing model")
+    print("3. Exit")
+
+    while True:
+        choice = input("Select option [1]: ").strip() or "1"
+        if choice in {"1", "2", "3"}:
+            return choice
+        print("Invalid choice. Please enter 1, 2, or 3.")
+
+
+def launch_finetuning_wizard() -> int:
+    """Launch the finetuning interactive script and return its exit code."""
+    finetune_script = SCRIPT_DIR / "finetuning" / "finetune_interactive.py"
+    if not finetune_script.exists():
+        print(f"\n❌ Finetuning script not found: {finetune_script}")
+        return 1
+
+    try:
+        result = subprocess.run([sys.executable, str(finetune_script)], check=False)
+        return result.returncode
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:
+        print(f"\n❌ Failed to launch finetuning wizard: {e}")
+        return 1
 
 
 def interactive_training_mode_selection() -> tuple[str, Optional[str]]:
@@ -1565,6 +1599,15 @@ Examples:
                         help='Create private HuggingFace repo')
 
     args = parser.parse_args()
+
+    # Show top-level menu only for default interactive startup.
+    if len(sys.argv) == 1:
+        menu_choice = interactive_main_menu_selection()
+        if menu_choice == "2":
+            sys.exit(launch_finetuning_wizard())
+        if menu_choice == "3":
+            print("Exiting.")
+            return
 
     print("=" * 60)
     print("  DIMBA Interactive Training")

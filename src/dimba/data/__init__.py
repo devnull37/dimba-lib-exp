@@ -1,6 +1,24 @@
 """Data module for DIMBA."""
 
 from .dataset import TextDataset, HuggingFaceDataset, HuggingFaceIterableDataset, DummyDataset, collate_fn
+from .finetuning import (
+    BaseDiffusionFormatter,
+    UltraChatFormatter,
+    CodeFeedbackFormatter,
+    OpenHermes25Formatter,
+    FeedbackCollectionFormatter,
+    SuggestedDatasetSpec,
+    SUGGESTED_DATASETS,
+    resolve_suggested_dataset,
+    resolve_dataset_source,
+    load_local_records,
+    load_finetuning_source,
+    load_and_format_finetuning_records,
+    InstructionDataset,
+    PreferenceDataset,
+    ChatDataset,
+    ConcatenatedSequenceDataset,
+)
 
 __all__ = [
     "TextDataset",
@@ -8,4 +26,20 @@ __all__ = [
     "HuggingFaceIterableDataset",
     "DummyDataset",
     "collate_fn",
+    "BaseDiffusionFormatter",
+    "UltraChatFormatter",
+    "CodeFeedbackFormatter",
+    "OpenHermes25Formatter",
+    "FeedbackCollectionFormatter",
+    "SuggestedDatasetSpec",
+    "SUGGESTED_DATASETS",
+    "resolve_suggested_dataset",
+    "resolve_dataset_source",
+    "load_local_records",
+    "load_finetuning_source",
+    "load_and_format_finetuning_records",
+    "InstructionDataset",
+    "PreferenceDataset",
+    "ChatDataset",
+    "ConcatenatedSequenceDataset",
 ]
