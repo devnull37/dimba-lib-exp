@@ -82,6 +82,8 @@ class DIMBA(nn.Module):
         self_conditioning: bool = False,
         prediction_type: str = "x0",
         zero_terminal_snr: bool = True,
+        embed_init_std: float = 0.02,
+        latent_scale: Optional[float] = None,
     ):
         super().__init__()
 
@@ -109,8 +111,21 @@ class DIMBA(nn.Module):
         else:
             self.d_latent = d_model
 
+        # Scale applied to the encoded signal so the diffused tensor is ~unit
+        # variance (standard diffusion assumes this for a calibrated SNR). For the
+        # embedding path the signal is the token embedding (std ~= embed_init_std),
+        # so the default brings it to ~unit variance. For the projector/VAE path the
+        # output std is data-dependent -> default 1.0; call calibrate_latent_scale on
+        # a representative batch before training. (cf. Stable Diffusion's 0.18215.)
+        if latent_scale is None:
+            latent_scale = (1.0 / embed_init_std) if not self.latent_diffusion else 1.0
+        self.latent_scale = float(latent_scale)
+        self.embed_init_std = float(embed_init_std)
+
         # Token embeddings
-        self.token_embed = TokenEmbedding(vocab_size, d_model, padding_idx=padding_idx)
+        self.token_embed = TokenEmbedding(
+            vocab_size, d_model, padding_idx=padding_idx, init_std=embed_init_std
+        )
 
         # Prompt encoder (used to build a pooled, response-free conditioning summary)
         self.prompt_encoder = PromptEncoder(
@@ -233,6 +248,8 @@ class DIMBA(nn.Module):
             self_conditioning=self_conditioning,
             prediction_type=prediction_type,
             zero_terminal_snr=zero_terminal_snr,
+            embed_init_std=embed_init_std,
+            latent_scale=self.latent_scale,
         )
 
     @property
@@ -266,16 +283,44 @@ class DIMBA(nn.Module):
         return self.cond_projector(conditioning)
 
     def encode_latent(self, x_0: torch.Tensor) -> torch.Tensor:
-        """Encode embeddings into the diffusion latent space."""
-        if self.latent_projector is None:
-            return x_0
-        return self.latent_projector.encode(x_0)
+        """Encode embeddings into the (scaled, ~unit-variance) diffusion signal."""
+        z = x_0 if self.latent_projector is None else self.latent_projector.encode(x_0)
+        return self.latent_scale * z
 
     def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent states back to embedding space."""
+        """Invert :meth:`encode_latent`: unscale, then project back to embedding space."""
+        z = z / self.latent_scale
         if self.latent_projector is None:
             return z
         return self.latent_projector.decode(z)
+
+    @torch.no_grad()
+    def calibrate_latent_scale(
+        self, input_ids_or_embeds: torch.Tensor, target_std: float = 1.0
+    ) -> float:
+        """Set ``latent_scale`` so the encoded signal has ~``target_std`` per element.
+
+        Call once on a representative batch *before* training (especially in
+        latent/VAE mode, where the projector output std is data-dependent). This is
+        the standard "measure the latent std, divide it out" calibration used by
+        latent diffusion models so the noise schedule's SNR is meaningful.
+
+        Args:
+            input_ids_or_embeds: Token ids ``[B, L]`` or embeddings ``[B, L, d_model]``.
+            target_std: Desired per-element std of the diffused signal (default 1.0).
+
+        Returns:
+            The new ``latent_scale``.
+        """
+        if input_ids_or_embeds.dim() == 2 and not torch.is_floating_point(input_ids_or_embeds):
+            x_0 = self.token_embed(input_ids_or_embeds)
+        else:
+            x_0 = input_ids_or_embeds
+        raw = x_0 if self.latent_projector is None else self.latent_projector.encode(x_0)
+        std = raw.float().std().clamp(min=1e-6).item()
+        self.latent_scale = float(target_std / std)
+        self._config["latent_scale"] = self.latent_scale
+        return self.latent_scale
 
     def _pooled_prompt(self, ids: torch.Tensor, prompt_mask: Optional[torch.Tensor]) -> torch.Tensor:
         """Mean-pool the prompt-encoder output over prompt positions -> ``[B, d_prompt]``."""

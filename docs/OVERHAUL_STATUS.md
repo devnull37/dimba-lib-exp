@@ -16,6 +16,7 @@ what changed, how it was validated, and what's left.
 - `denoise_step` referenced a renamed helper (`_run_denoiser`) → fixed to delegate to `denoise_to_x0_latent`. (`models/diffusion.py`)
 - `SimpleMamba2`'s vectorized scan can underflow to NaN for large state-decay over long sequences → now falls back to the stable sequential scan when the parallel result is non-finite. (`models/simple_mamba.py`)
 - `pyproject.toml` isort key `multi_line_mode` → `multi_line_output` (the typo crashed the isort/pre-commit hook).
+- **Latent/embedding scale calibration** — the diffused signal is now scaled to ~unit variance (`latent_scale`, à la Stable Diffusion's `0.18215`) so the schedule's SNR is meaningful; `DIMBA.calibrate_latent_scale(batch)` measures it for the VAE/latent path. Embeddings initialized at std 0.02 against unit-variance noise were crushing the effective SNR at every timestep. (`models/diffusion.py`, `models/embeddings.py`)
 
 **Research upgrades**
 - **Self-conditioning**, **classifier-free guidance**, **min-SNR-γ** weighting, **cross-entropy / rounding** anchor + latent-AE consistency, **v-prediction** option. (`models/diffusion.py`, `training/trainer.py`)

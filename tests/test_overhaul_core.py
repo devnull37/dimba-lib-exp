@@ -110,6 +110,18 @@ def test_config_roundtrip():
     assert m2.self_conditioning and m2.latent_diffusion and m2.d_latent == 8
 
 
+def test_latent_scale_calibration():
+    # Embedding mode: default scale = 1/embed_init_std = 50 -> ~unit-variance signal.
+    m = tiny()
+    assert m.latent_scale == pytest.approx(50.0, rel=1e-3)
+    x = m.token_embed(torch.randint(0, 40, (2, 5)))
+    s = m.encode_latent(x)
+    assert 0.5 < float(s.std()) < 2.0
+    assert torch.allclose(m.decode_latent(s), x, atol=1e-4)  # round-trips exactly
+    new = m.calibrate_latent_scale(torch.randint(0, 40, (4, 8)))
+    assert new > 0 and m.config["latent_scale"] == pytest.approx(new)
+
+
 def test_combined_loss():
     pytest.importorskip("pytorch_lightning")
     from dimba.training.trainer import compute_dimba_losses

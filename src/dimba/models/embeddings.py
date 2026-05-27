@@ -15,14 +15,20 @@ class TokenEmbedding(nn.Module):
         padding_idx: Optional padding index
     """
 
-    def __init__(self, vocab_size: int, embed_dim: int, padding_idx: Optional[int] = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        padding_idx: Optional[int] = None,
+        init_std: float = 0.02,
+    ):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
 
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
         # Initialize embeddings
-        nn.init.normal_(self.embedding.weight, std=0.02)
+        nn.init.normal_(self.embedding.weight, std=init_std)
         if padding_idx is not None:
             nn.init.constant_(self.embedding.weight[padding_idx], 0)
 
