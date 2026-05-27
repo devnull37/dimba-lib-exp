@@ -27,6 +27,7 @@ from dimba import DIMBA
 from dimba.models.lora import inject_lora_to_model, save_lora_weights
 from dimba.models.quantization import prepare_for_qlora, quantize_model_4bit
 from dimba.tokenizers import BPETokenizer, SimpleCharacterTokenizer
+from dimba.training.rewards import REWARD_REGISTRY, Reward, get_reward
 
 
 def set_seed(seed: int) -> None:
@@ -435,6 +436,11 @@ def bigram_prec(a: Sequence[int], b: Sequence[int]) -> float:
 
 
 def reward_fn(pred: Sequence[int], chosen: Sequence[int], rejected: Sequence[int], pad: int, eos: Optional[int]) -> float:
+    """DEPRECATED token-overlap reward: ``0.7*F1 + 0.3*bigram`` (rewards copying).
+
+    Retained only for ``--reward token_overlap`` backward compatibility. Prefer a
+    verifiable reward from ``dimba.training.rewards`` (numeric/exact-match).
+    """
     p = strip_special(pred, pad, eos)
     c = strip_special(chosen, pad, eos)
     r = strip_special(rejected, pad, eos)
@@ -443,6 +449,53 @@ def reward_fn(pred: Sequence[int], chosen: Sequence[int], rejected: Sequence[int
     sc = 0.7 * token_f1(p, c) + 0.3 * bigram_prec(p, c)
     sr = 0.7 * token_f1(p, r) + 0.3 * bigram_prec(p, r)
     return sc - sr
+
+
+def decode_ids(tokenizer: Any, ids: Sequence[int], pad: int, eos: Optional[int]) -> str:
+    """Decode token ids to text, dropping pad/eos, for string-based rewards."""
+    clean = strip_special(ids, pad, eos)
+    if hasattr(tokenizer, "decode"):
+        try:
+            return str(tokenizer.decode(clean))
+        except Exception:
+            pass
+    return " ".join(str(t) for t in clean)
+
+
+def score_with_reward(
+    reward: Reward,
+    tokenizer: Any,
+    pred_ids: Sequence[int],
+    chosen_ids: Sequence[int],
+    rejected_ids: Sequence[int],
+    prompt_ids: Sequence[int],
+    pad: int,
+    eos: Optional[int],
+) -> float:
+    """Score one completion via a pluggable :class:`Reward`.
+
+    Decodes the prediction, prompt, and gold (chosen) completion to text and
+    calls ``reward(prompt, completion, reference=chosen)``. The ``chosen``
+    response is used as the verifiable reference; ``rejected`` is unused here
+    because GRPO advantages already come from the group-relative reward spread.
+
+    Args:
+        reward: A :class:`Reward` instance from ``dimba.training.rewards``.
+        tokenizer: Tokenizer with a ``decode`` method (falls back to id strings).
+        pred_ids: Generated completion token ids.
+        chosen_ids: Gold/chosen completion token ids (used as reference).
+        rejected_ids: Rejected completion token ids (unused; kept for parity).
+        prompt_ids: Prompt token ids.
+        pad: Pad token id.
+        eos: EOS token id (or ``None``).
+
+    Returns:
+        Scalar reward for the prediction.
+    """
+    completion = decode_ids(tokenizer, pred_ids, pad, eos)
+    prompt = decode_ids(tokenizer, prompt_ids, pad, eos)
+    reference = decode_ids(tokenizer, chosen_ids, pad, eos)
+    return float(reward(prompt, completion, reference))
 
 
 def top_k_top_p(logits: torch.Tensor, top_k: Optional[int], top_p: Optional[float]) -> torch.Tensor:
@@ -568,6 +621,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-checkpoint", type=str, required=True)
     p.add_argument("--dataset", type=str, required=True)
     p.add_argument("--num-generations", type=int, default=4)
+    p.add_argument(
+        "--reward",
+        type=str,
+        default="numeric",
+        choices=sorted(REWARD_REGISTRY.keys()),
+        help=(
+            "Verifiable reward from dimba.training.rewards (default: 'numeric', "
+            "a GSM8K-style final-answer check). Use 'token_overlap' for the "
+            "deprecated copy-rewarding proxy."
+        ),
+    )
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--learning-rate", type=float, default=1e-5)
@@ -647,6 +711,22 @@ def main() -> None:
 
     pad = int(getattr(tok_obj, "pad_token_id", 0))
     eos = int(getattr(tok_obj, "eos_token_id", pad))
+
+    # Pluggable reward selection. Verifiable rewards (numeric/exact-match) are the
+    # recommended default; the legacy token-overlap proxy is opt-in + deprecated.
+    if args.reward == "token_overlap":
+        import warnings
+
+        warnings.warn(
+            "--reward token_overlap is a deprecated weak proxy that rewards "
+            "copying the reference rather than correctness. Prefer a verifiable "
+            "reward such as 'numeric' or 'exact_match'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    reward_obj: Reward = get_reward(args.reward)
+    print(f"[init] reward={args.reward} ({type(reward_obj).__name__})")
+
     rows = load_rows(args.dataset, args.dataset_split, args.max_samples)
     max_prompt = max(1, int(args.max_seq_len) - int(args.max_new_tokens))
     ds = PrefDataset(rows, tok_obj, max_prompt, int(args.max_new_tokens), eos)
@@ -676,11 +756,24 @@ def main() -> None:
                 seq_len = min(int(args.max_seq_len), int(prompt_ids.shape[1]) + int(args.max_new_tokens))
                 gen = generate_quiet(policy, reps, seq_len, args.sampling_steps, args.temperature, args.top_k, args.top_p, device)
                 eval_ids, comp_mask, comps = build_eval_inputs(prompt_ids, prompt_lens, gen, args.num_generations, args.max_new_tokens, args.max_seq_len, pad)
+                prompt_lens_cpu = prompt_lens.cpu()
+                prompt_ids_cpu = prompt_ids.cpu()
                 rewards = torch.zeros(bsz, args.num_generations, dtype=torch.float32)
                 for bi in range(bsz):
+                    plen = int(prompt_lens_cpu[bi].item())
+                    prompt_tokens = prompt_ids_cpu[bi, :plen].tolist()
                     for gi in range(args.num_generations):
                         idx = bi * args.num_generations + gi
-                        rewards[bi, gi] = reward_fn(comps[idx], chosen[bi], rejected[bi], pad, eos)
+                        rewards[bi, gi] = score_with_reward(
+                            reward_obj,
+                            tok_obj,
+                            comps[idx],
+                            chosen[bi],
+                            rejected[bi],
+                            prompt_tokens,
+                            pad,
+                            eos,
+                        )
                 adv = (rewards - rewards.mean(dim=1, keepdim=True)) / rewards.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-6)
                 adv = adv.reshape(-1).to(device)
 

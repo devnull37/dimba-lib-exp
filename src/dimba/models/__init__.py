@@ -10,6 +10,11 @@ from .embeddings import (
     AdditiveConditioning,
 )
 from .simple_mamba import SimpleMamba2, SimpleMamba2Block
+from .parallel_scan import (
+    selective_scan,
+    selective_scan_sequential,
+    bidirectional_selective_scan,
+)
 from .vae import TokenVAE, TokenVAEWithDeterministicFallback, create_latent_projector
 from .lora import (
     DEFAULT_LORA_TARGET_MODULES,
@@ -33,6 +38,9 @@ __all__ = [
     "AdditiveConditioning",
     "SimpleMamba2",
     "SimpleMamba2Block",
+    "selective_scan",
+    "selective_scan_sequential",
+    "bidirectional_selective_scan",
     "TokenVAE",
     "TokenVAEWithDeterministicFallback",
     "create_latent_projector",

@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -84,20 +85,14 @@ def compute_consistency_loss(
     x_t_early, _ = model.noise_schedule.add_noise(z_0, t_early)
     x_t_late, _ = model.noise_schedule.add_noise(z_0, t_late)
 
-    # Encode prompt
-    cond = model.encode_prompt(input_ids)
-    cond = model.project_conditioning(cond)
+    # Unconditional (null) conditioning -- avoids the prompt leak; CDLM aligns the
+    # model's own clean-latent predictions across noise levels.
+    cond = model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
 
-    # Get timestep embeddings
-    time_emb_early = model.timestep_embed(t_early)
-    time_emb_late = model.timestep_embed(t_late)
-
-    # Predict at t_early (trainable)
-    z_pred_early = model.denoiser(x_t_early, cond, time_emb_early)
-
-    # Predict at t_late (stop-gradient target)
+    # Predict clean latents at both timesteps (the later one is a stop-grad target).
+    z_pred_early = model.denoise_to_x0_latent(x_t_early, t_early, cond)
     with torch.no_grad():
-        z_pred_late = model.denoiser(x_t_late, cond, time_emb_late)
+        z_pred_late = model.denoise_to_x0_latent(x_t_late, t_late, cond)
 
     # Weight by remaining noise level at t_late
     # Positions with more remaining noise get higher weight
@@ -110,6 +105,86 @@ def compute_consistency_loss(
     consistency_loss = (diff ** 2).mean()
 
     return consistency_loss
+
+
+def compute_dimba_losses(
+    model: DIMBA,
+    input_ids: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    ce_loss_weight: float = 1.0,
+    min_snr_gamma: float = 5.0,
+    prompt_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute the DIMBA training loss.
+
+    Combines three signals the original MSE-only objective lacked:
+
+    * **Min-SNR-weighted diffusion regression** in the latent space (Hang et al.,
+      2023): per-timestep weight ``min(SNR, gamma)`` for x0-prediction
+      (``/(SNR+1)`` for v-prediction). Target is ``z_0`` (x0) or the velocity ``v``.
+    * **Cross-entropy / rounding anchor** (Diffusion-LM, Li et al. 2022): trains the
+      output head + decoder and ties the continuous prediction back to real tokens.
+    * **Latent autoencoder consistency** + optional VAE KL when diffusing in a
+      learned latent space.
+
+    When ``prompt_mask`` is given (True = clean prompt context), the diffusion and
+    cross-entropy terms use response positions only.
+
+    Returns:
+        ``(loss, parts)`` where ``parts`` holds detached scalar components.
+    """
+    x_pred, _noise, info = model(input_ids, t, prompt_mask=prompt_mask)
+    diffuse_mask = info.get("diffuse_mask")
+
+    # --- diffusion regression (min-SNR weighted), in latent space ---
+    if model.prediction_type == "v":
+        target = model.noise_schedule.velocity(info["z_0"], info["noise"], t)
+        pred = info["pred_raw"]
+    else:
+        target = info["z_0"]
+        pred = info["z0_hat"]
+    per_pos = ((pred - target) ** 2).mean(dim=-1)  # [B, L]
+    if diffuse_mask is not None:
+        m = diffuse_mask.to(per_pos.dtype)
+        per_sample = (per_pos * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+    else:
+        per_sample = per_pos.mean(dim=1)
+
+    snr = model.noise_schedule.snr(t)
+    weight = torch.clamp(snr, max=min_snr_gamma)
+    if model.prediction_type == "v":
+        weight = weight / (snr + 1.0)
+    weight = weight.clamp(min=1e-3)
+    diff_loss = (per_sample * weight).mean()
+
+    # --- cross-entropy / rounding anchor ---
+    logits = model.output_head(x_pred)
+    B, L, V = logits.shape
+    ce_per = F.cross_entropy(
+        logits.reshape(-1, V), input_ids.reshape(-1), reduction="none"
+    ).view(B, L)
+    if diffuse_mask is not None:
+        m = diffuse_mask.to(ce_per.dtype)
+        ce_loss = ((ce_per * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)).mean()
+    else:
+        ce_loss = ce_per.mean()
+
+    loss = model.recon_loss_weight * diff_loss + ce_loss_weight * ce_loss
+    parts = {"diff_loss": diff_loss.detach(), "ce_loss": ce_loss.detach()}
+
+    # --- latent autoencoder consistency + optional VAE KL ---
+    if model.latent_diffusion:
+        x_0 = model.token_embed(input_ids)
+        ae_loss = F.mse_loss(model.decode_latent(info["z_0"]), x_0)
+        loss = loss + model.latent_loss_weight * ae_loss
+        parts["ae_loss"] = ae_loss.detach()
+    if info.get("vae_kl_loss") is not None:
+        kl = info["vae_kl_loss"] / max(1, info["z_0"].numel())
+        loss = loss + getattr(model, "vae_kl_weight", 1.0) * kl
+        parts["vae_kl"] = kl.detach()
+
+    return loss, parts
 
 
 class DIMBALightningModule(pl.LightningModule):
@@ -153,6 +228,8 @@ class DIMBALightningModule(pl.LightningModule):
         consistency_loss_weight: float = 0.5,
         consistency_delta_min: int = 50,
         consistency_delta_max: int = 200,
+        ce_loss_weight: float = 1.0,
+        min_snr_gamma: float = 5.0,
         progressive_milestones: Optional[List[int]] = None,
         progressive_save_dir: str = "./progressive_checkpoints",
         enable_progressive_checkpoints: bool = False,
@@ -174,6 +251,10 @@ class DIMBALightningModule(pl.LightningModule):
         self.consistency_loss_weight = consistency_loss_weight
         self.consistency_delta_min = consistency_delta_min
         self.consistency_delta_max = consistency_delta_max
+
+        # Loss weights for the cross-entropy anchor and min-SNR weighting.
+        self.ce_loss_weight = ce_loss_weight
+        self.min_snr_gamma = min_snr_gamma
 
         # Progressive checkpointing
         self.progressive_checkpoint_manager = None
@@ -261,24 +342,23 @@ class DIMBALightningModule(pl.LightningModule):
         input_ids = batch["input_ids"]
         batch_size = input_ids.shape[0]
 
-        # Sample random timesteps for main denoising loss
+        # Sample random timesteps for the main denoising loss.
         t = sample_timesteps(batch_size, self.model.num_diffusion_steps, self.device)
 
-        # Forward pass for denoising loss
-        x_pred, noise, latent_info = self.model(input_ids, t)
+        prompt_mask = batch.get("prompt_mask")
+        loss, loss_parts = compute_dimba_losses(
+            self.model,
+            input_ids,
+            t,
+            ce_loss_weight=self.ce_loss_weight,
+            min_snr_gamma=self.min_snr_gamma,
+            prompt_mask=prompt_mask,
+        )
 
-        # Get clean embeddings
-        x_0 = self.model.token_embed(input_ids)
-
-        # Compute denoising loss (predict clean embeddings or latent targets)
-        loss = self.loss_fn(x_pred, x_0) * self.model.recon_loss_weight
-        if self.model.latent_diffusion and latent_info is not None:
-            latent_loss = self.loss_fn(latent_info["z_pred"], latent_info["z_0"])
-            loss = loss + latent_loss * self.model.latent_loss_weight
-
-        # CDLM Consistency loss: align predictions at t with predictions at t-delta
+        # CDLM consistency loss: align the model's clean-latent predictions across timesteps.
         consistency_loss = torch.tensor(0.0, device=self.device)
         if self.use_consistency_training and self.consistency_loss_weight > 0:
+            x_0 = self.model.token_embed(input_ids)
             consistency_loss = compute_consistency_loss(
                 model=self.model,
                 input_ids=input_ids,
@@ -319,6 +399,8 @@ class DIMBALightningModule(pl.LightningModule):
 
         # Logging
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
+        for _name, _val in loss_parts.items():
+            self.log(f"train/{_name}", _val, sync_dist=True)
         self.log("train/learning_rate", self.optimizers().param_groups[0]["lr"], sync_dist=True)
         if self.use_consistency_training:
             self.log("train/consistency_loss", consistency_loss, prog_bar=False, sync_dist=True)
@@ -344,12 +426,15 @@ class DIMBALightningModule(pl.LightningModule):
         # Keep validation on the active training model to avoid moving EMA to GPU.
         model = self.model
 
-        # Forward pass
-        x_pred, _, _ = model(input_ids, t)
-        x_0 = model.token_embed(input_ids)
-
-        # Compute loss
-        loss = self.loss_fn(x_pred, x_0)
+        # Compute the same combined loss as training (response-aware if masked).
+        loss, _ = compute_dimba_losses(
+            model,
+            input_ids,
+            t,
+            ce_loss_weight=self.ce_loss_weight,
+            min_snr_gamma=self.min_snr_gamma,
+            prompt_mask=batch.get("prompt_mask"),
+        )
 
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
 
@@ -360,13 +445,18 @@ class DIMBALightningModule(pl.LightningModule):
         input_ids = batch["input_ids"]
         batch_size = input_ids.shape[0]
 
-        # Use model at various timesteps
+        # Evaluate the combined loss at a few timesteps.
         losses = []
         for t_val in [100, 500, 900]:
             t = torch.full((batch_size,), min(t_val, self.model.num_diffusion_steps - 1), device=self.device)
-            x_pred, _, _ = self.model(input_ids, t)
-            x_0 = self.model.token_embed(input_ids)
-            loss = self.loss_fn(x_pred, x_0)
+            loss, _ = compute_dimba_losses(
+                self.model,
+                input_ids,
+                t,
+                ce_loss_weight=self.ce_loss_weight,
+                min_snr_gamma=self.min_snr_gamma,
+                prompt_mask=batch.get("prompt_mask"),
+            )
             losses.append(loss)
 
         avg_loss = torch.mean(torch.stack(losses))
@@ -399,23 +489,19 @@ def get_model_config(model: DIMBA) -> Dict[str, Any]:
     Returns:
         Dictionary with all model configuration parameters
     """
-    config = {
-        'vocab_size': model.vocab_size,
-        'd_model': model.d_model,
-        'd_prompt': model.d_prompt,
-        'num_diffusion_steps': model.num_diffusion_steps,
-        # Extract from denoiser if available (simplified getattr)
-        'num_denoiser_layers': len(model.denoiser.layers) if hasattr(model, 'denoiser') and hasattr(model.denoiser, 'layers') else 6,
-        'd_state': getattr(getattr(model, 'denoiser', None), 'd_state', 16),
-        'd_conv': getattr(getattr(model, 'denoiser', None), 'd_conv', 4),
-        'expand': getattr(getattr(model, 'denoiser', None), 'expand', 2),
-        # Latent diffusion settings
-        'latent_diffusion': model.latent_diffusion,
-        'd_latent': getattr(model, 'd_latent', None),
-        'latent_loss_weight': getattr(model, 'latent_loss_weight', 1.0),
-        'recon_loss_weight': getattr(model, 'recon_loss_weight', 1.0),
+    if hasattr(model, "config"):
+        return model.config
+    # Best-effort fallback for models that predate the stored config.
+    return {
+        "vocab_size": model.vocab_size,
+        "d_model": model.d_model,
+        "d_prompt": model.d_prompt,
+        "num_diffusion_steps": model.num_diffusion_steps,
+        "latent_diffusion": model.latent_diffusion,
+        "d_latent": getattr(model, "d_latent", None),
+        "latent_loss_weight": getattr(model, "latent_loss_weight", 1.0),
+        "recon_loss_weight": getattr(model, "recon_loss_weight", 1.0),
     }
-    return config
 
 
 class SimpleTrainer:
@@ -455,6 +541,8 @@ class SimpleTrainer:
         consistency_loss_weight: float = 0.5,
         consistency_delta_min: int = 50,
         consistency_delta_max: int = 200,
+        ce_loss_weight: float = 1.0,
+        min_snr_gamma: float = 5.0,
         progressive_milestones: Optional[List[int]] = None,
         progressive_save_dir: str = "./progressive_checkpoints",
         enable_progressive_checkpoints: bool = False,
@@ -473,6 +561,10 @@ class SimpleTrainer:
         self.consistency_loss_weight = consistency_loss_weight
         self.consistency_delta_min = consistency_delta_min
         self.consistency_delta_max = consistency_delta_max
+
+        # Loss weights for the cross-entropy anchor and min-SNR weighting.
+        self.ce_loss_weight = ce_loss_weight
+        self.min_snr_gamma = min_snr_gamma
 
         # Progressive checkpointing
         self.progressive_checkpoint_manager = None
@@ -534,15 +626,20 @@ class SimpleTrainer:
                 batch_size = input_ids.shape[0]
                 t = sample_timesteps(batch_size, self.model.num_diffusion_steps, torch.device(self.device))
 
-                x_pred, _, _ = self.model(input_ids, t)
-                x_0 = self.model.token_embed(input_ids)
-
-                denoise_loss = self.loss_fn(x_pred, x_0)
-                loss = denoise_loss
+                loss, _parts = compute_dimba_losses(
+                    self.model,
+                    input_ids,
+                    t,
+                    ce_loss_weight=self.ce_loss_weight,
+                    min_snr_gamma=self.min_snr_gamma,
+                    prompt_mask=batch.get("prompt_mask"),
+                )
+                denoise_loss = _parts["diff_loss"]
 
                 # CDLM Consistency loss
                 consistency_loss = torch.tensor(0.0, device=self.device)
                 if self.use_consistency_training and self.consistency_loss_weight > 0:
+                    x_0 = self.model.token_embed(input_ids)
                     consistency_loss = compute_consistency_loss(
                         model=self.model,
                         input_ids=input_ids,
@@ -624,10 +721,14 @@ class SimpleTrainer:
                 batch_size = input_ids.shape[0]
                 t = torch.full((batch_size,), self.model.num_diffusion_steps // 2, device=self.device)
 
-                x_pred, _, _ = self.model(input_ids, t)
-                x_0 = self.model.token_embed(input_ids)
-
-                loss = self.loss_fn(x_pred, x_0)
+                loss, _ = compute_dimba_losses(
+                    self.model,
+                    input_ids,
+                    t,
+                    ce_loss_weight=self.ce_loss_weight,
+                    min_snr_gamma=self.min_snr_gamma,
+                    prompt_mask=batch.get("prompt_mask"),
+                )
                 val_loss += loss.item()
 
         return val_loss / len(self.val_dataloader)

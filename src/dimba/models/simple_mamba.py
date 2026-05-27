@@ -1,29 +1,45 @@
-"""Simplified Mamba-2 implementation in pure PyTorch (no compilation needed).
+"""Pure-PyTorch Mamba selective-scan mixer (CPU/MPS fallback).
 
-This is a minimal, CPU-friendly implementation of Mamba-2 state-space model
-that works without requiring CUDA or external compilation.
+A minimal, dependency-free selective state-space mixer in the spirit of Mamba
+(Gu & Dao, 2023). It is a **mixer only**: the enclosing block owns normalization
+and the residual connection (matching the ``mamba_ssm`` API), so this is a drop-in
+replacement for the CUDA kernels.
 
-Based on: "Mamba: Linear-Time Sequence Modeling with Selective State Spaces"
+Correctness fixes vs. the previous implementation:
+
+* The state matrix ``A`` is now negative (``-exp(A_log)``), making the discrete
+  recurrence ``h_t = exp(dt*A) * h_{t-1} + dt * B * x`` contractive/stable. The old
+  code used a positive ``A = +1`` (divergent).
+* Each inner channel keeps its own input (the old code summed over the inner
+  dimension via ``B_x.sum(dim=1)``, collapsing it).
+* No internal LayerNorm / residual (the old code applied both *again* on top of the
+  enclosing block's, double-counting them).
+
+When :mod:`dimba.models.parallel_scan` is available, the sequential Python scan is
+replaced by a vectorized associative scan.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from typing import Optional
+
+try:  # Vectorized scan (built by the performance work package).
+    from .parallel_scan import selective_scan as _parallel_selective_scan
+
+    _HAS_PARALLEL_SCAN = True
+except Exception:  # pragma: no cover - module may not exist yet
+    _HAS_PARALLEL_SCAN = False
 
 
 class SimpleMamba2(nn.Module):
-    """Simplified Mamba-2 state-space model in pure PyTorch.
-
-    A minimal implementation that captures the core SSM dynamics without
-    requiring optimized CUDA kernels. Suitable for CPU and testing.
+    """Selective-scan SSM mixer ``[B, L, d_model] -> [B, L, d_model]``.
 
     Args:
-        d_model: Model dimension
-        d_state: State dimension (default: 16)
-        d_expand: Expansion factor for inner dimension (default: 2)
-        dt_rank: Rank of time step matrix (default: 'd_model // 16')
+        d_model: Model dimension.
+        d_state: SSM state dimension.
+        d_expand: Inner expansion factor.
+        dt_rank: Unused (kept for signature compatibility).
     """
 
     def __init__(
@@ -31,152 +47,80 @@ class SimpleMamba2(nn.Module):
         d_model: int,
         d_state: int = 16,
         d_expand: int = 2,
-        dt_rank: int = None,
+        dt_rank: Optional[int] = None,
     ):
         super().__init__()
-
         self.d_model = d_model
         self.d_state = d_state
         self.d_expand = d_expand
         self.d_inner = int(d_model * d_expand)
 
-        if dt_rank is None:
-            dt_rank = max(1, d_model // 16)
-        self.dt_rank = dt_rank
-
-        # Input projection
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner)
-
-        # SSM parameters
-        # A: state transition (diagonal, so just a vector)
-        self.A = nn.Parameter(torch.ones(1, self.d_inner, d_state))
-
-        # B: input-to-state projection
         self.B_proj = nn.Linear(d_model, d_state)
-
-        # C: state-to-output projection
         self.C_proj = nn.Linear(d_model, d_state)
-
-        # Time step delta
         self.dt_proj = nn.Linear(d_model, self.d_inner)
-
-        # Initialize dt_proj
-        dt_init_std = self.dt_rank ** -0.5
-        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-
-        # Output projection
         self.out_proj = nn.Linear(self.d_inner, d_model)
 
-        # Normalization
-        self.norm = nn.LayerNorm(d_model)
+        # S4D-real initialization: A = -[1..d_state] per inner channel, stored as log.
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through Mamba block.
+        """Mix the (pre-normalized) input. Returns the mixer output (no residual)."""
+        z, x_in = self.in_proj(x).chunk(2, dim=-1)  # [B, L, d_inner] each
+        dt = F.softplus(self.dt_proj(x))  # [B, L, d_inner]
+        b_mat = self.B_proj(x)  # [B, L, d_state]
+        c_mat = self.C_proj(x)  # [B, L, d_state]
+        a = -torch.exp(self.A_log)  # [d_inner, d_state]
 
-        Args:
-            x: Input [batch_size, seq_len, d_model]
+        y = self._scan(dt, a, b_mat, c_mat, x_in)  # [B, L, d_inner]
+        y = y + x_in * self.D  # D skip connection
+        y = y * F.silu(z)  # gating
+        return self.out_proj(y)
 
-        Returns:
-            output: [batch_size, seq_len, d_model]
-        """
-        batch_size, seq_len, d_model = x.shape
+    def _scan(
+        self,
+        dt: torch.Tensor,
+        a: torch.Tensor,
+        b_mat: torch.Tensor,
+        c_mat: torch.Tensor,
+        x_in: torch.Tensor,
+    ) -> torch.Tensor:
+        """Selective scan ``h_t = exp(dt*A) h_{t-1} + dt*B*x``; ``y_t = C_t . h_t``."""
+        if _HAS_PARALLEL_SCAN:
+            try:
+                y = _parallel_selective_scan(dt, a, b_mat, c_mat, x_in)
+                # The closed-form parallel scan can underflow (cumprod -> 0) for a
+                # large state-decay over a long sequence, yielding NaN/Inf. Only use
+                # it when finite; otherwise fall through to the stable sequential
+                # scan below (NaN is not an exception, so it must be checked).
+                if torch.isfinite(y).all():
+                    return y
+            except Exception:  # pragma: no cover - fall back on any incompatibility
+                pass
 
-        # Normalize input
-        x_norm = self.norm(x)
-
-        # Project input
-        z, x_proj = self.in_proj(x_norm).chunk(2, dim=-1)  # [batch, seq, d_inner] each
-
-        # Get time step deltas
-        dt = self.dt_proj(x_norm)  # [batch, seq, d_inner]
-        dt = F.softplus(dt)  # Ensure positive
-
-        # Get B and C projections
-        B = self.B_proj(x_norm)  # [batch, seq, d_state]
-        C = self.C_proj(x_norm)  # [batch, seq, d_state]
-
-        # Initialize state per hidden dimension
-        h = torch.zeros(batch_size, self.d_inner, self.d_state, device=x.device)
-
-        # Simplified SSM: iterate over sequence
+        batch, length, d_inner = x_in.shape
+        d_state = a.shape[-1]
+        h = x_in.new_zeros(batch, d_inner, d_state)
+        d_a = torch.exp(dt.unsqueeze(-1) * a)  # [B, L, d_inner, d_state]
+        d_bx = dt.unsqueeze(-1) * b_mat.unsqueeze(2) * x_in.unsqueeze(-1)  # [B, L, d_inner, d_state]
         outputs = []
-        for t in range(seq_len):
-            # Get current values
-            x_t = x_proj[:, t, :]  # [batch, d_inner]
-            dt_t = dt[:, t, :]  # [batch, d_inner]
-            B_t = B[:, t, :]  # [batch, d_state]
-            C_t = C[:, t, :]  # [batch, d_state]
-
-            # Simplified SSM discretization: h_new = h + dt * (A * h + B * x)
-            # A is [1, d_inner, d_state], replicate for batch
-            A_diag = self.A.expand(batch_size, -1, -1)  # [batch, d_inner, d_state]
-
-            # State transition: apply A to each state
-            # For element-wise: A_h = A .* h (element-wise multiply each channel)
-            A_h = A_diag * h  # [batch, d_inner, d_state]
-
-            # Input contribution: B @ x expanded
-            # B_x = B_t @ x_t per batch element
-            B_x = B_t.unsqueeze(1) * x_t.unsqueeze(2)  # [batch, d_state, d_inner] * [batch, d_inner, 1]
-            B_x = B_x.sum(dim=1, keepdim=True)  # [batch, 1, d_state]
-
-            # Update state: h = h + dt * (A*h + B*x)
-            dt_scale = dt_t.unsqueeze(-1)  # [batch, d_inner, 1]
-            h = h + dt_scale * (A_h + B_x.expand(-1, self.d_inner, -1))  # [batch, d_inner, d_state]
-
-            # Output: y = C @ h (for each batch and d_inner)
-            # C_t is [batch, d_state], h is [batch, d_inner, d_state]
-            # We want y_t [batch, d_inner] = sum_s C_t[s] * h[:, :, s]
-            y_t = torch.einsum('bs,bds->bd', C_t, h)  # [batch, d_inner]
-
-            outputs.append(y_t)
-
-        # Stack outputs
-        y = torch.stack(outputs, dim=1)  # [batch, seq, d_inner]
-
-        # Gating
-        y = y * torch.nn.functional.silu(z)
-
-        # Output projection
-        out = self.out_proj(y)  # [batch, seq, d_model]
-
-        # Residual connection
-        return x + out
+        for t in range(length):
+            h = d_a[:, t] * h + d_bx[:, t]
+            outputs.append(torch.einsum("bds,bs->bd", h, c_mat[:, t]))
+        return torch.stack(outputs, dim=1)  # [B, L, d_inner]
 
 
 class SimpleMamba2Block(nn.Module):
-    """Mamba-2 block with normalization (simpler version).
+    """Pre-norm + :class:`SimpleMamba2` mixer + residual (standalone convenience block)."""
 
-    Args:
-        d_model: Model dimension
-        d_state: State dimension
-        d_expand: Expansion factor
-    """
-
-    def __init__(
-        self,
-        d_model: int = 512,
-        d_state: int = 16,
-        d_expand: int = 2,
-    ):
+    def __init__(self, d_model: int = 512, d_state: int = 16, d_expand: int = 2):
         super().__init__()
-
         self.d_model = d_model
         self.norm = nn.LayerNorm(d_model)
-        self.mamba = SimpleMamba2(
-            d_model=d_model,
-            d_state=d_state,
-            d_expand=d_expand,
-        )
+        self.mamba = SimpleMamba2(d_model=d_model, d_state=d_state, d_expand=d_expand)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with residual connection.
-
-        Args:
-            x: Input [batch_size, seq_len, d_model]
-
-        Returns:
-            output: [batch_size, seq_len, d_model]
-        """
-        # Pre-norm + residual
+        """Pre-norm + mix + residual."""
         return x + self.mamba(self.norm(x))

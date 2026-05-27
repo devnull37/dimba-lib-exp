@@ -254,9 +254,13 @@ class FiLMConditioning(nn.Module):
         self.gamma_proj = nn.Linear(cond_dim, target_dim)
         self.beta_proj = nn.Linear(cond_dim, target_dim)
 
-        # Initialize to identity transformation: γ=1, β=0
-        nn.init.ones_(self.gamma_proj.weight)
-        nn.init.zeros_(self.gamma_proj.bias)
+        # Initialize to the identity transformation: gamma=1, beta=0.
+        # NOTE: gamma must be produced by a *zero* weight and a *one* bias, so
+        # gamma(cond) = 1 for any conditioning at init. The previous code set the
+        # weight to ones (giving gamma = sum(cond), not 1), which is not identity
+        # and destabilizes early training.
+        nn.init.zeros_(self.gamma_proj.weight)
+        nn.init.ones_(self.gamma_proj.bias)
         nn.init.zeros_(self.beta_proj.weight)
         nn.init.zeros_(self.beta_proj.bias)
 

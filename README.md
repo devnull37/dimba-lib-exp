@@ -16,6 +16,24 @@ DIMBA is a research-grade language model that combines the power of diffusion mo
 
 ---
 
+## 🆕 What's New — v2 Overhaul
+
+DIMBA v2 (branch `feature/dimba-v2-overhaul`) is a substantial correctness and research upgrade over the v1 concept paper:
+
+- **Bidirectional Mamba denoiser** — non-autoregressive denoising now sees the whole sequence (forward + backward scans) rather than a causal left-to-right view.
+- **Self-conditioning** — the denoiser is fed its own previous estimate (Analog Bits / SED), a large quality boost for latent diffusion.
+- **Classifier-free guidance** — train with conditioning dropout; steer prompt adherence at sampling time.
+- **Better objective** — min-SNR-weighted diffusion loss + a cross-entropy "rounding" anchor (Diffusion-LM) + latent autoencoder consistency, replacing the old MSE-only loss.
+- **True zero-terminal-SNR schedule** (Lin et al., 2023) — the model now trains on the pure-noise state it starts sampling from.
+- **Correct x0-parameterized DDIM sampler**, with optional v-prediction.
+- **Fixed conditioning** — the prompt is encoded as clean context with response-only loss; the v1 train/inference conditioning leak is gone.
+- **DPO post-training** for preference data, plus pluggable *verifiable* rewards for GRPO.
+- **Discrete / masked diffusion mode** (LLaDA / MDLM-style) alongside continuous latent diffusion.
+
+See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap and [`docs/RESEARCH_DIRECTIONS.md`](docs/RESEARCH_DIRECTIONS.md) for forward-looking ideas.
+
+---
+
 ## 🚀 Key Features
 
 ### ⚡ Pure PyTorch Mamba-2 Implementation
@@ -38,9 +56,9 @@ DIMBA is a research-grade language model that combines the power of diffusion mo
 - One-command training for various GPU tiers (A4000, L40S, etc.)
 
 ### 🔧 Multiple Decoding Strategies
-- **Standard diffusion sampling** — flexible step counts
-- **DDIM sampling** — faster inference with fewer steps
-- **Consistency training** (CDLM) — up to 14× faster inference
+- **x0-parameterized DDIM sampling** — correct reverse update, flexible step counts
+- **Classifier-free guidance** — adjustable prompt adherence at sampling time
+- **Consistency distillation** (experimental) — targets few-step generation (the paper's "ultra-fast" goal; not yet benchmarked)
 - Top-k, top-p, and temperature-based sampling
 
 ---
@@ -261,22 +279,27 @@ python scripts/train_cdlm.py \
 - [x] BPE tokenization
 - [x] EMA (Exponential Moving Average) training
 - [x] Checkpointing and resumption
+- [x] Bidirectional Mamba denoiser
+- [x] Self-conditioning & classifier-free guidance
+- [x] Min-SNR-weighted + cross-entropy (rounding) training objective
+- [x] Zero-terminal-SNR cosine schedule + x0-DDIM sampler
+- [x] DPO post-training + pluggable verifiable rewards for GRPO
 
 ### 🚧 Experimental / In Progress
 
-- [ ] Consistency model training (CDLM)
+- [ ] Discrete / masked diffusion mode (LLaDA / MDLM-style)
+- [ ] Consistency distillation for few-step sampling
+- [ ] MLX backend for Apple Silicon
 - [ ] Multi-modal extensions
-- [ ] Quantization support (INT8, INT4)
+- [ ] Quantization support (INT8, INT4) / Q-LoRA polish
 - [ ] ONNX export
-- [ ] Flash Attention integration
-- [ ] Rotary Position Embeddings (RoPE)
 
 ### ⚠️ Known Limitations
 
 1. **Training cost**: Diffusion models require substantial compute for pre-training
 2. **Discrete-continuous gap**: Mapping between discrete tokens and continuous embeddings affects rare token handling
 3. **Hyperparameter sensitivity**: Performance varies significantly with diffusion steps (T), architecture depth
-4. **Conditioning robustness**: Long-context conditioning requires careful tuning
+4. **Conditioning strength**: the v1 prompt-conditioning leak is fixed (clean-prefix context + response-only loss); global pooled conditioning can still be strengthened with cross-attention (see research directions)
 
 ---
 

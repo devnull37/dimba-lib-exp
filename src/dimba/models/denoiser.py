@@ -1,35 +1,93 @@
-"""Mamba-2 based denoiser for DIMBA."""
+"""Mamba-based denoiser for DIMBA.
 
+Two correctness-relevant changes vs. the original implementation:
+
+1. **Mamba-2 first.** We now prefer the genuine Mamba-2 (SSD) kernel from
+   ``mamba_ssm`` (``Mamba2``), falling back to Mamba-1 (``Mamba``) and then to the
+   pure-PyTorch :class:`~dimba.models.simple_mamba.SimpleMamba2`. The original
+   code imported ``Mamba`` (the Mamba-1 API) while naming everything "Mamba-2".
+
+2. **Bidirectional scans.** Vanilla Mamba is *causal* (position ``t`` only sees
+   ``<= t``). For non-autoregressive diffusion denoising every position should see
+   the entire (noisy) sequence, so each block optionally runs a forward and a
+   backward scan with *separate* SSM parameters and sums them (the Vision-Mamba /
+   Vim recipe, arXiv:2401.09417). This is enabled by default.
+"""
+
+import warnings
 import torch
 import torch.nn as nn
 from typing import Literal, Optional
 
-try:
-    from mamba_ssm import Mamba
+# Resolve the best available Mamba implementation once, at import time.
+_MAMBA_CLS = None
+_MAMBA_KIND = "simple"
+HAS_MAMBA_SSM = False
+try:  # Mamba-2 (SSD) — the intended backbone.
+    from mamba_ssm import Mamba2 as _MAMBA_CLS  # type: ignore
+
     HAS_MAMBA_SSM = True
+    _MAMBA_KIND = "mamba2"
 except ImportError:
-    HAS_MAMBA_SSM = False
+    try:  # Mamba-1 fallback.
+        from mamba_ssm import Mamba as _MAMBA_CLS  # type: ignore
+
+        HAS_MAMBA_SSM = True
+        _MAMBA_KIND = "mamba1"
+    except ImportError:
+        _MAMBA_CLS = None
 
 from .embeddings import FiLMConditioning, AdditiveConditioning
 
+_FALLBACK_WARNED = False
+
+
+def _make_mixer(
+    d_model: int,
+    d_state: int,
+    d_conv: int,
+    expand: int,
+    use_simple_mamba: bool,
+) -> nn.Module:
+    """Construct a single (causal) SSM mixer using the best available backend.
+
+    The returned module maps ``[B, L, d_model] -> [B, L, d_model]`` and contains
+    no normalization or residual connection (the enclosing block owns those).
+    """
+    global _FALLBACK_WARNED
+    if use_simple_mamba or not HAS_MAMBA_SSM:
+        from .simple_mamba import SimpleMamba2
+
+        return SimpleMamba2(d_model=d_model, d_state=d_state, d_expand=expand)
+
+    # mamba_ssm kernels (CUDA). Mamba2 and Mamba take slightly different kwargs;
+    # fall back gracefully rather than crash, and warn once if we can't use them.
+    try:
+        return _MAMBA_CLS(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+    except (TypeError, ValueError, AssertionError, RuntimeError) as exc:  # pragma: no cover - CUDA only
+        if not _FALLBACK_WARNED:
+            warnings.warn(
+                f"Could not construct {_MAMBA_KIND} mixer ({exc}); falling back to "
+                f"pure-PyTorch SimpleMamba2.",
+                RuntimeWarning,
+            )
+            _FALLBACK_WARNED = True
+        from .simple_mamba import SimpleMamba2
+
+        return SimpleMamba2(d_model=d_model, d_state=d_state, d_expand=expand)
+
 
 class Mamba2Block(nn.Module):
-    """Single Mamba-2 block with normalization and conditioning.
-
-    Wraps a Mamba SSM layer with layer normalization and optional conditioning.
+    """Pre-norm Mamba block with an optional bidirectional scan and residual.
 
     Args:
-        d_model: Hidden dimension
-        d_state: State size for SSM
-        d_conv: Convolution kernel size
-        expand: Expansion factor for inner dimension
-        dt_rank: Rank for delta projection
-        dt_min: Minimum delta value
-        dt_max: Maximum delta value
-        dt_init: Delta initialization strategy
-        dt_scale: Delta scale factor
-        bias: Whether to use bias in linear layers
-        conv_bias: Whether to use bias in convolution
+        d_model: Hidden dimension.
+        d_state: SSM state size.
+        d_conv: Short convolution kernel size (Mamba kernels only).
+        expand: Inner expansion factor.
+        bidirectional: If True (default), run a forward + backward scan with
+            separate parameters and sum them.
+        use_simple_mamba: Force the pure-PyTorch fallback mixer.
     """
 
     def __init__(
@@ -38,6 +96,9 @@ class Mamba2Block(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        bidirectional: bool = True,
+        use_simple_mamba: bool = False,
+        # Accepted for backward compatibility; only used by the Mamba-1 kernel.
         dt_rank: str = "auto",
         dt_min: float = 0.001,
         dt_max: float = 0.1,
@@ -45,65 +106,52 @@ class Mamba2Block(nn.Module):
         dt_scale: float = 1.0,
         bias: bool = True,
         conv_bias: bool = True,
-        use_simple_mamba: bool = False,
     ):
         super().__init__()
-
         self.d_model = d_model
+        self.bidirectional = bidirectional
         self.norm = nn.LayerNorm(d_model)
 
-        # Use simple Mamba if requested or if mamba_ssm not available
-        if use_simple_mamba or not HAS_MAMBA_SSM:
-            from .simple_mamba import SimpleMamba2
-            self.mamba = SimpleMamba2(
-                d_model=d_model,
-                d_state=d_state,
-                d_expand=expand,
-            )
-        else:
-            # Use optimized mamba-ssm
-            self.mamba = Mamba(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-                dt_rank=dt_rank,
-                dt_min=dt_min,
-                dt_max=dt_max,
-                dt_init=dt_init,
-                dt_scale=dt_scale,
-                bias=bias,
-                conv_bias=conv_bias,
-            )
+        self.mamba_fwd = _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba)
+        self.mamba_bwd = (
+            _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba)
+            if bidirectional
+            else None
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with residual connection.
+        """Pre-norm + (bi)directional mix + residual.
 
         Args:
-            x: Input tensor [batch_size, seq_len, d_model]
+            x: Input ``[B, L, d_model]``.
 
         Returns:
-            output: [batch_size, seq_len, d_model]
+            Output ``[B, L, d_model]``.
         """
-        # Pre-norm + residual
-        return x + self.mamba(self.norm(x))
+        h = self.norm(x)
+        y = self.mamba_fwd(h)
+        if self.bidirectional and self.mamba_bwd is not None:
+            h_rev = torch.flip(h, dims=[1])
+            y_bwd = self.mamba_bwd(h_rev)
+            y = y + torch.flip(y_bwd, dims=[1])
+        return x + y
 
 
 class Mamba2Denoiser(nn.Module):
-    """Mamba-2 based denoiser for DIMBA diffusion model.
-
-    Stacks multiple Mamba-2 blocks with conditioning support.
+    """Stack of (bidirectional) Mamba blocks with prompt + timestep conditioning.
 
     Args:
-        d_model: Model hidden dimension
-        num_layers: Number of Mamba-2 blocks
-        d_state: SSM state size
-        d_conv: Convolution kernel size
-        expand: Expansion factor for inner dimension
-        conditioning_type: Type of conditioning ('film' or 'additive')
-        cond_dim: Dimension of conditioning vectors
-        time_embed_dim: Dimension of timestep embeddings
-        dropout: Dropout rate
+        d_model: Model hidden dimension (the diffusion latent dim).
+        num_layers: Number of blocks.
+        d_state: SSM state size.
+        d_conv: Conv kernel size.
+        expand: Inner expansion factor.
+        conditioning_type: 'film' or 'additive'.
+        cond_dim: Dimension of the conditioning vectors.
+        time_embed_dim: Dimension of the incoming timestep embedding.
+        dropout: Dropout rate between blocks.
+        bidirectional: Enable bidirectional scans (default True).
+        use_simple_mamba: Force the pure-PyTorch fallback mixer.
     """
 
     def __init__(
@@ -117,44 +165,42 @@ class Mamba2Denoiser(nn.Module):
         cond_dim: int = 512,
         time_embed_dim: int = 512,
         dropout: float = 0.1,
+        bidirectional: bool = True,
         use_simple_mamba: bool = False,
     ):
         super().__init__()
-
         self.d_model = d_model
         self.num_layers = num_layers
         self.conditioning_type = conditioning_type
+        self.bidirectional = bidirectional
 
-        # Mamba blocks
-        self.blocks = nn.ModuleList([
-            Mamba2Block(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-                use_simple_mamba=use_simple_mamba,
-            )
-            for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                Mamba2Block(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    bidirectional=bidirectional,
+                    use_simple_mamba=use_simple_mamba,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
-        # Conditioning layers for each block
         if conditioning_type == "film":
-            self.conditioning = nn.ModuleList([
-                FiLMConditioning(cond_dim, d_model)
-                for _ in range(num_layers)
-            ])
+            self.conditioning = nn.ModuleList(
+                [FiLMConditioning(cond_dim, d_model) for _ in range(num_layers)]
+            )
         elif conditioning_type == "additive":
-            self.conditioning = nn.ModuleList([
-                AdditiveConditioning(cond_dim, d_model)
-                for _ in range(num_layers)
-            ])
+            self.conditioning = nn.ModuleList(
+                [AdditiveConditioning(cond_dim, d_model) for _ in range(num_layers)]
+            )
         else:
             raise ValueError(f"Unknown conditioning type: {conditioning_type}")
 
-        # Timestep embedding projection to conditioning dimension
+        # Project the timestep embedding into the conditioning dimension.
         self.time_proj = nn.Linear(time_embed_dim, cond_dim)
-
-        # Optional dropout
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
 
     def forward(
@@ -163,49 +209,38 @@ class Mamba2Denoiser(nn.Module):
         cond: torch.Tensor,
         timestep_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass through denoiser.
+        """Denoise ``x`` conditioned on ``cond`` (prompt) and ``timestep_emb``.
 
         Args:
-            x: Noisy embeddings [batch_size, seq_len, d_model]
-            cond: Conditioning vectors from prompt [batch_size, seq_len, cond_dim]
-            timestep_emb: Timestep embeddings [batch_size, time_embed_dim]
+            x: Noisy latents ``[B, L, d_model]``.
+            cond: Conditioning ``[B, L, cond_dim]`` (broadcast over L is fine).
+            timestep_emb: Timestep embedding ``[B, time_embed_dim]``.
 
         Returns:
-            output: Denoised embeddings [batch_size, seq_len, d_model]
+            Denoised latents ``[B, L, d_model]``.
         """
-        # Project timestep embedding to conditioning dimension
-        # Expand to match sequence length
-        time_cond = self.time_proj(timestep_emb)  # [batch_size, cond_dim]
-        time_cond = time_cond.unsqueeze(1)  # [batch_size, 1, cond_dim]
-        time_cond = time_cond.expand(-1, cond.size(1), -1)  # [batch_size, seq_len, cond_dim]
+        # Broadcast the timestep embedding across the sequence and add to cond.
+        time_cond = self.time_proj(timestep_emb).unsqueeze(1)  # [B, 1, cond_dim]
+        time_cond = time_cond.expand(-1, cond.size(1), -1)
+        combined_cond = cond + time_cond
 
-        # Combine temporal and prompt conditioning
-        combined_cond = cond + time_cond  # [batch_size, seq_len, cond_dim]
-
-        # Pass through Mamba blocks with conditioning
         output = x
         for block, cond_layer in zip(self.blocks, self.conditioning):
-            # Apply conditioning
             conditioned = cond_layer(output, combined_cond)
-
-            # Pass through Mamba block
             output = block(conditioned)
-
-            # Optional dropout
             if self.dropout is not None:
                 output = self.dropout(output)
-
         return output
 
 
 class DenoisingHead(nn.Module):
-    """Output head for converting denoised embeddings back to token logits.
+    """Project denoised embeddings to token logits, with optional weight tying.
 
     Args:
-        d_model: Model hidden dimension
-        vocab_size: Vocabulary size
-        use_weight_tying: Whether to tie weights with embedding matrix
-        embedding_weight: Embedding weight for weight tying (optional)
+        d_model: Model hidden dimension.
+        vocab_size: Vocabulary size.
+        use_weight_tying: Tie the projection with the embedding matrix.
+        embedding_weight: Embedding weight for tying (optional).
     """
 
     def __init__(
@@ -216,37 +251,22 @@ class DenoisingHead(nn.Module):
         embedding_weight: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.use_weight_tying = use_weight_tying
 
         if use_weight_tying and embedding_weight is not None:
-            # Weight tying: share with embedding matrix
             self.projection = nn.Identity()
             self.register_buffer("embedding_weight", embedding_weight, persistent=False)
         else:
-            # Independent projection layer
             self.projection = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x: torch.Tensor, embedding_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Project denoised embeddings to token logits.
-
-        Args:
-            x: Denoised embeddings [batch_size, seq_len, d_model]
-            embedding_weight: Optional embedding weight for weight tying
-
-        Returns:
-            logits: Token logits [batch_size, seq_len, vocab_size]
-        """
+    def forward(
+        self, x: torch.Tensor, embedding_weight: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Project denoised embeddings ``[B, L, d_model]`` to logits ``[B, L, vocab]``."""
         if self.use_weight_tying:
-            # Use tied embedding weight
             if embedding_weight is None:
                 embedding_weight = self.embedding_weight
-            # x @ W^T where W is embedding matrix transposed
-            logits = torch.matmul(x, embedding_weight.t())
-        else:
-            # Use independent projection
-            logits = self.projection(x)
-
-        return logits
+            return torch.matmul(x, embedding_weight.t())
+        return self.projection(x)
