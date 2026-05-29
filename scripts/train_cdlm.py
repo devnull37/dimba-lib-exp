@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath(src_dir))
 
 from dimba import DIMBA
 from dimba.data import HuggingFaceDataset, DummyDataset, collate_fn
-from dimba.tokenizers import BPETokenizer, SimpleTokenizer
+from dimba.tokenizers import BPETokenizer, SimpleCharacterTokenizer
 from dimba.training import DIMBALightningModule
 
 
@@ -45,7 +45,7 @@ def create_tokenizer(config: dict):
     if tokenizer_config['type'] == 'bpe':
         return BPETokenizer(vocab_size=tokenizer_config.get('vocab_size', 10000))
     else:
-        return SimpleTokenizer(vocab_size=tokenizer_config.get('vocab_size', 256))
+        return SimpleCharacterTokenizer(vocab_size=tokenizer_config.get('vocab_size', 256))
 
 
 def create_datasets(config: dict, tokenizer):
@@ -72,14 +72,14 @@ def create_datasets(config: dict, tokenizer):
     else:
         # Dummy dataset for testing
         train_dataset = DummyDataset(
-            num_examples=data_config.get('num_examples', 1000),
-            max_length=data_config.get('max_length', 256),
+            size=data_config.get('num_examples', 1000),
             vocab_size=tokenizer.vocab_size,
+            seq_length=data_config.get('max_length', 256),
         )
         val_dataset = DummyDataset(
-            num_examples=data_config.get('num_examples', 100) // 10,
-            max_length=data_config.get('max_length', 256),
+            size=data_config.get('num_examples', 100) // 10,
             vocab_size=tokenizer.vocab_size,
+            seq_length=data_config.get('max_length', 256),
         )
     
     return train_dataset, val_dataset

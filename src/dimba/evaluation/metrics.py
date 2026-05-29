@@ -195,33 +195,33 @@ class MetricsLogger:
 def evaluate_generation(
     predictions: List[str],
     references: List[str],
-    compute_bleu: bool = True,
-    compute_rouge: bool = True,
-    compute_meteor: bool = False,
+    with_bleu: bool = True,
+    with_rouge: bool = True,
+    with_meteor: bool = False,
 ) -> Dict[str, float]:
     """Compute multiple evaluation metrics for generated text.
 
     Args:
         predictions: List of generated sequences
         references: List of reference sequences
-        compute_bleu: Whether to compute BLEU
-        compute_rouge: Whether to compute ROUGE
-        compute_meteor: Whether to compute METEOR
+        with_bleu: Whether to compute BLEU
+        with_rouge: Whether to compute ROUGE
+        with_meteor: Whether to compute METEOR
 
     Returns:
         Dictionary of all computed metrics
     """
     results = {}
 
-    if compute_bleu:
+    if with_bleu:
         bleu_score = compute_bleu(predictions, [[ref] for ref in references])
         results["bleu"] = bleu_score
 
-    if compute_rouge:
+    if with_rouge:
         rouge_scores = compute_rouge(predictions, references)
         results.update(rouge_scores)
 
-    if compute_meteor:
+    if with_meteor:
         meteor_avg = compute_meteor(predictions, references)
         results["meteor"] = meteor_avg
 
