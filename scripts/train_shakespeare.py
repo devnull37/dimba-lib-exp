@@ -47,18 +47,21 @@ def load_chunks(path: str, seq_len: int = 256, min_len: int = 64) -> list[str]:
     return [c for c in chunks if len(c) >= min_len]
 
 
-def generate_sample(model, tokenizer, prompt: str, max_len: int = 128) -> str:
-    """Generate a text sample from the trained model."""
+def generate_sample(model, tokenizer, max_len: int = 256, device: str = "cpu") -> str:
+    """Unconditionally sample text from the (unconditionally pretrained) model.
+
+    We pretrain without prompts, so we sample from the null conditioning
+    (``prompt_ids=None``). The model is moved to ``device`` first because the
+    mamba_ssm CUDA kernels require GPU tensors and Lightning can leave the model
+    on CPU after DDP teardown.
+    """
     from dimba.diffusion.sampling import sample_from_model
 
-    model.eval()
-    dev = next(model.parameters()).device
-    prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=dev)
-
+    model = model.to(device).eval()
     with torch.no_grad():
         generated = sample_from_model(
-            model, prompt_ids=prompt_ids, seq_len=max_len,
-            num_steps=50, temperature=0.8, top_p=0.95,
+            model, prompt_ids=None, seq_len=max_len,
+            num_steps=50, temperature=0.8, top_p=0.95, device=device,
         )
     return tokenizer.decode(generated[0])
 
@@ -92,6 +95,10 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--log-dir", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true", help="Quick dry run (1 epoch, 2 batches)")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers per process")
+    parser.add_argument("--patience", type=int, default=10, help="EarlyStopping patience (epochs)")
+    parser.add_argument("--warmup-steps", type=int, default=200, help="LR warmup steps")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm (0 disables)")
     args = parser.parse_args()
 
     text_path = args.text_path or str(_repo_path("data/shakespeare.txt"))
@@ -136,13 +143,19 @@ def main():
     tokenizer = SimpleCharacterTokenizer(vocab_size=128)
 
     split = int(len(texts) * 0.9)
+    nw = args.num_workers
+    loader_kw = dict(
+        batch_size=args.batch_size, collate_fn=collate_fn,
+        num_workers=nw, pin_memory=(args.accelerator == "gpu"),
+        persistent_workers=(nw > 0),
+    )
     train_loader = DataLoader(
         TextDataset(texts[:split], tokenizer, max_length=args.seq_len),
-        batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn,
+        shuffle=True, **loader_kw,
     )
     val_loader = DataLoader(
         TextDataset(texts[split:], tokenizer, max_length=args.seq_len),
-        batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn,
+        shuffle=False, **loader_kw,
     )
 
     # ── 2. Model ──
@@ -151,7 +164,7 @@ def main():
         vocab_size=tokenizer.vocab_size,
         model_config=model_cfg,
         learning_rate=args.lr,
-        warmup_steps=100,
+        warmup_steps=args.warmup_steps,
         ema_decay=0.9999,
         use_ema=False,
         ce_loss_weight=1.0,
@@ -189,10 +202,11 @@ def main():
         devices=args.devices,
         strategy=args.strategy,
         precision=args.precision,
+        gradient_clip_val=(args.grad_clip or None),
         callbacks=[
             ModelCheckpoint(dirpath=ckpt_dir, filename="shakespeare1",
                             monitor="val/loss", mode="min", save_top_k=1),
-            EarlyStopping(monitor="val/loss", patience=3, mode="min"),
+            EarlyStopping(monitor="val/loss", patience=args.patience, mode="min"),
         ],
         logger=TensorBoardLogger(log_dir, name="shakespeare"),
         log_every_n_steps=10,
@@ -214,16 +228,19 @@ def main():
     if best:
         print(f"  ✓ best model  → {best}")
 
-    # ── 5. Sample ──
-    print("\n── Sample generation")
-    sys.stdout.flush()
-    try:
-        sample = generate_sample(module.model, tokenizer, prompt="Juliet:", max_len=args.seq_len // 2)
-        print(f'  prompt    : "Juliet:"')
-        print(f"  generated : {sample[:200]}")
-    except Exception as e:
-        print(f"  (skipped: {e})")
-    sys.stdout.flush()
+    # ── 5. Sample (rank 0 only; unconditional, matching how we pretrain) ──
+    if trainer.is_global_zero:
+        print("\n── Sample generation (unconditional)")
+        sys.stdout.flush()
+        sample_device = "cuda" if args.accelerator == "gpu" else (
+            "mps" if args.accelerator == "mps" else "cpu")
+        for k in range(2):
+            try:
+                sample = generate_sample(module.model, tokenizer, max_len=args.seq_len, device=sample_device)
+                print(f"  [sample {k + 1}]\n{sample[:400]}\n")
+            except Exception as e:
+                print(f"  (skipped: {e})")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

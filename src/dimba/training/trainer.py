@@ -317,11 +317,19 @@ class DIMBALightningModule(pl.LightningModule):
             betas=(0.9, 0.999),
         )
 
-        # Warmup scheduler
+        # Linear warmup -> cosine decay to zero over the whole run.
+        # NOTE: the previous schedule divided by ``self.trainer.max_steps``, which
+        # is -1 when training by ``max_epochs`` — that broke the decay entirely.
+        # ``estimated_stepping_batches`` is the correct total (accounts for epochs,
+        # devices, and gradient accumulation).
+        total_steps = max(2, int(self.trainer.estimated_stepping_batches))
+        warmup = max(1, min(self.warmup_steps, total_steps - 1))
+
         def lr_lambda(step):
-            if step < self.warmup_steps:
-                return float(step) / float(max(1, self.warmup_steps))
-            return max(0.0, float(self.trainer.max_steps - step) / float(max(1, self.trainer.max_steps - self.warmup_steps)))
+            if step < warmup:
+                return float(step) / float(warmup)
+            progress = float(step - warmup) / float(max(1, total_steps - warmup))
+            return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 

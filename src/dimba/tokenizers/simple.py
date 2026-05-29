@@ -37,6 +37,16 @@ class SimpleCharacterTokenizer(BaseTokenizer):
             self.id_to_char[next_id] = char
             next_id += 1
 
+        # Whitespace structure characters. The printable-ASCII range above omits
+        # these, but newline is essential for verse / line breaks (without it,
+        # newlines map to <unk> and the model can never learn or emit line
+        # structure — critical for Shakespeare).
+        for char in ("\n", "\t"):
+            if char not in self.char_to_id and next_id < vocab_size:
+                self.char_to_id[char] = next_id
+                self.id_to_char[next_id] = char
+                next_id += 1
+
     def encode(self, text: Union[str, List[str]]) -> Union[List[int], List[List[int]]]:
         """Encode text to token IDs.
 
