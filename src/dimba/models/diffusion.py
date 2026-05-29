@@ -70,6 +70,7 @@ class DIMBA(nn.Module):
         use_weight_tying: bool = False,
         padding_idx: Optional[int] = None,
         use_simple_mamba: bool = False,
+        use_gradient_checkpointing: bool = False,
         latent_diffusion: bool = False,
         d_latent: Optional[int] = None,
         latent_projector_depth: int = 2,
@@ -206,6 +207,7 @@ class DIMBA(nn.Module):
             dropout=dropout,
             bidirectional=bidirectional,
             use_simple_mamba=use_simple_mamba,
+            use_gradient_checkpointing=use_gradient_checkpointing,
         )
 
         # Output head
@@ -237,6 +239,7 @@ class DIMBA(nn.Module):
             use_weight_tying=use_weight_tying,
             padding_idx=padding_idx,
             use_simple_mamba=use_simple_mamba,
+            use_gradient_checkpointing=use_gradient_checkpointing,
             latent_diffusion=latent_diffusion,
             d_latent=self.d_latent,
             latent_projector_depth=latent_projector_depth,

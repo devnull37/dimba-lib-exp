@@ -80,7 +80,14 @@ def main():
     parser.add_argument("--d-model", type=int, default=128, help="Hidden dimension")
     parser.add_argument("--num-layers", type=int, default=2, help="Denoiser layers")
     parser.add_argument("--num-steps", type=int, default=64, help="Diffusion timesteps")
+    parser.add_argument("--d-state", type=int, default=16, help="SSM state size (use 64 for the mamba-ssm kernel)")
+    parser.add_argument("--use-mamba-ssm", action="store_true",
+                        help="Use the precompiled mamba_ssm CUDA kernels (fast, low memory) instead of the pure-PyTorch scan")
+    parser.add_argument("--grad-checkpoint", action="store_true",
+                        help="Gradient-checkpoint denoiser blocks (much lower memory, ~25%% slower)")
     parser.add_argument("--accelerator", type=str, default="mps", choices=["mps", "cpu", "gpu"])
+    parser.add_argument("--devices", type=int, default=1, help="Number of GPUs")
+    parser.add_argument("--strategy", type=str, default="auto", help="auto, ddp, ddp_spawn")
     parser.add_argument("--precision", type=str, default="32-true", help="32-true (MPS) or 16-mixed (CUDA)")
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--log-dir", type=str, default=None)
@@ -92,25 +99,30 @@ def main():
     log_dir = args.log_dir or str(_repo_path("logs"))
 
     # ── Config ──
+    # The mamba_ssm CUDA kernels only run on GPU; anywhere else use the
+    # pure-PyTorch scan regardless of the flag.
+    use_simple_mamba = not (args.use_mamba_ssm and args.accelerator == "gpu")
     model_cfg = {
         "d_model": args.d_model,
         "d_prompt": args.d_model // 2,
         "num_diffusion_steps": args.num_steps,
         "num_denoiser_layers": args.num_layers,
-        "d_state": 16,
+        "d_state": args.d_state,
         "d_conv": 4,
         "expand": 2,
         "conditioning_type": "film",
         "dropout": 0.1,
         "use_weight_tying": True,
-        "use_simple_mamba": True,
+        "use_simple_mamba": use_simple_mamba,
+        "use_gradient_checkpointing": args.grad_checkpoint,
         "latent_diffusion": True,
         "d_latent": args.d_model // 2,
         "embed_init_std": 0.02,
     }
 
+    accel = args.accelerator.upper() if args.accelerator != "gpu" else f"CUDA ({torch.cuda.get_device_name(0)})"
     print("=" * 54)
-    print("  DIMBA → Shakespeare  |  Apple Silicon MPS")
+    print(f"  DIMBA → Shakespeare  |  {accel}")
     print("=" * 54)
     print(f"  data   : {text_path}")
     print(f"  config : d_model={args.d_model}  layers={args.num_layers}  T={args.num_steps}")
@@ -148,6 +160,20 @@ def main():
     n = sum(p.numel() for p in module.parameters())
     print(f"   {n:,} params  ({n * 4 / 1024**2:.1f} MB fp32)")
 
+    # Verify the requested kernel is actually active. The denoiser silently
+    # falls back to the pure-PyTorch scan if mamba_ssm is missing or rejects the
+    # dims — that path is slow and OOM-prone, so fail loudly rather than waste a
+    # GPU session discovering it the hard way.
+    mixer = type(module.model.denoiser.blocks[0].mamba_fwd).__name__
+    print(f"   ssm kernel : {mixer}")
+    if args.use_mamba_ssm and args.accelerator == "gpu" and mixer == "SimpleMamba2":
+        raise RuntimeError(
+            "Requested --use-mamba-ssm but the model fell back to SimpleMamba2 "
+            "(pure-PyTorch scan). Install the kernels with:\n"
+            "    pip install --no-build-isolation causal-conv1d mamba-ssm\n"
+            "and make sure the dims are kernel-compatible (try --d-state 64)."
+        )
+
     # Calibrate latent scale (required for latent_diffusion)
     print("   calibrating latent scale ...")
     calib_batch = next(iter(train_loader))
@@ -160,7 +186,8 @@ def main():
     trainer = pl.Trainer(
         max_epochs=1 if args.dry_run else args.epochs,
         accelerator=args.accelerator,
-        devices=1,
+        devices=args.devices,
+        strategy=args.strategy,
         precision=args.precision,
         callbacks=[
             ModelCheckpoint(dirpath=ckpt_dir, filename="shakespeare1",

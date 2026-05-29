@@ -17,6 +17,7 @@ Two correctness-relevant changes vs. the original implementation:
 import warnings
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as _checkpoint
 from typing import Literal, Optional
 
 # Resolve the best available Mamba implementation once, at import time.
@@ -152,6 +153,11 @@ class Mamba2Denoiser(nn.Module):
         dropout: Dropout rate between blocks.
         bidirectional: Enable bidirectional scans (default True).
         use_simple_mamba: Force the pure-PyTorch fallback mixer.
+        use_gradient_checkpointing: Recompute each block in the backward pass
+            instead of storing its activations. Trades ~25% extra compute for a
+            large drop in peak memory (the SSM scan materializes a
+            ``[B, L, d_inner, d_state]`` tensor per layer). Only active in
+            training mode; ignored during eval/sampling.
     """
 
     def __init__(
@@ -167,12 +173,14 @@ class Mamba2Denoiser(nn.Module):
         dropout: float = 0.1,
         bidirectional: bool = True,
         use_simple_mamba: bool = False,
+        use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
         self.conditioning_type = conditioning_type
         self.bidirectional = bidirectional
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         self.blocks = nn.ModuleList(
             [
@@ -226,11 +234,28 @@ class Mamba2Denoiser(nn.Module):
 
         output = x
         for block, cond_layer in zip(self.blocks, self.conditioning):
-            conditioned = cond_layer(output, combined_cond)
-            output = block(conditioned)
-            if self.dropout is not None:
-                output = self.dropout(output)
+            if self.use_gradient_checkpointing and self.training:
+                # use_reentrant=False is the DDP-safe variant and correctly
+                # restores RNG state for the dropout inside _block_forward.
+                output = _checkpoint(
+                    self._block_forward,
+                    block,
+                    cond_layer,
+                    output,
+                    combined_cond,
+                    use_reentrant=False,
+                )
+            else:
+                output = self._block_forward(block, cond_layer, output, combined_cond)
         return output
+
+    def _block_forward(self, block, cond_layer, x, combined_cond):
+        """Condition + mix + dropout for a single denoiser block."""
+        conditioned = cond_layer(x, combined_cond)
+        out = block(conditioned)
+        if self.dropout is not None:
+            out = self.dropout(out)
+        return out
 
 
 class DenoisingHead(nn.Module):
