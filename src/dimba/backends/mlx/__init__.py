@@ -20,10 +20,21 @@ from .denoiser import (
     torch_state_dict_to_mlx,
 )
 
+# Correct Mamba-2 (SSD) MLX mixer — weight-compatible with mamba_ssm.Mamba2, runs on the
+# Apple GPU (the .denoiser classes above are the older Mamba-1/SimpleMamba2-style skeleton).
+from .mamba2 import (
+    MLXMamba2Mixer,
+    scan_chunked_mlx,
+    load_torch_mamba2_state_dict,
+)
+
 __all__ = [
     "HAS_MLX",
     "MLXMamba2Block",
     "MLXMamba2Denoiser",
     "mlx_selective_scan_sequential",
     "torch_state_dict_to_mlx",
+    "MLXMamba2Mixer",
+    "scan_chunked_mlx",
+    "load_torch_mamba2_state_dict",
 ]
