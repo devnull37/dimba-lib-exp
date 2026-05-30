@@ -28,6 +28,9 @@ from .mamba2 import (
     load_torch_mamba2_state_dict,
 )
 
+# Full DIMBA inference on the Apple GPU (the whole sampling loop, not just the mixer).
+from .model import MLXDIMBA
+
 __all__ = [
     "HAS_MLX",
     "MLXMamba2Block",
@@ -37,4 +40,5 @@ __all__ = [
     "MLXMamba2Mixer",
     "scan_chunked_mlx",
     "load_torch_mamba2_state_dict",
+    "MLXDIMBA",
 ]
