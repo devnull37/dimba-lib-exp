@@ -243,7 +243,19 @@ class TokenVAEWithDeterministicFallback(nn.Module):
         Returns:
             z: Latent embeddings [batch_size, seq_len, latent_dim]
         """
-        return self.vae.sample_latent(x, sample=self.use_vae_sampling)
+        if self.use_vae_sampling:
+            return self.vae.sample_latent(x, sample=True)
+
+        # Deterministic fallback: encode must be identical across calls for the
+        # same input. Force the VAE into eval mode so encoder dropout is
+        # disabled, then restore the previous mode to avoid side effects.
+        was_training = self.vae.training
+        self.vae.eval()
+        try:
+            z = self.vae.sample_latent(x, sample=False)
+        finally:
+            self.vae.train(was_training)
+        return z
 
     def decode(self, z: torch.Tensor):
         """Decode from latent space.

@@ -45,13 +45,19 @@ class TestDIMBALightningModule:
 
         output = module(input_ids, t)
 
+        # DIMBA.forward returns (x_pred, noise, latent_info).
         assert isinstance(output, tuple)
-        assert len(output) == 2
+        assert len(output) == 3
+        x_pred, noise, latent_info = output
+        assert x_pred.shape == input_ids.shape + (module.model.d_model,)
+        assert noise is not None
+        assert isinstance(latent_info, dict)
 
     def test_configure_optimizers(self, module):
-        # Need to set trainer.max_steps for LambdaLR scheduler
+        # Need to set trainer.estimated_stepping_batches for the LambdaLR scheduler,
+        # which computes the warmup/cosine-decay horizon from the total step count.
         class DummyTrainer:
-            max_steps = 10000
+            estimated_stepping_batches = 10000
 
         module.trainer = DummyTrainer()
         config = module.configure_optimizers()

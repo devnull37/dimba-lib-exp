@@ -156,13 +156,24 @@ def test_single_denoise_finite(model: DIMBA) -> None:
     _skip_if_nonfinite(z0_hat)
 
 
-def test_loss_decreases_two_steps() -> None:
-    """Loss decreases over two optimizer steps on a tiny fixed batch.
+def test_loss_decreases_over_optimizer_steps() -> None:
+    """Loss decreases over a few optimizer steps on a tiny fixed batch.
 
-    This mirrors the denoising objective used by the trainer
-    (``MSE(model(input_ids, t), token_embed(input_ids))``) but holds the noise
-    and timesteps fixed and detaches the target so the objective is well-defined
-    across the two steps. It checks optimization wiring, not training quality.
+    This regresses on the *same* latent-space x0 objective the trainer uses
+    (``MSE(z0_hat, z_0)`` from ``latent_info``; cf. ``compute_dimba_losses``),
+    with fixed noise/timesteps and the target ``z_0`` detached so the objective
+    is well-defined across steps. It checks optimization wiring -- that grads
+    reach the denoiser and a standard optimizer makes the denoising loss go down
+    -- not training quality.
+
+    Note: we deliberately *do not* regress ``x_pred`` against
+    ``token_embed(input_ids)``. ``x_pred`` is the decoded clean latent, which in
+    the (default, non-latent) embedding path is the denoiser output divided by
+    ``latent_scale`` (~50x). That collapses both prediction and target to
+    near-embedding scale (std ~0.02), so the MSE is dominated by the scale factor,
+    starts within ~4% of "predict all zeros", and is not the quantity the model
+    is trained to minimize -- a vacuous and brittle check. The latent objective
+    below has ~unit scale and real gradient signal.
     """
     model = _build_tiny_model(seed=42)
     model.train()
@@ -174,16 +185,13 @@ def test_loss_decreases_two_steps() -> None:
     noise = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL)
 
     loss_fn = nn.MSELoss()
-    # Use a comparatively large LR so two steps make a visible difference.
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
-
-    # Freeze the target once (clean embeddings of the inputs) so the objective is
-    # fixed across both steps -- this makes "loss decreases" unambiguous.
-    target = model.token_embed(input_ids).detach().clone()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     def compute_loss() -> torch.Tensor:
-        x_pred, _ = _forward(model, input_ids, t, noise=noise)
-        return loss_fn(x_pred, target)
+        # The 3-tuple's latent_info carries the predicted clean latent (z0_hat)
+        # and the clean latent target (z_0); regress one against the (frozen) other.
+        _, _, info = model(input_ids, t, noise=noise)
+        return loss_fn(info["z0_hat"], info["z_0"].detach())
 
     initial = compute_loss()
     # If the model can't produce a finite loss (upstream NaN during refactor),
@@ -191,7 +199,9 @@ def test_loss_decreases_two_steps() -> None:
     _skip_if_nonfinite(initial)
     initial_loss = initial.item()
 
-    for _ in range(2):
+    # A few steps so a standard LR makes a clear, robust difference without
+    # overshooting; the latent objective has ~unit scale so this is well-behaved.
+    for _ in range(5):
         optimizer.zero_grad()
         loss = compute_loss()
         loss.backward()
@@ -201,8 +211,10 @@ def test_loss_decreases_two_steps() -> None:
     _skip_if_nonfinite(final)
     final_loss = final.item()
 
-    assert final_loss < initial_loss, (
-        f"expected loss to decrease over 2 steps, "
+    # Require a clear relative decrease (not just any decrease) so the check is a
+    # meaningful test of optimization wiring rather than numerical noise.
+    assert final_loss < 0.99 * initial_loss, (
+        f"expected loss to decrease over optimizer steps, "
         f"got initial={initial_loss:.6f} final={final_loss:.6f}"
     )
 

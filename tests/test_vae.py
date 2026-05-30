@@ -100,10 +100,11 @@ class TestTokenVAE:
 
     def test_sample_latent_deterministic(self, vae):
         """Test sample_latent with sample=False returns mu."""
+        vae.eval()  # disable encoder dropout so encode() is deterministic at inference
         x = torch.randn(4, 16, 64)
         z = vae.sample_latent(x, sample=False)
         mu, _ = vae.encode(x)
-        
+
         assert torch.allclose(z, mu)
 
     def test_sample_latent_stochastic(self, vae):
