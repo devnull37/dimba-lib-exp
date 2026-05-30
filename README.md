@@ -46,9 +46,17 @@ See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap 
 - Trainable latent spaces with KL-regularization (β-VAE)
 - Improves diffusion efficiency and model capacity
 
-### 🍎 Native Apple Silicon (MPS) Support
-- First-class Metal Performance Shaders support
-- Optimized for M1/M2/M3 Macs without CUDA
+### 🍎 Native Apple Silicon Support — CPU, MPS, **and MLX (Apple GPU)**
+- **Runs CUDA-trained checkpoints on a Mac with no CUDA.** A pure-PyTorch Mamba-2 (SSD) mixer
+  (`TorchMamba2`) is weight-compatible with the `mamba_ssm` CUDA kernel, so checkpoints load
+  `strict=True` and run on CPU/MPS unchanged.
+- **Whole sampler on the Apple GPU via MLX** (`MLXDIMBA`) — token-identical to PyTorch and
+  **~17× faster than torch-MPS, ~44× faster than CPU** (256 tokens, 64 steps: 1.5 s vs 25.5 s).
+  ```bash
+  pip install mlx
+  python scripts/sample_mlx.py --num-samples 3 --temperature 0.8
+  ```
+- See **[`docs/BACKENDS.md`](docs/BACKENDS.md)** for the full benchmark table and details.
 
 ### 🎮 Interactive Training Scripts
 - `train_interactive.py` — guided wizard for easy configuration

@@ -127,10 +127,12 @@ class TestDIMBA:
         input_ids = torch.randint(0, 1000, (4, 32))
         t = torch.randint(0, 100, (4,))
 
-        x_pred, noise = model(input_ids, t)
+        # DIMBA.forward returns (x_pred, noise, latent_info).
+        x_pred, noise, latent_info = model(input_ids, t)
 
         assert x_pred.shape == (4, 32, 64)
         assert noise.shape == (4, 32, 64)
+        assert isinstance(latent_info, dict)
 
     def test_prompt_encoding(self, model):
         """Test prompt encoding."""

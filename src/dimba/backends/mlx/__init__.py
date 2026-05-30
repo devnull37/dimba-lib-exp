@@ -1,42 +1,31 @@
-"""Experimental MLX backend for DIMBA (Apple Silicon).
+"""MLX backend for DIMBA — Apple-Silicon GPU (Metal).
 
-This subpackage contains an MLX port skeleton of the Mamba-2 denoiser block and
-a helper to convert PyTorch state dicts into MLX arrays. It is *experimental*
-and intended for Apple-Silicon (M-series) machines where MLX can use the
-unified-memory GPU.
+Runs DIMBA on the Apple GPU via MLX, in two layers:
 
-The module imports cleanly even when ``mlx`` is not installed: in that case the
-exported classes are stubs that raise a clear ``RuntimeError`` on instantiation.
-Check :data:`HAS_MLX` to know whether a usable MLX runtime is present.
+* :class:`MLXMamba2Mixer` — the Mamba-2 (SSD) mixer, **weight-compatible** with
+  ``mamba_ssm.Mamba2`` / :class:`dimba.models.torch_mamba2.TorchMamba2`.
+* :class:`MLXDIMBA` — the **full** DIMBA diffusion sampler (token embedding, latent
+  projector, FiLM conditioning, bidirectional Mamba-2 blocks, timestep embedding,
+  schedule, x0-DDIM) on the GPU. ``MLXDIMBA.from_torch(model)`` copies weights from a
+  PyTorch ``DIMBA`` and produces token-identical output ~17x faster than torch-MPS.
+
+The module imports cleanly even when ``mlx`` is not installed: the exported classes are
+stubs that raise a clear ``RuntimeError`` on use. Check :data:`HAS_MLX` for a usable
+runtime. See ``docs/BACKENDS.md`` for benchmarks and usage.
 """
 
 from __future__ import annotations
 
-from .denoiser import (
-    HAS_MLX,
-    MLXMamba2Block,
-    MLXMamba2Denoiser,
-    mlx_selective_scan_sequential,
-    torch_state_dict_to_mlx,
-)
-
-# Correct Mamba-2 (SSD) MLX mixer — weight-compatible with mamba_ssm.Mamba2, runs on the
-# Apple GPU (the .denoiser classes above are the older Mamba-1/SimpleMamba2-style skeleton).
 from .mamba2 import (
+    HAS_MLX,
     MLXMamba2Mixer,
     scan_chunked_mlx,
     load_torch_mamba2_state_dict,
 )
-
-# Full DIMBA inference on the Apple GPU (the whole sampling loop, not just the mixer).
 from .model import MLXDIMBA
 
 __all__ = [
     "HAS_MLX",
-    "MLXMamba2Block",
-    "MLXMamba2Denoiser",
-    "mlx_selective_scan_sequential",
-    "torch_state_dict_to_mlx",
     "MLXMamba2Mixer",
     "scan_chunked_mlx",
     "load_torch_mamba2_state_dict",
