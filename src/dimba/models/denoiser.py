@@ -56,10 +56,18 @@ def _make_mixer(
     no normalization or residual connection (the enclosing block owns those).
     """
     global _FALLBACK_WARNED
-    if use_simple_mamba or not HAS_MAMBA_SSM:
+    if use_simple_mamba:
         from .simple_mamba import SimpleMamba2
 
         return SimpleMamba2(d_model=d_model, d_state=d_state, d_expand=expand)
+
+    if not HAS_MAMBA_SSM:
+        # No CUDA mamba_ssm: use the pure-PyTorch SSD mixer that is weight-compatible
+        # with mamba_ssm.Mamba2, so a checkpoint trained with the CUDA kernel loads
+        # and runs as-is on CPU/MPS (Apple Silicon, etc.).
+        from .torch_mamba2 import TorchMamba2
+
+        return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
 
     # mamba_ssm kernels (CUDA). Mamba2 and Mamba take slightly different kwargs;
     # fall back gracefully rather than crash, and warn once if we can't use them.
@@ -69,13 +77,13 @@ def _make_mixer(
         if not _FALLBACK_WARNED:
             warnings.warn(
                 f"Could not construct {_MAMBA_KIND} mixer ({exc}); falling back to "
-                f"pure-PyTorch SimpleMamba2.",
+                f"pure-PyTorch TorchMamba2.",
                 RuntimeWarning,
             )
             _FALLBACK_WARNED = True
-        from .simple_mamba import SimpleMamba2
+        from .torch_mamba2 import TorchMamba2
 
-        return SimpleMamba2(d_model=d_model, d_state=d_state, d_expand=expand)
+        return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
 
 
 class Mamba2Block(nn.Module):

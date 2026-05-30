@@ -10,6 +10,7 @@ from .embeddings import (
     AdditiveConditioning,
 )
 from .simple_mamba import SimpleMamba2, SimpleMamba2Block
+from .torch_mamba2 import TorchMamba2, RMSNormGated
 from .parallel_scan import (
     selective_scan,
     selective_scan_sequential,
@@ -38,6 +39,8 @@ __all__ = [
     "AdditiveConditioning",
     "SimpleMamba2",
     "SimpleMamba2Block",
+    "TorchMamba2",
+    "RMSNormGated",
     "selective_scan",
     "selective_scan_sequential",
     "bidirectional_selective_scan",
