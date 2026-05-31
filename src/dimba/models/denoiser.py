@@ -14,6 +14,7 @@ Two correctness-relevant changes vs. the original implementation:
    Vim recipe, arXiv:2401.09417). This is enabled by default.
 """
 
+import math
 import warnings
 import torch
 import torch.nn as nn
@@ -38,7 +39,7 @@ except ImportError:
     except ImportError:
         _MAMBA_CLS = None
 
-from .embeddings import FiLMConditioning, AdditiveConditioning
+from .embeddings import FiLMConditioning, AdditiveConditioning, AdaLNZeroConditioning
 
 _FALLBACK_WARNED = False
 
@@ -107,6 +108,7 @@ class Mamba2Block(nn.Module):
         expand: int = 2,
         bidirectional: bool = True,
         use_simple_mamba: bool = False,
+        bidir_merge: str = "sum",
         # Accepted for backward compatibility; only used by the Mamba-1 kernel.
         dt_rank: str = "auto",
         dt_min: float = 0.001,
@@ -119,6 +121,7 @@ class Mamba2Block(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.bidirectional = bidirectional
+        self.bidir_merge = bidir_merge
         self.norm = nn.LayerNorm(d_model)
 
         self.mamba_fwd = _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba)
@@ -127,23 +130,43 @@ class Mamba2Block(nn.Module):
             if bidirectional
             else None
         )
+        # Optional learned merge of the two scan directions (default "sum" preserves
+        # the original behavior). Init to [I | I] so concat starts == sum, then
+        # specializes -- gives the two directions independent routing capacity.
+        self.merge = None
+        if bidirectional and bidir_merge == "concat":
+            self.merge = nn.Linear(2 * d_model, d_model, bias=False)
+            with torch.no_grad():
+                self.merge.weight.copy_(
+                    torch.cat([torch.eye(d_model), torch.eye(d_model)], dim=1)
+                )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Pre-norm + (bi)directional mix + residual.
-
-        Args:
-            x: Input ``[B, L, d_model]``.
-
-        Returns:
-            Output ``[B, L, d_model]``.
-        """
-        h = self.norm(x)
+    def _mix(self, h: torch.Tensor) -> torch.Tensor:
+        """(Bi)directional SSM mix of an already-normalized input (no residual)."""
         y = self.mamba_fwd(h)
         if self.bidirectional and self.mamba_bwd is not None:
-            h_rev = torch.flip(h, dims=[1])
-            y_bwd = self.mamba_bwd(h_rev)
-            y = y + torch.flip(y_bwd, dims=[1])
-        return x + y
+            y_bwd = torch.flip(self.mamba_bwd(torch.flip(h, dims=[1])), dims=[1])
+            if self.merge is not None:
+                y = self.merge(torch.cat([y, y_bwd], dim=-1))
+            else:
+                y = y + y_bwd
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pre-norm + (bi)directional mix + residual (FiLM / additive path)."""
+        return x + self._mix(self.norm(x))
+
+    def forward_adaln(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        """AdaLN-Zero variant: norm -> (1+scale)*h+shift -> mix -> x + gate*y."""
+        h = self.norm(x)
+        h = h * (1 + scale) + shift
+        return x + gate * self._mix(h)
 
 
 class Mamba2Denoiser(nn.Module):
@@ -175,13 +198,14 @@ class Mamba2Denoiser(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-        conditioning_type: Literal["film", "additive"] = "film",
+        conditioning_type: Literal["film", "additive", "adaln"] = "film",
         cond_dim: int = 512,
         time_embed_dim: int = 512,
         dropout: float = 0.1,
         bidirectional: bool = True,
         use_simple_mamba: bool = False,
         use_gradient_checkpointing: bool = False,
+        bidir_merge: str = "sum",
     ):
         super().__init__()
         self.d_model = d_model
@@ -199,6 +223,7 @@ class Mamba2Denoiser(nn.Module):
                     expand=expand,
                     bidirectional=bidirectional,
                     use_simple_mamba=use_simple_mamba,
+                    bidir_merge=bidir_merge,
                 )
                 for _ in range(num_layers)
             ]
@@ -211,6 +236,10 @@ class Mamba2Denoiser(nn.Module):
         elif conditioning_type == "additive":
             self.conditioning = nn.ModuleList(
                 [AdditiveConditioning(cond_dim, d_model) for _ in range(num_layers)]
+            )
+        elif conditioning_type == "adaln":
+            self.conditioning = nn.ModuleList(
+                [AdaLNZeroConditioning(cond_dim, d_model) for _ in range(num_layers)]
             )
         else:
             raise ValueError(f"Unknown conditioning type: {conditioning_type}")
@@ -259,8 +288,11 @@ class Mamba2Denoiser(nn.Module):
 
     def _block_forward(self, block, cond_layer, x, combined_cond):
         """Condition + mix + dropout for a single denoiser block."""
-        conditioned = cond_layer(x, combined_cond)
-        out = block(conditioned)
+        if self.conditioning_type == "adaln":
+            scale, shift, gate = cond_layer(combined_cond)
+            out = block.forward_adaln(x, scale, shift, gate)
+        else:
+            out = block(cond_layer(x, combined_cond))
         if self.dropout is not None:
             out = self.dropout(out)
         return out
@@ -282,11 +314,23 @@ class DenoisingHead(nn.Module):
         vocab_size: int,
         use_weight_tying: bool = False,
         embedding_weight: Optional[torch.Tensor] = None,
+        use_norm: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.use_weight_tying = use_weight_tying
+
+        # Optional pre-head LayerNorm + learnable logit scale. A bare weight-tied head
+        # is a dot product with embeddings of std ~0.02, which produces near-uniform
+        # logits (poor token discrimination -> garbled word formation in generation).
+        # Normalizing the input and learning a temperature restores the logit dynamic
+        # range. Off by default to preserve existing-checkpoint behavior.
+        self.use_norm = use_norm
+        if use_norm:
+            self.norm = nn.LayerNorm(d_model)
+            # exp(init) == sqrt(d_model): a sensible starting temperature for a tied head.
+            self.logit_scale = nn.Parameter(torch.tensor(0.5 * math.log(d_model)))
 
         if use_weight_tying and embedding_weight is not None:
             self.projection = nn.Identity()
@@ -298,8 +342,14 @@ class DenoisingHead(nn.Module):
         self, x: torch.Tensor, embedding_weight: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Project denoised embeddings ``[B, L, d_model]`` to logits ``[B, L, vocab]``."""
+        if self.use_norm:
+            x = self.norm(x)
         if self.use_weight_tying:
             if embedding_weight is None:
                 embedding_weight = self.embedding_weight
-            return torch.matmul(x, embedding_weight.t())
-        return self.projection(x)
+            logits = torch.matmul(x, embedding_weight.t())
+        else:
+            logits = self.projection(x)
+        if self.use_norm:
+            logits = logits * self.logit_scale.exp()
+        return logits

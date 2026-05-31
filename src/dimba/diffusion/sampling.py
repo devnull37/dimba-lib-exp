@@ -44,6 +44,11 @@ def _ddim_step(
         acp_prev: alpha_cumprod at the next (cleaner) timestep (scalar tensor).
         eta: DDIM stochasticity (0 = deterministic).
     """
+    # Final step (acp_t ~ 1): x_t is already ~clean and eps is undefined
+    # (sqrt(1-acp)->0). Returning x0_hat avoids a (x_t-x0)/~0 division that can
+    # overflow to Inf in fp16 and then poison the result via 0*Inf = NaN.
+    if float(acp_t) >= 1.0 - 1e-6:
+        return x0_hat
     sqrt_acp_t = _coef(acp_t.sqrt(), x_t)
     sqrt_om_t = _coef((1.0 - acp_t).clamp(min=1e-8).sqrt(), x_t)
     eps_hat = (x_t - sqrt_acp_t * x0_hat) / sqrt_om_t
@@ -211,6 +216,10 @@ def top_k_top_p_filtering(
         sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
         cumsum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
         sorted_indices_to_remove = cumsum_probs > top_p
+        # Keep the token that *crosses* top_p (standard nucleus sampling, Holtzman
+        # et al. 2019): shift the removal mask right by one so the crossing token
+        # stays in the nucleus. Without this the nucleus is one token too small.
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
         indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
         indices_to_remove.scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)

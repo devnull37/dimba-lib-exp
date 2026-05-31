@@ -21,6 +21,16 @@ from dimba.backends.mlx.model import MLXDIMBA
 from dimba.tokenizers.simple import SimpleCharacterTokenizer
 import mlx.core as mx
 
+
+def _load_tokenizer_auto(path):
+    import json
+    with open(path) as f: data = json.load(f)
+    if isinstance(data, dict) and "char_to_id" in data:
+        from dimba.tokenizers.simple import SimpleCharacterTokenizer
+        tok = SimpleCharacterTokenizer(); tok.load(path); return tok
+    from dimba.tokenizers.bpe import BPETokenizer
+    tok = BPETokenizer(); tok.load(path); return tok
+
 TOKEN = os.environ.get("HF_TOKEN")
 SEQ_LEN, NUM_STEPS = 256, 64
 
@@ -58,6 +68,11 @@ def torch_sample_logits(m, noise, num_steps, device):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tokenizer", default=None, help="Path to tokenizer.json (char or BPE); auto-detected by file content.")
+    args, _ = ap.parse_known_args()
+
     print("loading dimbapeare1-30m (reconstruct + strict load) ...")
     m = load_torch_model()
     n_params = sum(p.numel() for p in m.parameters())
@@ -92,7 +107,10 @@ def main():
     print(f"   MLX-GPU    {t_mlx:6.2f} s   ({t_cpu/t_mlx:.1f}x vs CPU, {t_mps/t_mlx:.1f}x vs MPS)")
 
     # ---- show an MLX-generated Shakespeare sample (decoded with the real tokenizer) ----
-    tok = SimpleCharacterTokenizer(vocab_size=m.vocab_size)
+    if args.tokenizer:
+        tok = _load_tokenizer_auto(args.tokenizer)
+    else:
+        tok = SimpleCharacterTokenizer(vocab_size=m.vocab_size)
     ids = mlx_model.sample(SEQ_LEN, NUM_STEPS, temperature=0.8, seed=1)[0]
     print("\n[MLX-GPU sample, temp=0.8]:\n" + "-" * 60 + f"\n{tok.decode(ids.tolist())}\n" + "-" * 60)
 

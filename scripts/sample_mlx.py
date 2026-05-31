@@ -22,6 +22,16 @@ from dimba.backends.mlx.model import MLXDIMBA
 from dimba.tokenizers.simple import SimpleCharacterTokenizer
 
 
+def _load_tokenizer_auto(path):
+    import json
+    with open(path) as f: data = json.load(f)
+    if isinstance(data, dict) and "char_to_id" in data:
+        from dimba.tokenizers.simple import SimpleCharacterTokenizer
+        tok = SimpleCharacterTokenizer(); tok.load(path); return tok
+    from dimba.tokenizers.bpe import BPETokenizer
+    tok = BPETokenizer(); tok.load(path); return tok
+
+
 def load_checkpoint(args):
     if args.ckpt and os.path.exists(args.ckpt):
         path = args.ckpt
@@ -50,12 +60,16 @@ def main():
     ap.add_argument("--num-samples", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prompt", default=None, help="Optional conditioning prompt (chars).")
+    ap.add_argument("--tokenizer", default=None, help="Path to tokenizer.json (char or BPE); auto-detected by file content.")
     args = ap.parse_args()
 
     print(f"Loading {args.ckpt or args.repo + '/' + args.file} ...")
     m = load_checkpoint(args)
     mlx_model = MLXDIMBA.from_torch(m)
-    tok = SimpleCharacterTokenizer(vocab_size=m.vocab_size)
+    if args.tokenizer:
+        tok = _load_tokenizer_auto(args.tokenizer)
+    else:
+        tok = SimpleCharacterTokenizer(vocab_size=m.vocab_size)
 
     prompt_ids = None
     if args.prompt:

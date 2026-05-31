@@ -83,6 +83,9 @@ class DIMBA(nn.Module):
         self_conditioning: bool = False,
         prediction_type: str = "x0",
         zero_terminal_snr: bool = True,
+        use_head_norm: bool = False,
+        latent_norm: bool = False,
+        bidir_merge: str = "sum",
         embed_init_std: float = 0.02,
         latent_scale: Optional[float] = None,
     ):
@@ -103,6 +106,7 @@ class DIMBA(nn.Module):
         self.bidirectional = bidirectional
         self.self_conditioning = self_conditioning
         self.prediction_type = prediction_type
+        self.use_head_norm = use_head_norm
         self.vae_kl_weight = vae_kl_weight
 
         if self.latent_diffusion:
@@ -120,7 +124,11 @@ class DIMBA(nn.Module):
         # a representative batch before training. (cf. Stable Diffusion's 0.18215.)
         if latent_scale is None:
             latent_scale = (1.0 / embed_init_std) if not self.latent_diffusion else 1.0
-        self.latent_scale = float(latent_scale)
+        # Persisted as a buffer so a *calibrated* scale survives checkpoint reload. In
+        # latent/VAE mode this value is data-dependent; it was previously a plain float
+        # that silently reset to 1.0 on load -> a train/inference mismatch that broke
+        # the decode path (denoiser emits unit-scale latents, decoder expects ~0.018).
+        self.register_buffer("_latent_scale", torch.tensor(float(latent_scale)))
         self.embed_init_std = float(embed_init_std)
 
         # Token embeddings
@@ -168,6 +176,7 @@ class DIMBA(nn.Module):
                     hidden_dim=max(d_model, self.d_latent),
                     num_layers=latent_projector_depth,
                     dropout=dropout,
+                    latent_norm=latent_norm,
                 )
 
             if d_prompt != self.d_latent:
@@ -208,6 +217,7 @@ class DIMBA(nn.Module):
             bidirectional=bidirectional,
             use_simple_mamba=use_simple_mamba,
             use_gradient_checkpointing=use_gradient_checkpointing,
+            bidir_merge=bidir_merge,
         )
 
         # Output head
@@ -217,10 +227,12 @@ class DIMBA(nn.Module):
                 vocab_size=vocab_size,
                 use_weight_tying=True,
                 embedding_weight=self.token_embed.get_weight(),
+                use_norm=use_head_norm,
             )
         else:
             self.output_head = DenoisingHead(
-                d_model=d_model, vocab_size=vocab_size, use_weight_tying=False
+                d_model=d_model, vocab_size=vocab_size, use_weight_tying=False,
+                use_norm=use_head_norm,
             )
 
         # Full constructor config, stored for faithful replicas (EMA / reload).
@@ -251,6 +263,9 @@ class DIMBA(nn.Module):
             self_conditioning=self_conditioning,
             prediction_type=prediction_type,
             zero_terminal_snr=zero_terminal_snr,
+            use_head_norm=use_head_norm,
+            latent_norm=latent_norm,
+            bidir_merge=bidir_merge,
             embed_init_std=embed_init_std,
             latent_scale=self.latent_scale,
         )
@@ -259,6 +274,15 @@ class DIMBA(nn.Module):
     def config(self) -> dict:
         """Return a copy of the constructor configuration (for building replicas)."""
         return dict(self._config)
+
+    @property
+    def latent_scale(self) -> float:
+        """Scalar applied to the encoded signal; persisted via the ``_latent_scale`` buffer."""
+        return float(self._latent_scale)
+
+    @latent_scale.setter
+    def latent_scale(self, value: float) -> None:
+        self._latent_scale.fill_(float(value))
 
     def _init_self_cond_proj(self) -> None:
         """Initialize the self-conditioning fusion to ignore the (zero) prior estimate.
@@ -522,7 +546,8 @@ class DIMBA(nn.Module):
         cond = self._build_conditioning(None, batch_size, input_ids.device)
         t_idx = self._to_timestep_index(t, batch_size, input_ids.device)
         raw = self._denoiser_raw(z, t_idx, cond, None)
-        x_dec = self.decode_latent(raw)
+        z0_hat = self._to_x0_latent(z, raw, t_idx)  # convert v->x0 when prediction_type='v'
+        x_dec = self.decode_latent(z0_hat)
         return self.output_head(x_dec, embedding_weight=self.token_embed.get_weight())
 
     def get_noise_schedule(self) -> CosineNoiseSchedule:

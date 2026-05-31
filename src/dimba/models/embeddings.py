@@ -127,12 +127,17 @@ class LatentProjector(nn.Module):
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
         dropout: float = 0.1,
+        latent_norm: bool = False,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim or max(input_dim, latent_dim)
         self.num_layers = num_layers
+        # Normalize the encoder output so the diffused signal is ~unit variance and
+        # the noise schedule's SNR is meaningful regardless of init/data. The decoder
+        # learns to invert it (the AE-consistency loss trains the round-trip).
+        self.latent_norm = nn.LayerNorm(latent_dim) if latent_norm else None
 
         self.encoder = self._build_mlp(
             input_dim=input_dim,
@@ -176,7 +181,10 @@ class LatentProjector(nn.Module):
         Returns:
             latent: [batch_size, seq_len, latent_dim]
         """
-        return self.encoder(x)
+        z = self.encoder(x)
+        if self.latent_norm is not None:
+            z = self.latent_norm(z)
+        return z
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latent representations back to embedding space.
@@ -284,6 +292,44 @@ class FiLMConditioning(nn.Module):
         beta = self.beta_proj(cond)    # [batch_size, seq_len, target_dim]
 
         return gamma * x + beta
+
+
+class AdaLNZeroConditioning(nn.Module):
+    """DiT-style adaptive LayerNorm-Zero modulation (Peebles & Xie, 2023).
+
+    From a conditioning vector (pooled prompt + timestep) produces per-block
+    ``(scale, shift, gate)``. The output projection is **zero-initialized** so at
+    init ``scale=shift=gate=0`` and the consuming block is an exact identity
+    (``out = x + 0 * mixer(...)``) -- the denoiser starts as a no-op and learns to
+    use conditioning gradually, which trains far more stably than FiLM for deep
+    diffusion backbones.
+
+    The consuming block applies::
+
+        h = norm(x); h = h * (1 + scale) + shift
+        y = mixer(h); out = x + gate * y
+
+    Args:
+        cond_dim: Dimension of the conditioning vector.
+        target_dim: Dimension of the features being modulated.
+    """
+
+    def __init__(self, cond_dim: int, target_dim: int):
+        super().__init__()
+        self.cond_dim = cond_dim
+        self.target_dim = target_dim
+        # SiLU(cond) -> Linear, matching DiT's adaLN_modulation. Zero-init the linear.
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 3 * target_dim))
+        nn.init.zeros_(self.modulation[1].weight)
+        nn.init.zeros_(self.modulation[1].bias)
+
+    def forward(self, cond: torch.Tensor):
+        """Return ``(scale, shift, gate)`` from conditioning ``[B, L, cond_dim]``.
+
+        Each output is ``[B, L, target_dim]`` (broadcasts over L when cond is ``[B, 1, .]``).
+        """
+        scale, shift, gate = self.modulation(cond).chunk(3, dim=-1)
+        return scale, shift, gate
 
 
 class AdditiveConditioning(nn.Module):

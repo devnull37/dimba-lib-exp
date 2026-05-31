@@ -12,7 +12,7 @@ import os
 
 from ..models.diffusion import DIMBA
 from ..models.vae import TokenVAE
-from ..diffusion.sampling import sample_timesteps
+from ..diffusion.sampling import sample_timesteps, sample_from_model
 from ..utils.checkpointing import ProgressiveCheckpointManager
 
 
@@ -134,7 +134,22 @@ def compute_dimba_losses(
     Returns:
         ``(loss, parts)`` where ``parts`` holds detached scalar components.
     """
-    x_pred, _noise, info = model(input_ids, t, prompt_mask=prompt_mask)
+    # Self-conditioning (Chen et al., 2022): with prob 0.5, feed the model its own
+    # *detached* x0 estimate from a no-grad pre-pass. Both passes MUST share the same
+    # noise (hence the same x_t) for the estimate to be consistent. No-op when
+    # self_conditioning is off -> existing behavior is unchanged.
+    if getattr(model, "self_conditioning", False) and bool(torch.rand(()) < 0.5):
+        shared_noise = torch.randn(
+            input_ids.shape[0], input_ids.shape[1], model.d_latent, device=input_ids.device
+        )
+        with torch.no_grad():
+            _, _, info_sc = model(input_ids, t, noise=shared_noise, prompt_mask=prompt_mask)
+        x_self_cond = info_sc["z0_hat"].detach()
+        x_pred, _noise, info = model(
+            input_ids, t, noise=shared_noise, prompt_mask=prompt_mask, x_self_cond=x_self_cond
+        )
+    else:
+        x_pred, _noise, info = model(input_ids, t, prompt_mask=prompt_mask)
     diffuse_mask = info.get("diffuse_mask")
 
     # --- diffusion regression (min-SNR weighted), in latent space ---
@@ -185,6 +200,56 @@ def compute_dimba_losses(
         parts["vae_kl"] = kl.detach()
 
     return loss, parts
+
+
+class GenerationSampleCallback(pl.Callback):
+    """Periodically generate + decode text during training so generation quality is
+    actually visible. (The prior model's failure went unnoticed because validation
+    only measured a single mid-noise reconstruction loss.)
+
+    Args:
+        tokenizer: object with ``.encode(str)`` / ``.decode(ids)``.
+        prompt: optional prompt string (None -> unconditional generation).
+        seq_len: number of response tokens to generate.
+        num_steps: diffusion steps (None -> model default).
+        every_n_epochs: run every N validation epochs.
+        num_samples: how many samples to print.
+        temperature: sampling temperature.
+    """
+
+    def __init__(self, tokenizer, prompt=None, seq_len=128, num_steps=None,
+                 every_n_epochs=1, num_samples=2, temperature=0.8):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.prompt = prompt
+        self.seq_len = seq_len
+        self.num_steps = num_steps
+        self.every_n_epochs = max(1, int(every_n_epochs))
+        self.num_samples = num_samples
+        self.temperature = temperature
+
+    @torch.no_grad()
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.every_n_epochs != 0:
+            return
+        model = pl_module.model
+        was_training = model.training
+        model.eval()
+        try:
+            prompt_ids = None
+            if self.prompt is not None:
+                ids = self.tokenizer.encode(self.prompt)
+                prompt_ids = torch.tensor([ids], dtype=torch.long, device=pl_module.device)
+            print(f"\n[gen @ epoch {trainer.current_epoch + 1}]")
+            for i in range(self.num_samples):
+                out = sample_from_model(
+                    model, prompt_ids, self.seq_len, num_steps=self.num_steps,
+                    temperature=self.temperature, device=pl_module.device,
+                )
+                print(f"  sample {i + 1}: {self.tokenizer.decode(out[0])!r}")
+        finally:
+            if was_training:
+                model.train()
 
 
 class DIMBALightningModule(pl.LightningModule):
@@ -428,8 +493,10 @@ class DIMBALightningModule(pl.LightningModule):
         input_ids = batch["input_ids"]
         batch_size = input_ids.shape[0]
 
-        # Use middle timesteps for validation
-        t = torch.full((batch_size,), self.model.num_diffusion_steps // 2, device=self.device)
+        # Sample timesteps across the whole schedule. A fixed midpoint (the previous
+        # behavior) only probes easy mid-noise denoising and hides high-noise /
+        # generative failure -- exactly the regime where this model was found to break.
+        t = sample_timesteps(batch_size, self.model.num_diffusion_steps, self.device)
 
         # Keep validation on the active training model to avoid moving EMA to GPU.
         model = self.model
@@ -479,10 +546,10 @@ class DIMBALightningModule(pl.LightningModule):
         return self.model
 
     def on_train_end(self):
-        """Called at end of training."""
+        """Copy EMA weights into the main model so the final saved weights are the EMA."""
         if self.use_ema:
-            # Optionally copy EMA weights back to main model
-            pass
+            for param, ema_param in zip(self.model.parameters(), self.ema_model.parameters()):
+                param.data.copy_(ema_param.detach().to(param.device, param.dtype))
 
 
 def get_model_config(model: DIMBA) -> Dict[str, Any]:

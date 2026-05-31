@@ -29,6 +29,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from dimba.training import DIMBALightningModule
+from dimba.training.trainer import GenerationSampleCallback
 from dimba.tokenizers import SimpleCharacterTokenizer
 from dimba.data import TextDataset, collate_fn
 
@@ -99,6 +100,10 @@ def main():
     parser.add_argument("--patience", type=int, default=10, help="EarlyStopping patience (epochs)")
     parser.add_argument("--warmup-steps", type=int, default=200, help="LR warmup steps")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm (0 disables)")
+    parser.add_argument("--tokenizer", choices=["char", "bpe"], default="char",
+                        help="Tokenizer type: char (character-level) or bpe (subword BPE)")
+    parser.add_argument("--bpe-vocab-size", type=int, default=4096,
+                        help="BPE vocabulary size (only used when --tokenizer bpe)")
     args = parser.parse_args()
 
     text_path = args.text_path or str(_repo_path("data/shakespeare.txt"))
@@ -117,7 +122,9 @@ def main():
         "d_state": args.d_state,
         "d_conv": 4,
         "expand": 2,
-        "conditioning_type": "film",
+        "conditioning_type": "adaln",
+        "latent_norm": True,
+        "self_conditioning": True,
         "dropout": 0.1,
         "use_weight_tying": True,
         "use_simple_mamba": use_simple_mamba,
@@ -125,6 +132,14 @@ def main():
         "latent_diffusion": True,
         "d_latent": args.d_model // 2,
         "embed_init_std": 0.02,
+        # Generation-quality fixes for new runs (see the repo audit):
+        #  - v-prediction balances the loss across noise levels; x0-prediction +
+        #    min-SNR structurally under-trains the high-noise (generative) regime,
+        #    which made the prior 30M a strong denoiser but a weak generator.
+        #  - head LayerNorm + learnable logit-scale fixes near-uniform tied-head
+        #    logits (the tiny-embedding rounding bottleneck behind garbled words).
+        "prediction_type": "v",
+        "use_head_norm": True,
     }
 
     accel = args.accelerator.upper() if args.accelerator != "gpu" else f"CUDA ({torch.cuda.get_device_name(0)})"
@@ -137,10 +152,24 @@ def main():
 
     # ── 1. Data ──
     print("\n── Loading data")
-    texts = load_chunks(text_path, args.seq_len)
-    print(f"   {len(texts)} chunks of {args.seq_len} chars")
+    chunk_chars = args.seq_len * 4 if args.tokenizer == "bpe" else args.seq_len
+    texts = load_chunks(text_path, chunk_chars)
+    print(f"   {len(texts)} chunks of {chunk_chars} chars")
 
-    tokenizer = SimpleCharacterTokenizer(vocab_size=128)
+    if args.tokenizer == "bpe":
+        try:
+            from dimba.tokenizers.bpe import BPETokenizer
+        except ImportError as exc:
+            raise ImportError(
+                "BPETokenizer requires the 'tokenizers' library. "
+                "Install it with: pip install tokenizers"
+            ) from exc
+        print(f"   training BPE tokenizer (vocab_size={args.bpe_vocab_size}) ...")
+        tokenizer = BPETokenizer.train(texts, vocab_size=args.bpe_vocab_size)
+        tokenizer.vocab_size = tokenizer.tokenizer.get_vocab_size()
+        print(f"   BPE vocab size: {tokenizer.vocab_size}")
+    else:
+        tokenizer = SimpleCharacterTokenizer(vocab_size=128)
 
     split = int(len(texts) * 0.9)
     nw = args.num_workers
@@ -207,6 +236,10 @@ def main():
             ModelCheckpoint(dirpath=ckpt_dir, filename="shakespeare1",
                             monitor="val/loss", mode="min", save_top_k=1),
             EarlyStopping(monitor="val/loss", patience=args.patience, mode="min"),
+            GenerationSampleCallback(
+                tokenizer=tokenizer, prompt="ROMEO:\n",
+                seq_len=120, every_n_epochs=1,
+            ),
         ],
         logger=TensorBoardLogger(log_dir, name="shakespeare"),
         log_every_n_steps=10,
