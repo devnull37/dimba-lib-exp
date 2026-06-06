@@ -298,6 +298,65 @@ class Mamba2Denoiser(nn.Module):
         return out
 
 
+class _AttnBlock(nn.Module):
+    """Hand-rolled pre-norm bidirectional transformer encoder block.
+
+    Each block applies:
+        h = norm1(x)
+        multi-head self-attention (NO causal mask) -> x = x + o_proj(a)
+        h = norm2(x)
+        x = x + ff2(gelu(ff1(h)))
+
+    Separate q, k, v, o Linear projections are used (not fused) so the MLX
+    backend can mirror the block weight-for-weight without rewriting shapes.
+
+    Args:
+        d_model: Input/output hidden dimension.
+        nhead: Number of attention heads.  Must divide ``d_model`` evenly.
+    """
+
+    def __init__(self, d_model: int, nhead: int):
+        super().__init__()
+        assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff1 = nn.Linear(d_model, d_model * 4)
+        self.ff2 = nn.Linear(d_model * 4, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pre-norm bidirectional self-attention + FFN with residuals.
+
+        Args:
+            x: Input tensor ``[B, L, d_model]``.
+
+        Returns:
+            Output tensor ``[B, L, d_model]``.
+        """
+        B, L, D = x.shape
+        # --- self-attention branch ---
+        h = self.norm1(x)
+        q = self.q_proj(h).view(B, L, self.nhead, self.head_dim).transpose(1, 2)  # [B, H, L, hd]
+        k = self.k_proj(h).view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        scale = self.head_dim ** -0.5
+        attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)  # [B, H, L, L]
+        a = torch.matmul(attn, v)  # [B, H, L, hd]
+        a = a.transpose(1, 2).contiguous().view(B, L, D)  # [B, L, D]
+        x = x + self.o_proj(a)
+        # --- feed-forward branch ---
+        h = self.norm2(x)
+        x = x + self.ff2(torch.nn.functional.gelu(self.ff1(h)))
+        return x
+
+
 class DenoisingHead(nn.Module):
     """Project denoised embeddings to token logits, with optional weight tying.
 
@@ -306,6 +365,15 @@ class DenoisingHead(nn.Module):
         vocab_size: Vocabulary size.
         use_weight_tying: Tie the projection with the embedding matrix.
         embedding_weight: Embedding weight for tying (optional).
+        use_norm: Apply LayerNorm + learnable logit scale before projection.
+        head_type: ``"linear"`` (default, per-position projection, current behavior)
+            or ``"attn"`` (context-aware bidirectional self-attention blocks before
+            the projection).  Old checkpoints without this key default to ``"linear"``.
+        head_attn_layers: Number of transformer encoder blocks when
+            ``head_type="attn"`` (default 2).
+        head_attn_heads: Maximum number of attention heads for the attn blocks
+            (default 4).  The actual number used is the largest divisor of
+            ``d_model`` that is ``<= head_attn_heads`` (minimum 1).
     """
 
     def __init__(
@@ -315,11 +383,28 @@ class DenoisingHead(nn.Module):
         use_weight_tying: bool = False,
         embedding_weight: Optional[torch.Tensor] = None,
         use_norm: bool = False,
+        head_type: str = "linear",
+        head_attn_layers: int = 2,
+        head_attn_heads: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.use_weight_tying = use_weight_tying
+        self.head_type = head_type
+
+        # --- context-aware attention blocks (head_type=="attn") ---
+        self.attn_blocks: Optional[nn.ModuleList] = None
+        if head_type == "attn":
+            # Pick the largest divisor of d_model that is <= head_attn_heads (min 1).
+            nhead = 1
+            for candidate in range(head_attn_heads, 0, -1):
+                if d_model % candidate == 0:
+                    nhead = candidate
+                    break
+            self.attn_blocks = nn.ModuleList(
+                [_AttnBlock(d_model=d_model, nhead=nhead) for _ in range(head_attn_layers)]
+            )
 
         # Optional pre-head LayerNorm + learnable logit scale. A bare weight-tied head
         # is a dot product with embeddings of std ~0.02, which produces near-uniform
@@ -341,7 +426,26 @@ class DenoisingHead(nn.Module):
     def forward(
         self, x: torch.Tensor, embedding_weight: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Project denoised embeddings ``[B, L, d_model]`` to logits ``[B, L, vocab]``."""
+        """Project denoised embeddings ``[B, L, d_model]`` to logits ``[B, L, vocab]``.
+
+        When ``head_type="attn"``, the input first passes through bidirectional
+        self-attention blocks so each position can attend to the full sequence
+        before the final vocabulary projection.  The forward signature is
+        identical to the ``"linear"`` path so trainer/sampler callers are
+        unchanged.
+
+        Args:
+            x: Decoded embeddings ``[B, L, d_model]``.
+            embedding_weight: Optional embedding matrix for weight-tied projection.
+
+        Returns:
+            Token logits ``[B, L, vocab_size]``.
+        """
+        # Context-aware mixing (no-op for head_type=="linear").
+        if self.attn_blocks is not None:
+            for blk in self.attn_blocks:
+                x = blk(x)
+
         if self.use_norm:
             x = self.norm(x)
         if self.use_weight_tying:

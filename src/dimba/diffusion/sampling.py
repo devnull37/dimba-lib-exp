@@ -16,6 +16,7 @@ conditioning with zeros, and printed progress from inside the library; all fixed
 """
 
 import logging
+import math
 import torch
 import torch.nn.functional as F
 from typing import Optional
@@ -26,6 +27,66 @@ logger = logging.getLogger(__name__)
 def _coef(value: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     """Reshape a scalar schedule coefficient for broadcasting against ``like``."""
     return value.view(*([1] * like.dim())).to(like.device, like.dtype)
+
+
+def _dpmpp_step(
+    x_t: torch.Tensor,
+    x0_hat: torch.Tensor,
+    acp_t: torch.Tensor,
+    acp_prev: torch.Tensor,
+    prev_x0: Optional[torch.Tensor],
+    prev_h: Optional[float],
+) -> tuple:
+    """One x0-parameterized DPM-Solver++(2M) reverse step ``x_t -> x_{prev}``.
+
+    Uses the data-prediction (x0) form of DPM-Solver++ with multistep correction.
+
+    Args:
+        x_t: Current noisy latents ``[B, L, d]``.
+        x0_hat: Predicted clean latents (already CFG-combined/clamped).
+        acp_t: alpha_cumprod at the current (noisier) timestep.
+        acp_prev: alpha_cumprod at the next (cleaner) timestep.
+        prev_x0: x0 prediction from the previous step (None on first step).
+        prev_h: log-SNR step size from the previous step (None on first step).
+
+    Returns:
+        ``(x_prev, x0_hat, h)`` — the denoised sample, the current x0 prediction
+        (stored as ``prev_x0`` for the next call), and the current h (stored as
+        ``prev_h`` for the next call).
+    """
+    # Final step guard: acp_prev ~ 1 -> sigma_prev ~ 0 -> x_prev ~ x0_hat.
+    if float(acp_prev) >= 1.0 - 1e-6:
+        return x0_hat, x0_hat, None
+
+    alpha_t = acp_t.sqrt()
+    sigma_t = (1.0 - acp_t).clamp(min=1e-8).sqrt()
+    alpha_prev = acp_prev.sqrt()
+    sigma_prev = (1.0 - acp_prev).clamp(min=1e-8).sqrt()
+
+    # log-SNR: lambda = log(alpha) - log(sigma)
+    lam_t = torch.log(alpha_t) - torch.log(sigma_t)
+    lam_prev = torch.log(alpha_prev) - torch.log(sigma_prev)
+    h = float(lam_prev - lam_t)  # > 0 because acp_prev > acp_t
+
+    # DPM-Solver++(2M): multistep if we have a prior estimate, else 1st-order.
+    if prev_x0 is None or prev_h is None:
+        # First-order (same as DPM-Solver++ 1S / DDIM-like).
+        D = x0_hat
+    else:
+        r = prev_h / h
+        # Second-order correction blending current and previous x0 estimates.
+        D = (1.0 + 1.0 / (2.0 * r)) * x0_hat - (1.0 / (2.0 * r)) * prev_x0
+
+    exp_neg_h = math.exp(-h)
+
+    coef_xt = _coef(sigma_prev / sigma_t, x_t)
+    coef_D = _coef(alpha_prev * torch.tensor(1.0 - exp_neg_h, dtype=acp_t.dtype, device=acp_t.device), x_t)
+    # DPM-Solver++(2M) data-prediction: x_prev = (sigma_prev/sigma_t) x_t
+    #   - alpha_prev (e^-h - 1) D  ==  (sigma_prev/sigma_t) x_t + alpha_prev (1 - e^-h) D.
+    # The x0 term is ADDED (the first-order case must reduce to DDIM(eta=0)).
+    x_prev = coef_xt * x_t + coef_D * D
+
+    return x_prev, x0_hat, h
 
 
 def _ddim_step(
@@ -91,6 +152,7 @@ def sample_from_model(
     cfg_mode: str = "x0",
     device: Optional[torch.device] = None,
     verbose: bool = False,
+    sampler: str = "ddim",
 ) -> torch.Tensor:
     """Generate ``seq_len`` response tokens, optionally conditioned on ``prompt_ids``.
 
@@ -111,10 +173,14 @@ def sample_from_model(
             more uniform effective guidance across the trajectory).
         device: Override device.
         verbose: Log progress.
+        sampler: ``"ddim"`` (default, unchanged behaviour) or ``"dpmpp"``
+            (DPM-Solver++(2M) — data-prediction form, 10-20 steps sufficient).
 
     Returns:
         Generated token IDs ``[B, seq_len]``.
     """
+    if sampler not in ("ddim", "dpmpp"):
+        raise ValueError(f"sampler must be 'ddim' or 'dpmpp', got {sampler!r}")
     if device is None:
         device = next(model.parameters()).device
     if num_steps is None:
@@ -155,6 +221,11 @@ def sample_from_model(
     n_steps = len(timesteps)
     if clamp_to_tokens and clamp_mode == "none":  # backward-compat: hard-clamp every step
         clamp_mode, clamp_from = "hard", 1.0
+
+    # DPM-Solver++(2M) carry state.
+    dpmpp_prev_x0: Optional[torch.Tensor] = None
+    dpmpp_prev_h: Optional[float] = None
+
     for i in range(n_steps):
         t_val = timesteps[i]
         t = torch.full((batch_size,), int(t_val.item()), dtype=torch.long, device=device)
@@ -185,7 +256,13 @@ def sample_from_model(
                 x0_hat = _clamp_latent_to_tokens(model, x0_hat)
 
         acp_prev = alphas_cumprod[timesteps[i + 1]] if i < n_steps - 1 else torch.ones((), device=device)
-        x_prev = _ddim_step(x_t, x0_hat, acp_t, acp_prev, eta)
+
+        if sampler == "dpmpp":
+            x_prev, dpmpp_prev_x0, dpmpp_prev_h = _dpmpp_step(
+                x_t, x0_hat, acp_t, acp_prev, dpmpp_prev_x0, dpmpp_prev_h
+            )
+        else:
+            x_prev = _ddim_step(x_t, x0_hat, acp_t, acp_prev, eta)
 
         # Hold the prompt prefix clean.
         if prompt_latent is not None:

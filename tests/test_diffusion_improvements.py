@@ -82,11 +82,35 @@ def test_cfg_eps_mode_runs():
     assert out.shape == (1, 8) and torch.isfinite(out.float()).all()
 
 
-# ---- MLX v2 guard ----
-def test_mlx_guard_rejects_v2():
+# ---- MLX v2 support ----
+def test_mlx_v2_supported():
+    """MLX backend now supports the v2 config (adaln / v-pred / head-norm).
+
+    The old guard (NotImplementedError) has been replaced with real v2 support.
+    This test confirms from_torch succeeds and produces finite logits.
+
+    NOTE: _tiny() uses use_simple_mamba=True (SimpleMamba2), which has a
+    different state_dict layout from TorchMamba2/MLXMamba2Mixer.  To keep this
+    test fast and decoupled from mixer weight-format details we just verify that
+    construction and a single-step forward pass succeed without error.
+    """
     import pytest
     pytest.importorskip("mlx.core")
+    import numpy as np
+    import mlx.core as mx
     from dimba.backends.mlx.model import MLXDIMBA
-    v2 = _tiny(conditioning_type="adaln", prediction_type="v", use_head_norm=True)
-    with pytest.raises(NotImplementedError):
-        MLXDIMBA.from_torch(v2)
+    # _tiny uses d_latent=24 which is too small for TorchMamba2 (needs d_inner >= headdim=64).
+    # Override d_latent=64 and use_simple_mamba=False so mixer weights are
+    # TorchMamba2-compatible (required by load_torch_mamba2_state_dict).
+    v2 = _tiny(conditioning_type="adaln", prediction_type="v", use_head_norm=True,
+               latent_norm=True, self_conditioning=True, use_simple_mamba=False,
+               d_latent=64)
+    v2.eval()
+    mlx_m = MLXDIMBA.from_torch(v2)
+    assert mlx_m.conditioning_type == "adaln"
+    assert mlx_m.prediction_type == "v"
+    assert mlx_m.use_head_norm is True
+    # Quick smoke: sample_logits returns finite values.
+    noise = np.random.RandomState(0).randn(1, 4, v2.d_latent).astype(np.float32)
+    logits = mlx_m.sample_logits(noise, num_steps=2)
+    assert np.isfinite(np.array(logits)).all()

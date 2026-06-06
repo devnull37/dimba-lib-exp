@@ -90,6 +90,9 @@ class DIMBA(nn.Module):
         noise_df: float = 5.0,
         embed_init_std: float = 0.02,
         latent_scale: Optional[float] = None,
+        head_type: str = "linear",
+        head_attn_layers: int = 2,
+        head_attn_heads: int = 4,
     ):
         super().__init__()
 
@@ -231,11 +234,19 @@ class DIMBA(nn.Module):
                 use_weight_tying=True,
                 embedding_weight=self.token_embed.get_weight(),
                 use_norm=use_head_norm,
+                head_type=head_type,
+                head_attn_layers=head_attn_layers,
+                head_attn_heads=head_attn_heads,
             )
         else:
             self.output_head = DenoisingHead(
-                d_model=d_model, vocab_size=vocab_size, use_weight_tying=False,
+                d_model=d_model,
+                vocab_size=vocab_size,
+                use_weight_tying=False,
                 use_norm=use_head_norm,
+                head_type=head_type,
+                head_attn_layers=head_attn_layers,
+                head_attn_heads=head_attn_heads,
             )
 
         # Full constructor config, stored for faithful replicas (EMA / reload).
@@ -273,6 +284,9 @@ class DIMBA(nn.Module):
             noise_df=noise_df,
             embed_init_std=embed_init_std,
             latent_scale=self.latent_scale,
+            head_type=head_type,
+            head_attn_layers=head_attn_layers,
+            head_attn_heads=head_attn_heads,
         )
 
     @property
