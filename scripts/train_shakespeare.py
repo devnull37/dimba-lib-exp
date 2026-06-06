@@ -140,6 +140,10 @@ def main():
         #    logits (the tiny-embedding rounding bottleneck behind garbled words).
         "prediction_type": "v",
         "use_head_norm": True,
+        # Context-aware (non-autoregressive) rounding head: each position picks its
+        # token with full-sequence self-attention -- the cited fix for the rounding
+        # bottleneck behind garbled words. Latent diffusion + Mamba backbone unchanged.
+        "head_type": "attn",
     }
 
     accel = args.accelerator.upper() if args.accelerator != "gpu" else f"CUDA ({torch.cuda.get_device_name(0)})"
