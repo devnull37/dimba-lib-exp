@@ -58,8 +58,12 @@ class TextDataset(Dataset):
         else:
             raise TypeError("Tokenizer must be callable or provide an encode(text) method")
 
+        # Attention mask (1 = real token, 0 = padding) so padding positions can be
+        # excluded from the loss. Pad id is 0 for both bundled tokenizers.
+        pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
         return {
             "input_ids": input_ids,
+            "attention_mask": (input_ids != pad_id).long(),
         }
 
 
@@ -269,8 +273,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     Returns:
         Batched tensors
     """
-    input_ids = torch.stack([example["input_ids"] for example in batch])
-
-    return {
-        "input_ids": input_ids,
-    }
+    out = {"input_ids": torch.stack([example["input_ids"] for example in batch])}
+    if "attention_mask" in batch[0]:
+        out["attention_mask"] = torch.stack([example["attention_mask"] for example in batch])
+    return out

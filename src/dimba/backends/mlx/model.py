@@ -79,6 +79,29 @@ class MLXDIMBA:
     def from_torch(cls, torch_model) -> "MLXDIMBA":
         """Build from a constructed PyTorch ``DIMBA`` (weights copied to MLX)."""
         cfg = dict(torch_model.config)
+        # The MLX backend mirrors the dimbapeare1-30m (v1) config: film / x0 / no
+        # head-norm / no self-conditioning / no latent-norm / gaussian noise. Fail
+        # loudly rather than silently mis-sample a v2 checkpoint -- those must use the
+        # PyTorch backend until the MLX v2 port lands.
+        _unsupported = []
+        if cfg.get("conditioning_type", "film") != "film":
+            _unsupported.append(f"conditioning_type={cfg.get('conditioning_type')}")
+        if cfg.get("prediction_type", "x0") != "x0":
+            _unsupported.append("prediction_type=v")
+        if cfg.get("self_conditioning"):
+            _unsupported.append("self_conditioning")
+        if cfg.get("use_head_norm"):
+            _unsupported.append("use_head_norm")
+        if cfg.get("latent_norm"):
+            _unsupported.append("latent_norm")
+        if cfg.get("noise_dist", "gaussian") != "gaussian":
+            _unsupported.append(f"noise_dist={cfg.get('noise_dist')}")
+        if _unsupported:
+            raise NotImplementedError(
+                "MLXDIMBA supports the film/x0 (v1) config only; this checkpoint uses "
+                f"{_unsupported}. Run v2 checkpoints through the PyTorch backend "
+                "(MLX v2 port is a tracked TODO)."
+            )
         cfg["latent_scale"] = float(torch_model.latent_scale)
         self = cls(cfg)
         sd = {k: v for k, v in torch_model.state_dict().items()}

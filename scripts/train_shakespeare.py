@@ -198,6 +198,12 @@ def main():
         use_ema=False,
         ce_loss_weight=1.0,
         min_snr_gamma=5.0,
+        # logit-normal timestep sampling concentrates training on the mid-noise regime
+        # where token content is decided (SD3/FLUX); antithetic pairing cuts gradient
+        # variance; skip the degenerate t=0 (x_t == x_0 under zero-terminal-SNR).
+        timestep_sampling="logit_normal",
+        antithetic_t=True,
+        exclude_zero_t=True,
     )
     n = sum(p.numel() for p in module.parameters())
     print(f"   {n:,} params  ({n * 4 / 1024**2:.1f} MB fp32)")

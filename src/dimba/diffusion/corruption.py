@@ -436,8 +436,15 @@ class AbsorbingMaskCorruption(CorruptionProcess):
             reduction="none",
         ).reshape(batch, seq)
 
-        # MDLM NELBO weight 1/t, broadcast per example over the sequence.
-        weight = (1.0 / t).view(batch, *([1] * (ce.dim() - 1)))
+        # NELBO weight: 1/t for linear schedule; for cosine schedule the correct
+        # continuous-time weight is (pi/2 * sin(pi*t/2)) / (1 - cos(pi*t/2)).
+        if self.schedule == "cosine":
+            numerator = (0.5 * math.pi) * torch.sin(0.5 * math.pi * t)
+            denominator = (1.0 - torch.cos(0.5 * math.pi * t)).clamp(min=1e-8)
+            nelbo_weight = numerator / denominator
+        else:
+            nelbo_weight = 1.0 / t
+        weight = nelbo_weight.view(batch, *([1] * (ce.dim() - 1)))
         weighted = ce * weight * masked_positions.to(ce.dtype)
 
         denom = masked_positions.sum().clamp(min=1).to(ce.dtype)
@@ -653,7 +660,15 @@ class HybridCorruption(CorruptionProcess):
             targets.reshape(-1),
             reduction="none",
         ).reshape(batch, seq)
-        ce_w = (1.0 / t).view(batch, *([1] * (ce.dim() - 1)))
+        # NELBO weight: 1/t for linear schedule; for cosine schedule the correct
+        # continuous-time weight is (pi/2 * sin(pi*t/2)) / (1 - cos(pi*t/2)).
+        if self.schedule == "cosine":
+            numerator = (0.5 * math.pi) * torch.sin(0.5 * math.pi * t)
+            denominator = (1.0 - torch.cos(0.5 * math.pi * t)).clamp(min=1e-8)
+            nelbo_weight = numerator / denominator
+        else:
+            nelbo_weight = 1.0 / t
+        ce_w = nelbo_weight.view(batch, *([1] * (ce.dim() - 1)))
         ce_term = (ce * ce_w * masked_positions.to(ce.dtype)).sum()
         ce_term = ce_term / masked_positions.sum().clamp(min=1).to(ce.dtype)
 

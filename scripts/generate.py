@@ -27,6 +27,22 @@ sys.path.insert(0, str(SRC_DIR))
 from dimba import DIMBA, DDIMSampler, sample_from_model
 
 
+def _load_tokenizer_auto(path):
+    """Auto-detect tokenizer type from JSON and load it."""
+    import json
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "char_to_id" in data:
+        from dimba.tokenizers.simple import SimpleCharacterTokenizer
+        tok = SimpleCharacterTokenizer()
+        tok.load(path)
+        return tok
+    from dimba.tokenizers.bpe import BPETokenizer
+    tok = BPETokenizer()
+    tok.load(path)
+    return tok
+
+
 def load_checkpoint(checkpoint_path: str, vocab_size: int, device: str, config_path: str = None):
     """Load model from checkpoint.
 
@@ -105,7 +121,8 @@ def main():
     parser.add_argument('--top-k', type=int, default=None, help='Top-k sampling')
     parser.add_argument('--top-p', type=float, default=0.95, help='Top-p (nucleus) sampling')
     parser.add_argument('--use-ddim', action='store_true', help='Use DDIM sampling')
-    parser.add_argument('--vocab-size', type=int, default=10000, help='Vocabulary size')
+    parser.add_argument('--vocab-size', type=int, default=10000, help='Vocabulary size (ignored when --tokenizer is given)')
+    parser.add_argument('--tokenizer', type=str, default=None, help='Path to tokenizer JSON file (auto-detects SimpleCharacterTokenizer or BPETokenizer)')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--num-samples', type=int, default=1, help='Number of samples to generate')
 
@@ -124,24 +141,35 @@ def main():
     print(f"Number of samples: {args.num_samples}")
     print("-" * 50)
 
-    # Simple tokenizer (just split by spaces for demo)
-    def tokenize(text):
-        return [ord(c) % args.vocab_size for c in text]
+    # Load tokenizer: use auto-detect helper when --tokenizer is given,
+    # otherwise fall back to the ord(c)%vocab_size character hack for
+    # quick sanity runs without a real tokenizer file.
+    if args.tokenizer is not None:
+        print(f"Loading tokenizer from {args.tokenizer}...")
+        tokenizer = _load_tokenizer_auto(args.tokenizer)
 
-    def detokenize(token_ids):
-        # Convert token IDs back to characters (inverse of tokenize)
-        # Since tokenize uses ord(c) % vocab_size, try to recover characters
-        try:
-            chars = [chr(int(t)) for t in token_ids.tolist() if 32 <= int(t) < 127]
-            if chars:
-                text = ''.join(chars)
-            else:
-                text = f"<non-printable tokens>"
-        except:
-            text = f"<decoding error>"
+        def tokenize(text):
+            return tokenizer.encode(text)
 
-        # Show both text and token IDs
-        return f"{text}\n  (Token IDs: {token_ids.tolist()[:30]}...)"
+        def detokenize(token_ids):
+            try:
+                text = tokenizer.decode(token_ids.tolist())
+            except Exception:
+                text = "<decoding error>"
+            return f"{text}\n  (Token IDs: {token_ids.tolist()[:30]}...)"
+    else:
+        print("Warning: no --tokenizer given; using ord(c)%vocab_size fallback.")
+
+        def tokenize(text):
+            return [ord(c) % args.vocab_size for c in text]
+
+        def detokenize(token_ids):
+            try:
+                chars = [chr(int(t)) for t in token_ids.tolist() if 32 <= int(t) < 127]
+                text = ''.join(chars) if chars else "<non-printable tokens>"
+            except Exception:
+                text = "<decoding error>"
+            return f"{text}\n  (Token IDs: {token_ids.tolist()[:30]}...)"
 
     # Tokenize prompt
     prompt_ids = torch.tensor([tokenize(args.prompt)], device=args.device)

@@ -115,6 +115,7 @@ def compute_dimba_losses(
     ce_loss_weight: float = 1.0,
     min_snr_gamma: float = 5.0,
     prompt_mask: Optional[torch.Tensor] = None,
+    loss_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute the DIMBA training loss.
 
@@ -159,10 +160,18 @@ def compute_dimba_losses(
     else:
         target = info["z_0"]
         pred = info["z0_hat"]
-    per_pos = ((pred - target) ** 2).mean(dim=-1)  # [B, L]
+    # Effective per-position loss mask: response positions (diffuse_mask) intersected
+    # with non-padding (loss_mask). None -> mean over all positions (unchanged default).
+    eff = None
     if diffuse_mask is not None:
-        m = diffuse_mask.to(per_pos.dtype)
-        per_sample = (per_pos * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+        eff = diffuse_mask.to(torch.float32)
+    if loss_mask is not None:
+        lm = loss_mask.to(torch.float32)
+        eff = lm if eff is None else eff * lm
+
+    per_pos = ((pred - target) ** 2).mean(dim=-1)  # [B, L]
+    if eff is not None:
+        per_sample = (per_pos * eff).sum(dim=1) / eff.sum(dim=1).clamp(min=1.0)
     else:
         per_sample = per_pos.mean(dim=1)
 
@@ -179,8 +188,8 @@ def compute_dimba_losses(
     ce_per = F.cross_entropy(
         logits.reshape(-1, V), input_ids.reshape(-1), reduction="none"
     ).view(B, L)
-    if diffuse_mask is not None:
-        m = diffuse_mask.to(ce_per.dtype)
+    if eff is not None:
+        m = eff.to(ce_per.dtype)
         ce_loss = ((ce_per * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)).mean()
     else:
         ce_loss = ce_per.mean()
@@ -295,6 +304,9 @@ class DIMBALightningModule(pl.LightningModule):
         consistency_delta_max: int = 200,
         ce_loss_weight: float = 1.0,
         min_snr_gamma: float = 5.0,
+        timestep_sampling: str = "uniform",
+        antithetic_t: bool = False,
+        exclude_zero_t: bool = False,
         progressive_milestones: Optional[List[int]] = None,
         progressive_save_dir: str = "./progressive_checkpoints",
         enable_progressive_checkpoints: bool = False,
@@ -415,8 +427,14 @@ class DIMBALightningModule(pl.LightningModule):
         input_ids = batch["input_ids"]
         batch_size = input_ids.shape[0]
 
-        # Sample random timesteps for the main denoising loss.
-        t = sample_timesteps(batch_size, self.model.num_diffusion_steps, self.device)
+        # Sample timesteps for the main denoising loss (distribution is configurable:
+        # uniform / logit_normal / logsnr_uniform, with optional antithetic pairing).
+        t = self.model.noise_schedule.sample_timesteps(
+            batch_size, self.device,
+            mode=self.hparams.timestep_sampling,
+            antithetic=self.hparams.antithetic_t,
+            exclude_zero=self.hparams.exclude_zero_t,
+        )
 
         prompt_mask = batch.get("prompt_mask")
         loss, loss_parts = compute_dimba_losses(
@@ -426,6 +444,7 @@ class DIMBALightningModule(pl.LightningModule):
             ce_loss_weight=self.ce_loss_weight,
             min_snr_gamma=self.min_snr_gamma,
             prompt_mask=prompt_mask,
+            loss_mask=batch.get("attention_mask"),
         )
 
         # CDLM consistency loss: align the model's clean-latent predictions across timesteps.
@@ -794,7 +813,9 @@ class SimpleTrainer:
             for batch in self.val_dataloader:
                 input_ids = batch["input_ids"].to(self.device)
                 batch_size = input_ids.shape[0]
-                t = torch.full((batch_size,), self.model.num_diffusion_steps // 2, device=self.device)
+                # Sample across the full schedule (a fixed midpoint hides high-noise /
+                # generative failure) -- matches DIMBALightningModule.validation_step.
+                t = sample_timesteps(batch_size, self.model.num_diffusion_steps, torch.device(self.device))
 
                 loss, _ = compute_dimba_losses(
                     self.model,

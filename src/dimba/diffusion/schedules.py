@@ -15,6 +15,7 @@ a minimum of 1e-4 (which guarantees a *nonzero* terminal SNR) while its docstrin
 claimed to fix it; that is corrected here.
 """
 
+import math
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
@@ -61,11 +62,19 @@ class CosineNoiseSchedule(nn.Module):
         num_steps: int = 1000,
         s: float = 0.008,
         zero_terminal_snr: bool = True,
+        noise_dist: str = "gaussian",
+        noise_df: float = 5.0,
     ):
         super().__init__()
         self.num_steps = num_steps
         self.s = s
         self.zero_terminal_snr = zero_terminal_snr
+        # Forward-process noise distribution. "gaussian" is the standard DDPM choice;
+        # "student_t" injects heavy-tailed (Levy-like) corruption, rescaled to unit
+        # variance so the SNR schedule stays calibrated (Heavy-Tailed Diffusion,
+        # arXiv:2410.14171). Large noise_df -> Gaussian; small -> heavier tails.
+        self.noise_dist = noise_dist
+        self.noise_df = float(noise_df)
 
         alphas_cumprod = self._compute_alphas_cumprod()
         alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]])
@@ -80,6 +89,12 @@ class CosineNoiseSchedule(nn.Module):
             "sqrt_one_minus_alphas_cumprod",
             torch.sqrt((1.0 - alphas_cumprod).clamp(min=0.0)),
         )
+        # log-SNR per timestep (monotonically decreasing in t), used by logSNR-uniform
+        # timestep sampling. Clamp acp away from {0,1} so the endpoints stay finite --
+        # 1e-5 (not 1e-8) because (1 - 1e-8) rounds to exactly 1.0 in float32, which
+        # would make log(1-acp) = -inf at t=0.
+        acp_c = alphas_cumprod.clamp(1e-5, 1.0 - 1e-5)
+        self.register_buffer("logsnr", torch.log(acp_c) - torch.log(1.0 - acp_c))
 
     def _compute_alphas_cumprod(self) -> torch.Tensor:
         """Compute cumulative alpha products using the (normalized) cosine schedule."""
@@ -108,11 +123,66 @@ class CosineNoiseSchedule(nn.Module):
             ``(x_t, noise)``.
         """
         if noise is None:
-            noise = torch.randn_like(x_0)
+            noise = self.sample_noise(x_0)
         sqrt_alpha = _reshape_to(self.sqrt_alphas_cumprod[t], x_0)
         sqrt_one_minus = _reshape_to(self.sqrt_one_minus_alphas_cumprod[t], x_0)
         x_t = sqrt_alpha * x_0 + sqrt_one_minus * noise
         return x_t, noise
+
+    def sample_noise(self, x_0: torch.Tensor) -> torch.Tensor:
+        """Draw forward-process noise shaped like ``x_0`` from the configured distribution.
+
+        ``gaussian`` -> standard normal. ``student_t`` -> unit-variance Student-t
+        (heavy-tailed); rescaled by ``sqrt((df-2)/df)`` so the marginal variance matches
+        N(0, I) and the SNR schedule stays valid.
+        """
+        if self.noise_dist == "student_t":
+            df = self.noise_df
+            n = torch.distributions.StudentT(df).sample(x_0.shape).to(x_0.device, x_0.dtype)
+            if df > 2.0:
+                n = n * math.sqrt((df - 2.0) / df)
+            return n
+        return torch.randn_like(x_0)
+
+    def sample_timesteps(
+        self,
+        batch: int,
+        device: torch.device,
+        mode: str = "uniform",
+        exclude_zero: bool = False,
+        antithetic: bool = False,
+    ) -> torch.Tensor:
+        """Sample training timesteps ``[batch]`` with the chosen distribution.
+
+        ``mode``: "uniform" (clock-uniform, the classic default); "logit_normal"
+        (t = round((T-1)*sigmoid(N(0,1))), SD3/FLUX -- concentrates on mid-noise where
+        token content is decided); "logsnr_uniform" (uniform over log-SNR, PLAID /
+        Improved-Noise-Schedule -- equal effort per SNR decade).
+        ``exclude_zero``: skip t=0 (degenerate under zero-terminal-SNR: x_t == x_0).
+        ``antithetic``: pair each draw with its mirror ``T-1-t`` for variance reduction
+        (MDLM / DiffuMamba low-discrepancy sampling).
+        """
+        if antithetic:
+            half = (batch + 1) // 2
+            base = self._draw_t(half, device, mode, exclude_zero)
+            mirror = (self.num_steps - 1) - base
+            return torch.cat([base, mirror], dim=0)[:batch]
+        return self._draw_t(batch, device, mode, exclude_zero)
+
+    def _draw_t(self, n: int, device, mode: str, exclude_zero: bool) -> torch.Tensor:
+        T = self.num_steps
+        lo = 1 if exclude_zero else 0
+        if mode == "uniform":
+            return torch.randint(lo, T, (n,), device=device)
+        if mode == "logit_normal":
+            s = torch.sigmoid(torch.randn(n, device=device))
+            return (s * (T - 1)).round().long().clamp(lo, T - 1)
+        if mode == "logsnr_uniform":
+            ls = self.logsnr.to(device)                      # decreasing in t
+            target = torch.empty(n, device=device).uniform_(ls[-1].item(), ls[0].item())
+            idx_inc = torch.searchsorted(torch.flip(ls, dims=[0]), target).clamp(0, T - 1)
+            return ((T - 1) - idx_inc).clamp(lo, T - 1).long()
+        raise ValueError(f"unknown timestep sampling mode: {mode}")
 
     def velocity(self, x_0: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """v-prediction target ``v = sqrt(acp) * noise - sqrt(1 - acp) * x_0`` (Salimans & Ho, 2022)."""

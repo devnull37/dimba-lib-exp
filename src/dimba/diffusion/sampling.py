@@ -86,6 +86,9 @@ def sample_from_model(
     guidance_scale: float = 1.0,
     eta: float = 0.0,
     clamp_to_tokens: bool = False,
+    clamp_mode: str = "none",
+    clamp_from: float = 0.0,
+    cfg_mode: str = "x0",
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> torch.Tensor:
@@ -99,8 +102,13 @@ def sample_from_model(
         temperature, top_k, top_p: token-sampling controls.
         guidance_scale: Classifier-free guidance weight (1.0 disables CFG).
         eta: DDIM stochasticity (0 = deterministic DDIM).
-        clamp_to_tokens: Snap the predicted embedding to the nearest token
-            embedding each step (the Diffusion-LM clamping trick; embedding-space only).
+        clamp_to_tokens: Legacy flag — hard-snap every step (== clamp_mode="hard", clamp_from=1.0).
+        clamp_mode: "none" | "hard" (nearest token, Diffusion-LM) | "soft" (expected
+            token embedding under the head's softmax, DiffuSeq-v2 — less committal).
+        clamp_from: apply clamping only in the final fraction of steps (0=never, 1=all);
+            pulling the latent toward the token manifold late fights non-word drift.
+        cfg_mode: "x0" (interpolate x0 predictions) | "eps" (interpolate in noise space —
+            more uniform effective guidance across the trajectory).
         device: Override device.
         verbose: Log progress.
 
@@ -144,21 +152,39 @@ def sample_from_model(
     timesteps = _make_timesteps(model.num_diffusion_steps, num_steps, device)
 
     x_self_cond = None
-    for i in range(len(timesteps)):
+    n_steps = len(timesteps)
+    if clamp_to_tokens and clamp_mode == "none":  # backward-compat: hard-clamp every step
+        clamp_mode, clamp_from = "hard", 1.0
+    for i in range(n_steps):
         t_val = timesteps[i]
         t = torch.full((batch_size,), int(t_val.item()), dtype=torch.long, device=device)
+        acp_t = alphas_cumprod[t_val]
 
         x0_hat = model.denoise_to_x0_latent(x_t, t, cond, x_self_cond)
         if use_cfg:
             x0_uncond = model.denoise_to_x0_latent(x_t, t, uncond, x_self_cond)
-            x0_hat = x0_uncond + guidance_scale * (x0_hat - x0_uncond)
+            if cfg_mode == "eps":
+                # Guide in noise space: convert both x0 estimates to eps, blend, convert
+                # back. Keeps the effective guidance scale more uniform across timesteps.
+                sa = acp_t.sqrt()
+                so = (1.0 - acp_t).clamp(min=1e-8).sqrt()
+                eps_c = (x_t - sa * x0_hat) / so
+                eps_u = (x_t - sa * x0_uncond) / so
+                eps_g = eps_u + guidance_scale * (eps_c - eps_u)
+                x0_hat = (x_t - so * eps_g) / sa.clamp(min=1e-8)
+            else:
+                x0_hat = x0_uncond + guidance_scale * (x0_hat - x0_uncond)
         x_self_cond = x0_hat
 
-        if clamp_to_tokens:
-            x0_hat = _clamp_latent_to_tokens(model, x0_hat)
+        # Pull the prediction toward the token manifold in the final `clamp_from`
+        # fraction of steps (soft = expected embedding, hard = nearest token).
+        if clamp_mode != "none" and (i + 1) / n_steps >= (1.0 - clamp_from):
+            if clamp_mode == "soft":
+                x0_hat = _soft_clamp_latent_to_tokens(model, x0_hat, temperature)
+            else:
+                x0_hat = _clamp_latent_to_tokens(model, x0_hat)
 
-        acp_t = alphas_cumprod[t_val]
-        acp_prev = alphas_cumprod[timesteps[i + 1]] if i < len(timesteps) - 1 else torch.ones((), device=device)
+        acp_prev = alphas_cumprod[timesteps[i + 1]] if i < n_steps - 1 else torch.ones((), device=device)
         x_prev = _ddim_step(x_t, x0_hat, acp_t, acp_prev, eta)
 
         # Hold the prompt prefix clean.
@@ -166,8 +192,8 @@ def sample_from_model(
             x_prev[:, :prompt_len, :] = prompt_latent
         x_t = x_prev
 
-        if verbose and (i % max(1, len(timesteps) // 10) == 0):
-            logger.info("denoising step %d/%d (t=%d)", i + 1, len(timesteps), int(t_val.item()))
+        if verbose and (i % max(1, n_steps // 10) == 0):
+            logger.info("denoising step %d/%d (t=%d)", i + 1, n_steps, int(t_val.item()))
 
     # Decode the response region to logits and sample.
     response_latent = x_t[:, prompt_len:, :]
@@ -198,6 +224,20 @@ def _clamp_latent_to_tokens(model: torch.nn.Module, z0_hat: torch.Tensor) -> tor
     ids = dists.argmin(dim=-1)  # [B, L]
     snapped = model.token_embed(ids)
     return model.encode_latent(snapped)
+
+
+def _soft_clamp_latent_to_tokens(
+    model: torch.nn.Module, z0_hat: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
+    """Soft clamping (DiffuSeq-v2): replace x0 with the *expected* token embedding under
+    the head's predicted distribution, then re-encode. Less committal than hard
+    nearest-neighbour, so the trajectory can still self-correct at earlier steps."""
+    emb = model.decode_latent(z0_hat)             # [B, L, d_model]
+    logits = model.output_head(emb)               # [B, L, V]
+    probs = F.softmax(logits / max(temperature, 1e-6), dim=-1)
+    table = model.token_embed.get_weight()        # [V, d_model]
+    soft_emb = torch.matmul(probs, table)         # [B, L, d_model] expected embedding
+    return model.encode_latent(soft_emb)
 
 
 def top_k_top_p_filtering(

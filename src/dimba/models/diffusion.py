@@ -86,6 +86,8 @@ class DIMBA(nn.Module):
         use_head_norm: bool = False,
         latent_norm: bool = False,
         bidir_merge: str = "sum",
+        noise_dist: str = "gaussian",
+        noise_df: float = 5.0,
         embed_init_std: float = 0.02,
         latent_scale: Optional[float] = None,
     ):
@@ -200,7 +202,8 @@ class DIMBA(nn.Module):
 
         # Diffusion schedule (now with a real zero-terminal-SNR option)
         self.noise_schedule = CosineNoiseSchedule(
-            num_steps=num_diffusion_steps, zero_terminal_snr=zero_terminal_snr
+            num_steps=num_diffusion_steps, zero_terminal_snr=zero_terminal_snr,
+            noise_dist=noise_dist, noise_df=noise_df,
         )
 
         # Mamba denoiser (bidirectional by default)
@@ -266,6 +269,8 @@ class DIMBA(nn.Module):
             use_head_norm=use_head_norm,
             latent_norm=latent_norm,
             bidir_merge=bidir_merge,
+            noise_dist=noise_dist,
+            noise_df=noise_df,
             embed_init_std=embed_init_std,
             latent_scale=self.latent_scale,
         )

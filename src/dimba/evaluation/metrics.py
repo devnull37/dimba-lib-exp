@@ -233,42 +233,102 @@ def compute_model_perplexity(
     dataloader,
     device: str = "cuda",
 ) -> float:
-    """Compute perplexity of model on a dataset.
+    """Compute denoising-NLL perplexity of a DIMBA model on a dataset.
+
+    For each batch, samples random diffusion timesteps, runs the forward
+    denoising pass, projects to token logits via output_head, and computes
+    cross-entropy against the true token ids. Returns exp(mean NLL).
 
     Args:
         model: DIMBA model
-        dataloader: DataLoader with batches
+        dataloader: DataLoader yielding dicts with "input_ids"
         device: Device to run on
 
     Returns:
-        Average perplexity across dataset
+        exp(mean denoising NLL) -- denoising-reconstruction perplexity
     """
+    from ..diffusion.sampling import sample_timesteps
+
     model.eval()
-    total_loss = 0.0
-    num_batches = 0
+    total_nll = 0.0
+    total_tokens = 0
 
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
             batch_size = input_ids.shape[0]
 
-            # Sample random timesteps
-            from ..diffusion.sampling import sample_timesteps
+            # Sample random diffusion timesteps
             t = sample_timesteps(batch_size, model.num_diffusion_steps, torch.device(device))
 
-            # Forward pass
+            # Forward denoising pass
             x_pred, _, _ = model(input_ids, t)
 
-            # Get clean embeddings
-            x_0 = model.token_embed(input_ids)
+            # Project to token logits
+            logits = model.output_head(x_pred, embedding_weight=model.token_embed.get_weight())
 
-            # Compute loss
-            loss = torch.nn.functional.mse_loss(x_pred, x_0)
-            total_loss += loss.item()
-            num_batches += 1
+            # Cross-entropy NLL vs true token ids
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                input_ids.reshape(-1),
+                reduction="sum",
+            )
+            total_nll += nll.item()
+            total_tokens += input_ids.numel()
 
-    avg_loss = total_loss / max(1, num_batches)
-    # Convert MSE loss to approximate perplexity
-    perplexity = np.exp(min(avg_loss, 10))  # Cap to prevent overflow
+    avg_nll = total_nll / max(1, total_tokens)
+    return float(np.exp(avg_nll))
 
-    return perplexity
+
+def distinct_n(texts: List[str], n: int) -> float:
+    """Compute distinct-n diversity metric.
+
+    Ratio of unique n-grams (whitespace-tokenized) to total n-grams across
+    all texts. Returns 0.0 if there are no n-grams.
+
+    Args:
+        texts: List of generated text strings
+        n: n-gram order (1 for unigrams, 2 for bigrams, etc.)
+
+    Returns:
+        Ratio of unique n-grams to total n-grams in [0, 1]
+    """
+    all_ngrams = []
+    for text in texts:
+        tokens = text.split()
+        ngrams = [tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+        all_ngrams.extend(ngrams)
+    if not all_ngrams:
+        return 0.0
+    return len(set(all_ngrams)) / len(all_ngrams)
+
+
+def self_bleu(texts: List[str]) -> Optional[float]:
+    """Compute self-BLEU diversity metric (mean pairwise BLEU).
+
+    Lower self-BLEU indicates higher diversity. Requires sacrebleu.
+    Returns None if sacrebleu is not available.
+
+    Args:
+        texts: List of generated text strings
+
+    Returns:
+        Mean pairwise corpus BLEU score (0-1), or None if sacrebleu unavailable
+    """
+    if corpus_bleu is None:
+        warnings.warn("sacrebleu not installed; self_bleu returning None. Install with: pip install sacrebleu")
+        return None
+
+    if len(texts) < 2:
+        return 0.0
+
+    scores = []
+    try:
+        for i, hypothesis in enumerate(texts):
+            references = [t for j, t in enumerate(texts) if j != i]
+            score = corpus_bleu([hypothesis], [references])
+            scores.append(score.score / 100.0)
+        return float(np.mean(scores)) if scores else 0.0
+    except Exception as e:
+        warnings.warn(f"Failed to compute self-BLEU: {e}")
+        return None
