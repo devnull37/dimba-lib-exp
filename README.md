@@ -9,7 +9,7 @@
 
 DIMBA is a research-grade language model that combines the power of diffusion models with Mamba-2 State Space Models (SSM) to enable **fast, parallel text generation**. Unlike traditional autoregressive models that generate tokens one-by-one, DIMBA generates entire sequences simultaneously through iterative denoising.
 
-🔬 **Research Paper**: *"DIMBA: Revolutionizing Theoretical Ultra-Fast Inference and Advanced Reasoning with Mamba-Based Diffusion"* — Faris Allafi (2025)
+🔬 **Research Paper**: [*"DIMBA: Revolutionizing Theoretical Ultra-Fast Inference and Advanced Reasoning with Mamba-Based Diffusion"*](https://doi.org/10.55277/researchhub.lu30m581.2) — Faris Allafi (2025)
 
 🌐 **Website**: [dimbalabs.xyz](https://dimbalabs.xyz)  
 👤 **Author**: [farisallafi.xyz](https://farisallafi.xyz)
@@ -18,7 +18,7 @@ DIMBA is a research-grade language model that combines the power of diffusion mo
 
 ## 🆕 What's New — v2 Overhaul
 
-DIMBA v2 (branch `feature/dimba-v2-overhaul`) is a substantial correctness and research upgrade over the v1 concept paper:
+DIMBA v2 (now merged into `main`) is a substantial correctness and research upgrade over the v1 concept paper:
 
 - **Bidirectional Mamba denoiser** — non-autoregressive denoising now sees the whole sequence (forward + backward scans) rather than a causal left-to-right view.
 - **Self-conditioning** — the denoiser is fed its own previous estimate (Analog Bits / SED), a large quality boost for latent diffusion.
@@ -391,7 +391,7 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 - 🌐 **Website**: [dimbalabs.xyz](https://dimbalabs.xyz)
 - 👤 **Author**: [farisallafi.xyz](https://farisallafi.xyz)
-- 📄 **Paper**: Available in the `paper/` directory
+- 📄 **Paper**: [Published on ResearchHub (DOI)](https://doi.org/10.55277/researchhub.lu30m581.2) · also in the `paper/` directory
 - 💻 **Repository**: [github.com/devnull37/dimba-lib-exp](https://github.com/devnull37/dimba-lib-exp)
 - 🐛 **Issues**: [GitHub Issues](https://github.com/devnull37/dimba-lib-exp/issues)
 
