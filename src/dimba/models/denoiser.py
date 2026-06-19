@@ -18,6 +18,7 @@ import math
 import warnings
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 from typing import Literal, Optional
 
@@ -87,6 +88,47 @@ def _make_mixer(
         return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
 
 
+class _BlockFFN(nn.Module):
+    """Position-wise feed-forward sub-layer for a Mamba block (channel-mixing).
+
+    A Mamba block mixes *tokens* but has no dedicated *channel*-mixing / memory module
+    the way a Transformer block's MLP does. This optional sub-layer adds one, in either
+    of the two shapes used by real LLMs so a teacher's FFN weights can be inherited
+    directly (MOHAWK-style cross-architecture distillation):
+
+      * ``"mlp"``    -> ``ff2(gelu(ff1(x)))``  (GPT-2 / Pythia / BERT; ``hidden = mult*d``).
+      * ``"swiglu"`` -> ``down(silu(gate(x)) * up(x))``  (Llama / Qwen / Mistral).
+
+    Submodule names (``ff1``/``ff2``; ``gate_proj``/``up_proj``/``down_proj``) match the
+    corresponding HuggingFace modules so weight transfer is a plain ``copy_``.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        mult: int = 4,
+        ffn_type: str = "mlp",
+        hidden: Optional[int] = None,
+    ):
+        super().__init__()
+        self.ffn_type = ffn_type
+        self.hidden = int(hidden) if hidden is not None else mult * d_model
+        if ffn_type == "mlp":
+            self.ff1 = nn.Linear(d_model, self.hidden)
+            self.ff2 = nn.Linear(self.hidden, d_model)
+        elif ffn_type == "swiglu":
+            self.gate_proj = nn.Linear(d_model, self.hidden, bias=False)
+            self.up_proj = nn.Linear(d_model, self.hidden, bias=False)
+            self.down_proj = nn.Linear(self.hidden, d_model, bias=False)
+        else:
+            raise ValueError(f"Unknown ffn_type: {ffn_type!r} (expected 'mlp' or 'swiglu')")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.ffn_type == "swiglu":
+            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.ff2(F.gelu(self.ff1(x)))
+
+
 class Mamba2Block(nn.Module):
     """Pre-norm Mamba block with an optional bidirectional scan and residual.
 
@@ -109,6 +151,10 @@ class Mamba2Block(nn.Module):
         bidirectional: bool = True,
         use_simple_mamba: bool = False,
         bidir_merge: str = "sum",
+        block_ffn: bool = False,
+        ffn_mult: int = 4,
+        ffn_type: str = "mlp",
+        ffn_hidden: Optional[int] = None,
         # Accepted for backward compatibility; only used by the Mamba-1 kernel.
         dt_rank: str = "auto",
         dt_min: float = 0.001,
@@ -141,6 +187,16 @@ class Mamba2Block(nn.Module):
                     torch.cat([torch.eye(d_model), torch.eye(d_model)], dim=1)
                 )
 
+        # Optional position-wise FFN sub-layer (channel-mixing). Off by default so the
+        # mixer-only block and existing checkpoints are byte-for-byte unchanged. When
+        # enabled it adds the channel-mixing/memory capacity a mixer lacks and a slot
+        # to inherit a Transformer teacher's MLP weights (cross-architecture distill).
+        self.norm2 = None
+        self.ffn = None
+        if block_ffn:
+            self.norm2 = nn.LayerNorm(d_model)
+            self.ffn = _BlockFFN(d_model, mult=ffn_mult, ffn_type=ffn_type, hidden=ffn_hidden)
+
     def _mix(self, h: torch.Tensor) -> torch.Tensor:
         """(Bi)directional SSM mix of an already-normalized input (no residual)."""
         y = self.mamba_fwd(h)
@@ -153,8 +209,11 @@ class Mamba2Block(nn.Module):
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Pre-norm + (bi)directional mix + residual (FiLM / additive path)."""
-        return x + self._mix(self.norm(x))
+        """Pre-norm + (bi)directional mix + residual, then optional FFN sub-layer."""
+        x = x + self._mix(self.norm(x))
+        if self.ffn is not None:
+            x = x + self.ffn(self.norm2(x))
+        return x
 
     def forward_adaln(
         self,
@@ -163,10 +222,39 @@ class Mamba2Block(nn.Module):
         shift: torch.Tensor,
         gate: torch.Tensor,
     ) -> torch.Tensor:
-        """AdaLN-Zero variant: norm -> (1+scale)*h+shift -> mix -> x + gate*y."""
+        """AdaLN-Zero variant: norm -> (1+scale)*h+shift -> mix -> x + gate*y, then FFN."""
         h = self.norm(x)
         h = h * (1 + scale) + shift
-        return x + gate * self._mix(h)
+        x = x + gate * self._mix(h)
+        if self.ffn is not None:
+            x = x + self.ffn(self.norm2(x))
+        return x
+
+    def materialize_matrices(self, h_normed: torch.Tensor):
+        """Return ``(M_fwd, M_bwd)`` per-head token-mixing matrices for a mixer input.
+
+        ``h_normed`` is the *already-normalized, conditioned* tensor the block feeds to
+        its mixer (see :meth:`Mamba2Denoiser._mixer_input`). ``M_fwd`` ``[B, H, L, L]``
+        is causal (lower-triangular); ``M_bwd`` ``[B, H, L, L]`` is the backward scan's
+        matrix re-expressed in the original position basis (upper-triangular), or
+        ``None`` when the block is unidirectional. These are the MOHAWK Stage-1 student
+        matrices, directly comparable to a causal teacher's ``tril(A)`` / ``triu(A)``.
+        """
+        if not hasattr(self.mamba_fwd, "materialize_mixing_matrix"):
+            raise NotImplementedError(
+                "Matrix-orientation distillation requires a mixer exposing "
+                "materialize_mixing_matrix; use use_simple_mamba=False (TorchMamba2)."
+            )
+        m_fwd = self.mamba_fwd.materialize_mixing_matrix(h_normed)
+        m_bwd = None
+        if self.bidirectional and self.mamba_bwd is not None:
+            m_bwd_flipped = self.mamba_bwd.materialize_mixing_matrix(
+                torch.flip(h_normed, dims=[1])
+            )
+            # The backward mixer ran on the flipped sequence; flip both sequence axes
+            # of its matrix back to the original position basis (-> upper-triangular).
+            m_bwd = torch.flip(m_bwd_flipped, dims=[2, 3])
+        return m_fwd, m_bwd
 
 
 class Mamba2Denoiser(nn.Module):
@@ -206,6 +294,10 @@ class Mamba2Denoiser(nn.Module):
         use_simple_mamba: bool = False,
         use_gradient_checkpointing: bool = False,
         bidir_merge: str = "sum",
+        block_ffn: bool = False,
+        ffn_mult: int = 4,
+        ffn_type: str = "mlp",
+        ffn_hidden: Optional[int] = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -224,6 +316,10 @@ class Mamba2Denoiser(nn.Module):
                     bidirectional=bidirectional,
                     use_simple_mamba=use_simple_mamba,
                     bidir_merge=bidir_merge,
+                    block_ffn=block_ffn,
+                    ffn_mult=ffn_mult,
+                    ffn_type=ffn_type,
+                    ffn_hidden=ffn_hidden,
                 )
                 for _ in range(num_layers)
             ]
@@ -253,16 +349,24 @@ class Mamba2Denoiser(nn.Module):
         x: torch.Tensor,
         cond: torch.Tensor,
         timestep_emb: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        return_hidden_states: bool = False,
+        return_matrices: bool = False,
+    ):
         """Denoise ``x`` conditioned on ``cond`` (prompt) and ``timestep_emb``.
 
         Args:
             x: Noisy latents ``[B, L, d_model]``.
             cond: Conditioning ``[B, L, cond_dim]`` (broadcast over L is fine).
             timestep_emb: Timestep embedding ``[B, time_embed_dim]``.
+            return_hidden_states: Also collect the residual-stream input to each block.
+            return_matrices: Also materialize each block's ``(fwd, bwd)`` mixing matrices.
 
         Returns:
-            Denoised latents ``[B, L, d_model]``.
+            Denoised latents ``[B, L, d_model]`` by default. When ``return_hidden_states``
+            or ``return_matrices`` is set, returns ``(out, info)`` where ``info`` carries
+            ``hidden_states`` / ``block_outputs`` (lists of ``[B, L, d_model]``) and
+            ``matrices_fwd`` / ``matrices_bwd`` (lists of ``[B, H, L, L]`` or ``None``).
         """
         # Broadcast the timestep embedding across the sequence and add to cond.
         time_cond = self.time_proj(timestep_emb).unsqueeze(1)  # [B, 1, cond_dim]
@@ -270,21 +374,57 @@ class Mamba2Denoiser(nn.Module):
         combined_cond = cond + time_cond
 
         output = x
+        if not (return_hidden_states or return_matrices):
+            for block, cond_layer in zip(self.blocks, self.conditioning):
+                if self.use_gradient_checkpointing and self.training:
+                    # use_reentrant=False is the DDP-safe variant and correctly
+                    # restores RNG state for the dropout inside _block_forward.
+                    output = _checkpoint(
+                        self._block_forward,
+                        block,
+                        cond_layer,
+                        output,
+                        combined_cond,
+                        use_reentrant=False,
+                    )
+                else:
+                    output = self._block_forward(block, cond_layer, output, combined_cond)
+            return output
+
+        # Distillation-alignment collection path: capture per-block intermediates.
+        # Gradient checkpointing is bypassed here so the captured tensors are real
+        # graph nodes the alignment losses can backprop through.
+        hidden_states, block_outputs, mats_fwd, mats_bwd = [], [], [], []
         for block, cond_layer in zip(self.blocks, self.conditioning):
-            if self.use_gradient_checkpointing and self.training:
-                # use_reentrant=False is the DDP-safe variant and correctly
-                # restores RNG state for the dropout inside _block_forward.
-                output = _checkpoint(
-                    self._block_forward,
-                    block,
-                    cond_layer,
-                    output,
-                    combined_cond,
-                    use_reentrant=False,
-                )
-            else:
-                output = self._block_forward(block, cond_layer, output, combined_cond)
-        return output
+            if return_hidden_states:
+                hidden_states.append(output)
+            if return_matrices:
+                h_normed = self._mixer_input(block, cond_layer, output, combined_cond)
+                m_fwd, m_bwd = block.materialize_matrices(h_normed)
+                mats_fwd.append(m_fwd)
+                mats_bwd.append(m_bwd)
+            output = self._block_forward(block, cond_layer, output, combined_cond)
+            block_outputs.append(output)
+        info = {
+            "hidden_states": hidden_states,
+            "block_outputs": block_outputs,
+            "matrices_fwd": mats_fwd,
+            "matrices_bwd": mats_bwd,
+        }
+        return output, info
+
+    def _mixer_input(self, block, cond_layer, x, combined_cond):
+        """Reconstruct the normalized, conditioned tensor a block feeds to its mixer.
+
+        Mirrors :meth:`_block_forward` up to (but excluding) the SSM mix, so the
+        matrices from :meth:`Mamba2Block.materialize_matrices` correspond exactly to
+        what that block computes for this input.
+        """
+        if self.conditioning_type == "adaln":
+            scale, shift, _gate = cond_layer(combined_cond)
+            h = block.norm(x)
+            return h * (1 + scale) + shift
+        return block.norm(cond_layer(x, combined_cond))
 
     def _block_forward(self, block, cond_layer, x, combined_cond):
         """Condition + mix + dropout for a single denoiser block."""

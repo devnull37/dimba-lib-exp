@@ -93,6 +93,10 @@ class DIMBA(nn.Module):
         head_type: str = "linear",
         head_attn_layers: int = 2,
         head_attn_heads: int = 4,
+        block_ffn: bool = False,
+        ffn_mult: int = 4,
+        ffn_type: str = "mlp",
+        ffn_hidden: Optional[int] = None,
     ):
         super().__init__()
 
@@ -224,6 +228,10 @@ class DIMBA(nn.Module):
             use_simple_mamba=use_simple_mamba,
             use_gradient_checkpointing=use_gradient_checkpointing,
             bidir_merge=bidir_merge,
+            block_ffn=block_ffn,
+            ffn_mult=ffn_mult,
+            ffn_type=ffn_type,
+            ffn_hidden=ffn_hidden,
         )
 
         # Output head
@@ -287,6 +295,10 @@ class DIMBA(nn.Module):
             head_type=head_type,
             head_attn_layers=head_attn_layers,
             head_attn_heads=head_attn_heads,
+            block_ffn=block_ffn,
+            ffn_mult=ffn_mult,
+            ffn_type=ffn_type,
+            ffn_hidden=ffn_hidden,
         )
 
     @property
@@ -568,6 +580,63 @@ class DIMBA(nn.Module):
         z0_hat = self._to_x0_latent(z, raw, t_idx)  # convert v->x0 when prediction_type='v'
         x_dec = self.decode_latent(z0_hat)
         return self.output_head(x_dec, embedding_weight=self.token_embed.get_weight())
+
+    def align_forward(
+        self,
+        input_ids: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        *,
+        return_hidden_states: bool = True,
+        return_matrices: bool = False,
+        drop_cond: bool = True,
+    ) -> Dict[str, object]:
+        """Clean (noise-free) pass through the denoiser for distillation alignment.
+
+        Unlike :meth:`forward`, **no diffusion noise is added**: token embeddings are
+        encoded to the diffusion latent and denoised at timestep ``t`` (default 0, the
+        lowest-noise state) with null (or pooled-prompt) conditioning. This isolates the
+        sequence-mixing / per-layer representations so a Transformer teacher can be
+        matched against them (MOHAWK Stage 1 = mixing matrices, Stage 2 = hidden states).
+
+        Args:
+            input_ids: Token ids ``[B, L]``.
+            t: Optional timesteps ``[B]`` (default all-zero).
+            return_hidden_states: Collect the residual-stream input to each block.
+            return_matrices: Materialize each block's ``(fwd, bwd)`` mixing matrices
+                (requires a TorchMamba2 mixer, i.e. ``use_simple_mamba=False``).
+            drop_cond: Use the null conditioning (default) rather than the pooled prompt.
+
+        Returns:
+            Dict with ``block_inputs`` / ``block_outputs`` (lists ``[B, L, d_latent]``),
+            ``matrices_fwd`` / ``matrices_bwd`` (lists ``[B, H, L, L]`` or ``None``), and
+            ``denoiser_out`` ``[B, L, d_latent]``.
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        z = self.encode_latent(self.token_embed(input_ids))  # clean latent, no noise
+        if t is None:
+            t = torch.zeros(batch_size, dtype=torch.long, device=device)
+        pooled = None if drop_cond else self._pooled_prompt(input_ids, None)
+        cond = self._build_conditioning(pooled, batch_size, device)
+        # Self-conditioning: feed a zero prior estimate, matching :meth:`_denoiser_raw`.
+        if self.self_conditioning and self.self_cond_proj is not None:
+            denoiser_in = self.self_cond_proj(torch.cat([z, torch.zeros_like(z)], dim=-1))
+        else:
+            denoiser_in = z
+        out, info = self.denoiser(
+            denoiser_in,
+            cond,
+            self.timestep_embed(t),
+            return_hidden_states=return_hidden_states,
+            return_matrices=return_matrices,
+        )
+        return {
+            "block_inputs": info["hidden_states"],
+            "block_outputs": info["block_outputs"],
+            "matrices_fwd": info["matrices_fwd"],
+            "matrices_bwd": info["matrices_bwd"],
+            "denoiser_out": out,
+        }
 
     def get_noise_schedule(self) -> CosineNoiseSchedule:
         """Access the noise schedule."""
