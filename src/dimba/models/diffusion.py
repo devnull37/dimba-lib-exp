@@ -437,6 +437,16 @@ class DIMBA(nn.Module):
         x_self_cond: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Run the denoiser and return its *raw* prediction (x0 or v per prediction_type)."""
+        # Single chokepoint for EVERY denoiser call (training forward, sampling,
+        # denoise_to_x0_latent). x_t / cond can arrive as fp32 — the noising and the
+        # sampling loop do fp32 timestep math that promotes them — but the denoiser
+        # weights are the model dtype (e.g. bf16) and matmuls require an exact dtype
+        # match (the FFN's gate_proj is the first to fail). Coerce here so no caller
+        # can leak an fp32 tensor into the denoiser.
+        param_dtype = next(self.denoiser.parameters()).dtype
+        x_t = x_t.to(param_dtype)
+        if cond is not None:
+            cond = cond.to(param_dtype)
         if self.self_conditioning and self.self_cond_proj is not None:
             sc = x_self_cond if x_self_cond is not None else torch.zeros_like(x_t)
             denoiser_in = self.self_cond_proj(torch.cat([x_t, sc], dim=-1))
@@ -514,6 +524,14 @@ class DIMBA(nn.Module):
             x_t = self.flow_schedule.forward_process(z_0, noise, t_cont)
         else:
             x_t, noise = self.noise_schedule.add_noise(z_0, t, noise)
+        # The noising can upcast to fp32 (flow t_cont is fp32; the discrete schedule's
+        # buffers may be fp32 too), but the denoiser weights are the model dtype (e.g.
+        # bf16). Elementwise ops silently promote, but matmuls require an exact dtype
+        # match (the FFN's gate_proj is the first to fail). Keep x_t / noise in the
+        # latent dtype so the whole denoiser pass is dtype-consistent.
+        x_t = x_t.to(z_0.dtype)
+        if noise is not None:
+            noise = noise.to(z_0.dtype)
         diffuse_mask = None
         if prompt_mask is not None:
             keep = prompt_mask.unsqueeze(-1)  # [B, L, 1] bool

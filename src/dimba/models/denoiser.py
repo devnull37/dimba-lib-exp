@@ -686,6 +686,14 @@ class DenoisingHead(nn.Module):
         Returns:
             Token logits ``[B, L, vocab_size]``.
         """
+        # The sampler/decoder can hand us an fp32 tensor (fp32 timestep math upcasts the
+        # latent), but the head's matmuls need an exact dtype match. Cast to the head dtype.
+        if self.use_weight_tying:
+            _ew = embedding_weight if embedding_weight is not None else self.embedding_weight
+            x = x.to(_ew.dtype)
+        elif isinstance(self.projection, nn.Linear):
+            x = x.to(self.projection.weight.dtype)
+
         # Context-aware mixing (no-op for head_type=="linear").
         if self.attn_blocks is not None:
             for blk in self.attn_blocks:
