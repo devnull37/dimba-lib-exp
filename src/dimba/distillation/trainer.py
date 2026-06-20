@@ -206,10 +206,10 @@ class DistillationTrainer:
         self.head_aligners: nn.ModuleList = nn.ModuleList(head_aligner_list)
         self.projectors: nn.ModuleList = nn.ModuleList(projector_list)
 
-        # Move auxiliary modules to the same device as the student model.
-        _student_device = next(model.parameters()).device
-        self.head_aligners.to(_student_device)
-        self.projectors.to(_student_device)
+        # Move auxiliary modules to the same device AND dtype as the student model.
+        _student_param = next(model.parameters())
+        self.head_aligners.to(device=_student_param.device, dtype=_student_param.dtype)
+        self.projectors.to(device=_student_param.device, dtype=_student_param.dtype)
 
         logger.info(
             "DistillationTrainer: %d student blocks, d_latent=%d, d_teacher=%d, "
