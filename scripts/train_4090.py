@@ -29,7 +29,7 @@ GRPO domain options:
     --grpo-data math   OrcaMath only (default)
     --grpo-data code   Bespoke-Stratos code split only
     --grpo-data seq    Sequential: math RL (1 K steps) → code RL (1 K steps)
-    --grpo-data both   Math + SmolTalk mixed
+    --grpo-data both   Sequential: math RL (num_steps//2) → SmolTalk/general RL (num_steps//2)
 
 Flow matching is ON by default (15 Euler steps ≈ 2× faster inference than 30 DPM++ steps).
 
@@ -69,7 +69,7 @@ from dimba.training.grpo import (
 )
 from dimba.data.cot_dataset import SmolTalkDataset, OrcaMathDataset, BlockCoTDataset
 from dimba.data.frontier_cot import (
-    FrontierCoTMix, BespokeStratosDataset, OpenThoughtsDataset,
+    FrontierCoTMix, BespokeStratosDataset,
 )
 
 logging.basicConfig(
@@ -256,23 +256,41 @@ def _build_or_load_model(
 ) -> DIMBA:
     if checkpoint and os.path.isfile(checkpoint):
         logger.info("loading model from checkpoint: %s", checkpoint)
+        import inspect
         ckpt = torch.load(checkpoint, map_location="cpu")
-        cfg = ckpt.get("config", STUDENT_CFG)
+        sd = ckpt["model_state_dict"]
+        cfg = ckpt.get("config")
+        dimba_params = set(inspect.signature(DIMBA.__init__).parameters) - {"self"}
+        if not (isinstance(cfg, dict) and "vocab_size" in cfg and set(cfg) <= dimba_params):
+            raise ValueError(
+                f"checkpoint {checkpoint} has no usable DIMBA model config "
+                f"(found keys: {sorted(cfg) if isinstance(cfg, dict) else type(cfg)}). "
+                "Re-save it with model.config, or rebuild from teacher.")
+        # Trust the tensors over the recorded config for vocab_size (resize may have grown it).
+        emb_key = next(k for k in sd if k.endswith("token_embed.embedding.weight"))
+        true_vocab = sd[emb_key].shape[0]
+        cfg = {**cfg, "vocab_size": true_vocab}
         model = DIMBA(**cfg)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        model.load_state_dict(sd, strict=True)
     else:
         logger.info("building fresh student model (Mode A: inherit teacher weights)")
-        teacher = TeacherWrapper(TEACHER_MODEL, device=str(device))
+        _build_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        teacher = TeacherWrapper(TEACHER_MODEL, device=str(device), dtype=_build_dtype)
         model, _layer_map = build_student_from_teacher(
             teacher,
             num_diffusion_steps=1000,
             d_state=64,
             d_conv=4,
             expand=2,
-            conditioning_type="adaln",
-            use_flow_matching=True,
-            flow_logit_normal=True,
+            conditioning_type=STUDENT_CFG["conditioning_type"],
+            use_flow_matching=STUDENT_CFG["use_flow_matching"],
+            flow_logit_normal=STUDENT_CFG["flow_logit_normal"],
+            use_weight_tying=True,
             use_simple_mamba=False,
+            block_ffn=DISTILL_CFG["block_ffn"],
+            inherit_embeddings=DISTILL_CFG["inherit_embeddings"],
+            inherit_ffn=DISTILL_CFG["inherit_ffn"],
+            inherit_head=DISTILL_CFG["inherit_head"],
         )
         teacher.unload()
 
@@ -356,6 +374,7 @@ def _sft_loop(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     global_step = start_step
     opt_step = 0
+    running_loss, running_n = 0.0, 0
     model.train()
 
     for epoch in range(cfg["num_epochs"]):
@@ -364,13 +383,16 @@ def _sft_loop(
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
             response_mask = batch["response_mask"].to(device)
+            prompt_mask = batch["prompt_mask"].to(device)
 
             # Sample random diffusion timesteps — DIMBA.forward requires t.
             t = torch.randint(
                 0, model.num_diffusion_steps, (input_ids.shape[0],), device=device
             )
             # Model is bf16 natively — no autocast or GradScaler needed.
-            x_pred, _, _ = model(input_ids, t)
+            # Pass prompt_mask so the prompt stays clean and pooled conditioning
+            # is built from it, matching the conditioning path used at inference.
+            x_pred, _, _ = model(input_ids, t, prompt_mask=prompt_mask)
             # Pass live embedding weight so weight-tying stays correct after resize.
             logits = model.output_head(x_pred, embedding_weight=model.token_embed.get_weight())
             loss_per_token = F.cross_entropy(
@@ -382,6 +404,9 @@ def _sft_loop(
                    / response_mask.sum().clamp(min=1)
             (loss / accum).backward()
 
+            running_loss += loss.item()
+            running_n += 1
+
             micro_step += 1
             if micro_step % accum == 0:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
@@ -390,24 +415,28 @@ def _sft_loop(
                 opt_step += 1
                 scheduler.step()
 
+                # Log and save keyed on optimizer steps (not micro-batch steps)
+                # so cadence is independent of grad_accum.
+                if opt_step % cfg["log_interval"] == 0:
+                    lr_now = scheduler.get_last_lr()[0]
+                    avg_loss = running_loss / max(1, running_n)
+                    logger.info("%s step %d | loss=%.4f | lr=%.2e",
+                                label, opt_step, avg_loss, lr_now)
+                    _write_state({"stage": label, "step": opt_step,
+                                  "loss": avg_loss, "lr": lr_now})
+                    running_loss, running_n = 0.0, 0
+
+                if opt_step % cfg["save_interval"] == 0:
+                    ckpt_path = os.path.join(save_dir, f"sft_step{opt_step}.pt")
+                    torch.save({
+                        "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
+                        "config": getattr(model, "config", STUDENT_CFG),
+                        "step": opt_step,
+                        "phase": label,
+                    }, ckpt_path)
+                    logger.info("saved → %s", ckpt_path)
+
             global_step += 1
-
-            if global_step % cfg["log_interval"] == 0:
-                lr_now = scheduler.get_last_lr()[0]
-                logger.info("%s step %d | loss=%.4f | lr=%.2e",
-                            label, global_step, loss.item(), lr_now)
-                _write_state({"stage": label, "step": global_step,
-                              "loss": loss.item(), "lr": lr_now})
-
-            if global_step % cfg["save_interval"] == 0:
-                ckpt_path = os.path.join(save_dir, f"sft_step{global_step}.pt")
-                torch.save({
-                    "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
-                    "config": getattr(model, "config", STUDENT_CFG),
-                    "step": global_step,
-                    "phase": label,
-                }, ckpt_path)
-                logger.info("saved → %s", ckpt_path)
 
         # Flush any remaining accumulated gradients at epoch end.
         if micro_step % accum != 0:
@@ -417,7 +446,7 @@ def _sft_loop(
             opt_step += 1
             scheduler.step()
 
-    return global_step
+    return opt_step
 
 
 # ── phase 1: distillation ─────────────────────────────────────────────────────
@@ -474,12 +503,23 @@ def run_distill(
 
     cfg = DistillationConfig.from_dict({**DISTILL_CFG, "device": str(device)})
 
-    teacher = TeacherWrapper(TEACHER_MODEL, device=str(device))
+    compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    teacher = TeacherWrapper(TEACHER_MODEL, device=str(device), dtype=compute_dtype)
     model, _layer_map = build_student_from_teacher(
         teacher,
-        use_flow_matching=True,
-        flow_logit_normal=True,
-        conditioning_type="adaln",
+        num_diffusion_steps=1000,
+        d_state=64,
+        d_conv=4,
+        expand=2,
+        conditioning_type=STUDENT_CFG["conditioning_type"],
+        use_flow_matching=STUDENT_CFG["use_flow_matching"],
+        flow_logit_normal=STUDENT_CFG["flow_logit_normal"],
+        use_weight_tying=True,
+        use_simple_mamba=False,
+        block_ffn=DISTILL_CFG["block_ffn"],
+        inherit_embeddings=DISTILL_CFG["inherit_embeddings"],
+        inherit_ffn=DISTILL_CFG["inherit_ffn"],
+        inherit_head=DISTILL_CFG["inherit_head"],
     )
 
     if resume and os.path.isfile(resume):
@@ -540,13 +580,26 @@ def run_sft(
     os.makedirs(save_dir, exist_ok=True)
     logger.info("=== PHASE 2: SFT (two-stage block-CoT) ===")
 
+    if resume:
+        logger.warning(
+            "SFT resume is not implemented; --resume is ignored for the SFT phase, "
+            "optimizer/step state will restart from 0. Only model weights are loaded "
+            "via the positional checkpoint argument."
+        )
+
     model = _build_or_load_model(checkpoint, device)
     tokenizer = _load_tokenizer(TEACHER_MODEL)
 
-    think_start_id = (tokenizer.convert_tokens_to_ids("<think>")
-                      if "<think>" in tokenizer.get_vocab() else None)
-    think_end_id = (tokenizer.convert_tokens_to_ids("</think>")
-                    if "</think>" in tokenizer.get_vocab() else None)
+    # Add <think>/</think> special tokens before compile so the embedding resize
+    # happens as a structural mutation. Mirrors the run_grpo path so SFT trains
+    # on the same block-CoT delimiters GRPO uses.
+    if "<think>" not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
+        model.token_embed.resize(len(tokenizer))
+        if hasattr(model.output_head, "embedding_weight"):
+            model.output_head.embedding_weight = model.token_embed.get_weight()
+    think_start_id = tokenizer.convert_tokens_to_ids("<think>")
+    think_end_id = tokenizer.convert_tokens_to_ids("</think>")
 
     # Compile after all structural mutations are done.
     if device.type == "cuda":
@@ -603,7 +656,7 @@ def run_sft(
 
 # ── phase 3: GRPO ─────────────────────────────────────────────────────────────
 
-def _load_grpo_data(data: str, num_steps: int):
+def _load_grpo_data(data: str):
     """Load prompt/reference lists for the given GRPO domain.
 
     Returns a list of (prompts, references, label) tuples, one per domain pass.
@@ -742,7 +795,7 @@ def run_grpo(
     if device.type == "cuda":
         model = torch.compile(model, mode="reduce-overhead")
 
-    passes = _load_grpo_data(data, num_steps)
+    passes = _load_grpo_data(data)
 
     # For sequential (math → code): split steps evenly across passes.
     steps_per_pass = num_steps // len(passes)
@@ -791,7 +844,7 @@ def parse_args() -> argparse.Namespace:
                        "'math'/'orca' = OrcaMath only; "
                        "'code' = Bespoke-Stratos; "
                        "'seq' = sequential math→code; "
-                       "'both' = math + SmolTalk mixed"
+                       "'both' = sequential math→general (SmolTalk)"
                    ))
     p.add_argument("--teacher", default=TEACHER_MODEL,
                    help=f"HuggingFace teacher model (default: {TEACHER_MODEL})")
@@ -829,6 +882,20 @@ def main() -> None:
     # Normalise alias: --grpo-data orca is the same as math
     grpo_data = args.grpo_data if args.grpo_data != "orca" else "math"
 
+    # user_ckpt is the checkpoint the user provided via --checkpoint.
+    # --resume is only meaningful for a single explicitly-selected phase: it
+    # restores optimizer/scheduler state from that same checkpoint. In --phase all
+    # mode the cross-phase weight handoff (distill->sft->grpo) uses the positional
+    # checkpoint argument; passing auto-generated previous-phase final.pt as
+    # resume= would inject an SFT-only file into GRPOTrainer.load_checkpoint,
+    # which only makes sense for genuine GRPO checkpoints.
+    user_ckpt = args.checkpoint
+
+    def _resume_for(phase: str) -> Optional[str]:
+        # Within-phase resume is only meaningful when the user explicitly selects
+        # that single phase AND provides a checkpoint that was saved by that phase.
+        return user_ckpt if (args.resume and args.phase == phase) else None
+
     ckpt = args.checkpoint
 
     hf_kw = dict(hf_token=args.hf_token, hf_repo=args.hf_repo)
@@ -836,15 +903,15 @@ def main() -> None:
         logger.info("HuggingFace upload enabled → %s", args.hf_repo)
 
     if args.phase in ("distill", "all"):
-        ckpt = run_distill(device, resume=ckpt if args.resume else None, **hf_kw)
+        ckpt = run_distill(device, resume=_resume_for("distill"), **hf_kw)
 
     if args.phase in ("sft", "all"):
-        ckpt = run_sft(ckpt, device, resume=ckpt if args.resume else None,
+        ckpt = run_sft(ckpt, device, resume=_resume_for("sft"),
                        use_frontier=not args.no_frontier, **hf_kw)
 
     if args.phase in ("grpo", "all"):
         ckpt = run_grpo(ckpt, device,
-                        resume=ckpt if args.resume else None,
+                        resume=_resume_for("grpo"),
                         num_steps=args.grpo_steps,
                         data=grpo_data,
                         **hf_kw)

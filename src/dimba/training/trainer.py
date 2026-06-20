@@ -154,6 +154,11 @@ def compute_dimba_losses(
     diffuse_mask = info.get("diffuse_mask")
 
     # --- diffusion regression (min-SNR weighted), in latent space ---
+    if getattr(model, "use_flow_matching", False) and model.prediction_type == "v":
+        raise ValueError(
+            "prediction_type='v' is not supported with use_flow_matching=True; "
+            "flow matching uses raw x0 prediction (set prediction_type='x0')."
+        )
     if model.prediction_type == "v":
         target = model.noise_schedule.velocity(info["z_0"], info["noise"], t)
         pred = info["pred_raw"]
@@ -175,11 +180,22 @@ def compute_dimba_losses(
     else:
         per_sample = per_pos.mean(dim=1)
 
-    snr = model.noise_schedule.snr(t)
-    weight = torch.clamp(snr, max=min_snr_gamma)
-    if model.prediction_type == "v":
-        weight = weight / (snr + 1.0)
-    weight = weight.clamp(min=1e-3)
+    if getattr(model, "use_flow_matching", False):
+        # Match forward(): t is a discrete index -> continuous noise level.
+        t_cont = t.float() / (model.num_diffusion_steps - 1)
+        t_cont = t_cont.clamp(1e-5, 1.0 - 1e-5)
+        snr_flow = ((1.0 - t_cont) / t_cont) ** 2  # SNR of x_t=(1-t)z0+t*eps
+        weight = torch.clamp(snr_flow, max=min_snr_gamma)
+        if model.prediction_type == "v":
+            # flow velocity target has unit-ish scale; SNR+1 normalization keeps min-SNR-v consistent
+            weight = weight / (snr_flow + 1.0)
+        weight = weight.clamp(min=1e-3)
+    else:
+        snr = model.noise_schedule.snr(t)
+        weight = torch.clamp(snr, max=min_snr_gamma)
+        if model.prediction_type == "v":
+            weight = weight / (snr + 1.0)
+        weight = weight.clamp(min=1e-3)
     diff_loss = (per_sample * weight).mean()
 
     # --- cross-entropy / rounding anchor ---
@@ -528,6 +544,7 @@ class DIMBALightningModule(pl.LightningModule):
             ce_loss_weight=self.ce_loss_weight,
             min_snr_gamma=self.min_snr_gamma,
             prompt_mask=batch.get("prompt_mask"),
+            loss_mask=batch.get("attention_mask"),
         )
 
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
@@ -550,6 +567,7 @@ class DIMBALightningModule(pl.LightningModule):
                 ce_loss_weight=self.ce_loss_weight,
                 min_snr_gamma=self.min_snr_gamma,
                 prompt_mask=batch.get("prompt_mask"),
+                loss_mask=batch.get("attention_mask"),
             )
             losses.append(loss)
 
@@ -720,6 +738,9 @@ class SimpleTrainer:
                 batch_size = input_ids.shape[0]
                 t = sample_timesteps(batch_size, self.model.num_diffusion_steps, torch.device(self.device))
 
+                _attn_mask = batch.get("attention_mask")
+                if _attn_mask is not None:
+                    _attn_mask = _attn_mask.to(self.device)
                 loss, _parts = compute_dimba_losses(
                     self.model,
                     input_ids,
@@ -727,6 +748,7 @@ class SimpleTrainer:
                     ce_loss_weight=self.ce_loss_weight,
                     min_snr_gamma=self.min_snr_gamma,
                     prompt_mask=batch.get("prompt_mask"),
+                    loss_mask=_attn_mask,
                 )
                 denoise_loss = _parts["diff_loss"]
 
@@ -817,6 +839,9 @@ class SimpleTrainer:
                 # generative failure) -- matches DIMBALightningModule.validation_step.
                 t = sample_timesteps(batch_size, self.model.num_diffusion_steps, torch.device(self.device))
 
+                _attn_mask = batch.get("attention_mask")
+                if _attn_mask is not None:
+                    _attn_mask = _attn_mask.to(self.device)
                 loss, _ = compute_dimba_losses(
                     self.model,
                     input_ids,
@@ -824,6 +849,7 @@ class SimpleTrainer:
                     ce_loss_weight=self.ce_loss_weight,
                     min_snr_gamma=self.min_snr_gamma,
                     prompt_mask=batch.get("prompt_mask"),
+                    loss_mask=_attn_mask,
                 )
                 val_loss += loss.item()
 

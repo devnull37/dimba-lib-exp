@@ -32,34 +32,38 @@ from ..diffusion.sampling import sample_from_model, sample_from_model_flow
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _repetition_ratio(block: torch.Tensor, prev_blocks: list[torch.Tensor]) -> float:
-    """Fraction of tokens in *block* that also appear (majority) in *prev_blocks*."""
-    if not prev_blocks:
-        return 0.0
-    flat = block.reshape(-1)
-    if flat.numel() == 0:
-        return 0.0
-    all_prev = torch.cat([b.reshape(-1) for b in prev_blocks])
-    prev_set = set(all_prev.tolist())
-    matches = sum(1 for t in flat.tolist() if t in prev_set)
-    return matches / flat.numel()
+def _degenerate_mask(
+    block: torch.Tensor,
+    eos_id: Optional[int],
+    rep_threshold: float,
+    prev_blocks: list[torch.Tensor],
+) -> torch.Tensor:
+    """Return a [B] bool tensor: True where row *i* of *block* looks degenerate.
 
+    Per-row degeneracy is checked independently so a single bad prompt cannot
+    terminate thinking for the whole batch.
+    """
+    B = block.shape[0]
+    mask = torch.zeros(B, dtype=torch.bool, device=block.device)
 
-def _is_degenerate(block: torch.Tensor, eos_id: Optional[int], rep_threshold: float = 0.85,
-                   prev_blocks: Optional[list] = None) -> bool:
-    """True if the block looks like padding/repetition and thinking should stop."""
-    flat = block.reshape(-1)
-    if flat.numel() == 0:
-        return True
-    # Mostly EOS/padding
+    if block.shape[1] == 0:
+        return torch.ones(B, dtype=torch.bool, device=block.device)
+
+    # Per-row EOS fraction
     if eos_id is not None:
-        eos_frac = (flat == eos_id).float().mean().item()
-        if eos_frac > 0.6:
-            return True
-    # Highly repetitive vs previous blocks
-    if prev_blocks and _repetition_ratio(block, prev_blocks) >= rep_threshold:
-        return True
-    return False
+        eos_frac = (block == eos_id).float().mean(dim=1)  # [B]
+        mask = mask | (eos_frac > 0.6)
+
+    # Per-row repetition against each row's own previous tokens
+    if prev_blocks:
+        prev = torch.cat(prev_blocks, dim=1)  # [B, prev_len]
+        rep = torch.stack([
+            torch.isin(block[i], prev[i]).float().mean()
+            for i in range(B)
+        ])  # [B]
+        mask = mask | (rep >= rep_threshold)
+
+    return mask
 
 
 # ── public API ───────────────────────────────────────────────────────────────
@@ -100,7 +104,7 @@ def block_sample_from_model(
           ``think_blocks``  — ``[B, n_actual, block_size]`` (only generated blocks)
           ``response``      — ``[B, response_len]``
           ``full_ids``      — ``[B, P + overhead + n*block_size + response_len]``
-          ``n_think_blocks``— int, how many blocks were actually generated
+          ``n_think_blocks``— ``[B]`` long tensor, per-row count of generated blocks
     """
     device = next(model.parameters()).device
 
@@ -114,9 +118,25 @@ def block_sample_from_model(
     prefix = prompt_ids  # [B, P] or None
 
     think_blocks: list[torch.Tensor] = []   # list of [B, block_size]
-    n_generated = 0
+    # Per-row counters and active mask (bugs 1, 2, 3: replace scalar with [B] tensors)
+    n_generated = torch.zeros(batch_size, dtype=torch.long, device=device)
+    active = torch.ones(batch_size, dtype=torch.bool, device=device)
+    fill_id = eos_id if eos_id is not None else 0
+
+    # Resolve sampler name per regime once, before the loop (bug 4)
+    use_flow = getattr(model, "use_flow_matching", False)
+    req_sampler = sample_kwargs.get("sampler")
+    if use_flow:
+        resolved_sampler = req_sampler if req_sampler in ("euler", "heun") else "euler"
+    else:
+        resolved_sampler = req_sampler if req_sampler in ("ddim", "dpmpp") else "ddim"
+    # Build a clean kwargs dict for the DDIM branch with the resolved sampler
+    ddim_kwargs = {**sample_kwargs, "sampler": resolved_sampler}
 
     for _ in range(num_think_blocks):
+        if not active.any():
+            break
+
         # Optionally prepend <think> to the prefix before sampling this block
         gen_prefix = prefix
         if think_start_id is not None:
@@ -124,20 +144,29 @@ def block_sample_from_model(
                                    dtype=torch.long, device=device)
             gen_prefix = torch.cat([gen_prefix, start_tok], dim=1) if gen_prefix is not None else start_tok
 
-        if getattr(model, "use_flow_matching", False):
+        if use_flow:
             block = sample_from_model_flow(
                 model, gen_prefix, seq_len=block_size,
                 num_steps=sample_kwargs.get("num_steps", 20),
-                sampler=sample_kwargs.get("sampler", "euler"),
+                sampler=resolved_sampler,
             )
         else:
-            block = sample_from_model(model, gen_prefix, block_size, **sample_kwargs)  # [B, block_size]
+            block = sample_from_model(model, gen_prefix, block_size, **ddim_kwargs)  # [B, block_size]
 
-        if adaptive_stop and _is_degenerate(block, eos_id, rep_threshold, think_blocks):
+        if adaptive_stop:
+            deg = _degenerate_mask(block, eos_id, rep_threshold, think_blocks)  # [B] bool
+            active = active & ~deg
+
+        if not active.any():
             break
 
+        # Freeze inactive rows: replace their tokens with fill_id so they
+        # do not corrupt the shared prefix for still-active rows.
+        block = torch.where(active.unsqueeze(1), block,
+                            torch.full_like(block, fill_id))
+
+        n_generated = n_generated + active.long()
         think_blocks.append(block)
-        n_generated += 1
 
         # Extend prefix with [<think>] block [</think>]
         parts = [prefix] if prefix is not None else []
@@ -149,14 +178,14 @@ def block_sample_from_model(
         prefix = torch.cat(parts, dim=1)
 
     # Generate final response conditioned on prefix (prompt + all think blocks)
-    if getattr(model, "use_flow_matching", False):
+    if use_flow:
         response = sample_from_model_flow(
             model, prefix, seq_len=response_len,
             num_steps=sample_kwargs.get("num_steps", 20),
-            sampler=sample_kwargs.get("sampler", "euler"),
+            sampler=resolved_sampler,
         )
     else:
-        response = sample_from_model(model, prefix, response_len, **sample_kwargs)
+        response = sample_from_model(model, prefix, response_len, **ddim_kwargs)
 
     full_ids = torch.cat([prefix, response], dim=1) if prefix is not None else response
 
@@ -229,7 +258,7 @@ class BlockCoTSampler:
         """Generate thinking + response.
 
         Returns the same dict as :func:`block_sample_from_model`, plus
-        ``think_token_count`` (int) for reward shaping.
+        ``think_token_count`` ([B] long tensor) for reward shaping.
         """
         result = block_sample_from_model(
             self.model,

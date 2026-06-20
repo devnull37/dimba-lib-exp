@@ -39,7 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .preference import elbo_sequence_logprob, antithetic_timesteps
-from .rewards import CompositeReward, NumericAnswerReward, ExactMatchReward, LengthPenaltyReward, Reward
+from .rewards import CompositeReward, NumericAnswerReward, ExactMatchReward, RegexMatchReward, LengthPenaltyReward, Reward
 from ..inference.block_cot import block_sample_from_model
 
 logger = logging.getLogger(__name__)
@@ -119,11 +119,29 @@ def _compute_elbo_logprob(
     mc_samples: int,
     antithetic: bool,
     generator: Optional[torch.Generator] = None,
+    prompt_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """ELBO-surrogate log-prob for response positions of *input_ids*. Returns [B]."""
+    """ELBO-surrogate log-prob for response positions of *input_ids*. Returns [B].
+
+    Bug 3 fix: when prompt_mask is supplied, a custom logits_fn is built that
+    passes it into model.forward so that (a) prompt tokens are kept clean during
+    diffusion and (b) pooled conditioning is built from the prompt prefix only.
+    Without this, model(input_ids, t, return_latent_info=True) with prompt_mask=None
+    noises the entire sequence (including the prompt) and uses no conditioning.
+    """
     B = input_ids.shape[0]
     T = model.num_diffusion_steps
     total_lp = torch.zeros(B, device=input_ids.device)
+
+    if prompt_mask is not None:
+        # Capture prompt_mask in a closure for the logits_fn signature required
+        # by elbo_sequence_logprob: (model, input_ids, t) -> logits.
+        _pm = prompt_mask
+        def _logits_fn(m: nn.Module, ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            x_pred, _, _ = m(ids, t, prompt_mask=_pm, return_latent_info=True)
+            return m.output_head(x_pred, embedding_weight=m.token_embed.get_weight())
+    else:
+        _logits_fn = None  # elbo_sequence_logprob uses its default forward
 
     if antithetic and mc_samples < 2:
         antithetic = False  # can't do antithetic pairs with fewer than 2 samples
@@ -135,11 +153,13 @@ def _compute_elbo_logprob(
             for tt in (t, t_ant):
                 lp = elbo_sequence_logprob(model, input_ids, input_ids, response_mask,
                                            timesteps=tt, num_mc_samples=1,
+                                           logits_fn=_logits_fn,
                                            generator=generator)
                 total_lp = total_lp + lp
         else:
             lp = elbo_sequence_logprob(model, input_ids, input_ids, response_mask,
                                        timesteps=None, num_mc_samples=1,
+                                       logits_fn=_logits_fn,
                                        generator=generator)
             total_lp = total_lp + lp
 
@@ -235,6 +255,24 @@ class GRPOTrainer:
             p.requires_grad_(False)
         self.ref_model.eval()
 
+        # Bug 4 fix: validate that cfg.sampler is compatible with the model's
+        # sampling path.  'euler'/'heun' are only valid on the flow-matching path;
+        # 'ddim'/'dpmpp' are only valid on the non-flow path.  Surface the mismatch
+        # at construction time rather than crashing on the first generation call.
+        _use_flow = getattr(model, "use_flow_matching", False)
+        if _use_flow:
+            if self.cfg.sampler not in ("euler", "heun"):
+                raise ValueError(
+                    f"flow-matching model requires sampler in {{'euler', 'heun'}}, "
+                    f"got {self.cfg.sampler!r}"
+                )
+        else:
+            if self.cfg.sampler not in ("ddim", "dpmpp"):
+                raise ValueError(
+                    f"non-flow model requires sampler in {{'ddim', 'dpmpp'}}, "
+                    f"got {self.cfg.sampler!r}"
+                )
+
         _fused = next(model.parameters()).is_cuda
         self.optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -309,16 +347,16 @@ class GRPOTrainer:
             )
             full_list.append(f)
             resp_list.append(out["response"])
-            # n_think_blocks is now a per-row tensor [B] from block_cot (per-prompt
-            # stop tracking).  Convert to the right device; fall back to broadcasting
-            # a scalar only if block_cot hasn't been updated yet.
+            # Bug 6 fix: block_sample_from_model returns n_think_blocks as a scalar
+            # int (adaptive_stop breaks globally for the whole batch via
+            # _is_degenerate in block_cot, not per-row).  The old isinstance branch
+            # claiming per-row tensor tracking was dead and documented a guarantee
+            # that does not exist.  Broadcast the scalar across the B rows of this
+            # call to form the [B] count tensor.
             n_think = out["n_think_blocks"]
-            if isinstance(n_think, torch.Tensor):
-                count_list.append(n_think.to(device=device, dtype=torch.long))
-            else:
-                count_list.append(
-                    torch.full((B,), n_think, dtype=torch.long, device=device)
-                )
+            count_list.append(
+                torch.full((B,), int(n_think), dtype=torch.long, device=device)
+            )
 
         max_len = max(f.shape[1] for f in full_list)
         padded = [F.pad(f, (0, max_len - f.shape[1])) for f in full_list]
@@ -458,17 +496,37 @@ class GRPOTrainer:
 
         advantages_flat = advantages.reshape(B * G)
 
+        # ── Bug 1 fix: skip optimizer step when no group carries learning signal ──
+        # With B=1 and a homogeneous group (all-correct or all-wrong), every
+        # advantage is zero after group normalization.  pg_loss is then exactly 0
+        # and the step wastes the generation budget with a pure-KL gradient only.
+        # Detect this condition and skip optimizer.step()/scheduler.step().
+        _adv_tol = cfg.advantage_eps * 10  # slightly above the normalization floor
+        _homogeneous = advantages_flat.abs().max().item() < _adv_tol
+        if not hasattr(self, "_skipped_steps"):
+            self._skipped_steps = 0
+
         # ── 4. Policy / ref log-probs ─────────────────────────────────────────
         self.model.train()
         response_mask = self._build_response_mask(full_ids, response_ids, true_lens)
         response_len = response_mask.sum(dim=1).clamp(min=1)  # [B*G] for per-token norm
 
+        # Bug 3 fix: build a prompt_mask so model.forward receives clean prompt
+        # tokens (no noise) and builds pooled conditioning from the prompt prefix.
+        # Computed from true_lens (not ~response_mask) to exclude right-padding.
+        R = response_ids.shape[1]
+        _prompt_start = (true_lens - R).clamp(min=0).unsqueeze(1)   # [B*G, 1]
+        _col = torch.arange(full_ids.shape[1], device=full_ids.device).unsqueeze(0)
+        prompt_mask = (_col < _prompt_start)                          # bool [B*G, L]
+
         policy_lp = _compute_elbo_logprob(
             self.model, full_ids, response_mask, cfg.mc_samples, cfg.antithetic,
+            prompt_mask=prompt_mask,
         )
         with torch.no_grad():
             ref_lp = _compute_elbo_logprob(
                 self.ref_model, full_ids, response_mask, cfg.mc_samples, cfg.antithetic,
+                prompt_mask=prompt_mask,
             )
 
         # Per-token normalisation (VibeThinker: 1/|y_i| in the loss)
@@ -480,22 +538,33 @@ class GRPOTrainer:
         # k3 KL estimator: E[exp(log r) - log r - 1] where r = ref/policy.
         # Always >= 0, unbiased, avoids the anti-regularization caused by the
         # raw log-prob difference which can be negative and reduce the loss.
-        logr = ref_lp_norm - policy_lp_norm  # log(ref/policy); ref under no_grad
-        kl = (logr.exp() - logr - 1).mean()  # k3 estimator: always >= 0
+        # Bug 2 fix: cast to fp32 and clamp before exp() to prevent bf16 overflow.
+        logr = (ref_lp_norm - policy_lp_norm).float()   # log(ref/policy); fp32 to avoid bf16 overflow
+        logr = logr.clamp(min=-10.0, max=10.0)          # bound k3 to ~2.2e4, preserve sign
+        kl = (logr.exp() - logr - 1).mean()             # k3 estimator: always >= 0
         loss = pg_loss + cfg.kl_coeff * kl
 
         # ── 6. Optimise ────────────────────────────────────────────────────────
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
-        self.optimizer.step()
-        self.scheduler.step()
+        if _homogeneous:
+            # Homogeneous group: no policy learning signal; skip optimizer/scheduler
+            # to avoid wasting an update step on a pure-KL gradient.
+            self._skipped_steps += 1
+        else:
+            self.optimizer.step()
+            used_lr = self.scheduler.get_last_lr()[0]   # LR actually applied by optimizer.step()
+            self.scheduler.step()
         self.step += 1
 
         # ── 7. Metrics ────────────────────────────────────────────────────────
         # group_acc uses raw correctness rewards (not the Long2Short-shaped ones)
         # so it reflects true solve rate, not brevity-adjusted reward.
         group_acc = (raw_rewards > 0).float().mean(dim=1)     # [B]
+        if _homogeneous:
+            # LR didn't advance; report the current scheduler LR for consistency.
+            used_lr = self.scheduler.get_last_lr()[0]
         metrics = {
             "step": self.step,
             "loss": loss.item(),
@@ -505,7 +574,8 @@ class GRPOTrainer:
             "reward_std": bonused_rewards.std().item(),
             "mean_think_blocks": think_counts.float().mean().item(),
             "group_accuracy": group_acc.mean().item(),
-            "lr": self.scheduler.get_last_lr()[0],
+            "lr": used_lr,
+            "skipped_steps": self._skipped_steps,
         }
         if cfg.use_mgpo:
             # Use raw_rewards to keep mgpo_weight consistent with the weight used
@@ -537,24 +607,37 @@ class GRPOTrainer:
     def save_checkpoint(self, path: Optional[str] = None) -> str:
         os.makedirs(self.cfg.save_dir, exist_ok=True)
         path = path or os.path.join(self.cfg.save_dir, f"grpo_step{self.step}.pt")
+        _base_model = getattr(self.model, "_orig_mod", self.model)
         torch.save({
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "step": self.step,
-            "config": asdict(self.cfg),
+            "grpo_config": asdict(self.cfg),
+            "config": getattr(_base_model, "config", None),  # real DIMBA model config
         }, path)
         logger.info("saved → %s", path)
         return path
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location="cpu")
-        self.model.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        msd = ckpt["model_state_dict"]
+        # Tolerate torch.compile prefix differences between the saving and loading model.
+        try:
+            self.model.load_state_dict(msd)
+        except RuntimeError:
+            from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
+            consume_prefix_in_state_dict_if_present(msd, "_orig_mod.")
+            target = getattr(self.model, "_orig_mod", self.model)
+            target.load_state_dict(msd)
+        # Optimizer and scheduler state are only present in GRPO-saved checkpoints;
+        # SFT/distill checkpoints are model-only and do not carry these keys.
+        if "optimizer_state_dict" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.step = ckpt.get("step", 0)
-        logger.info("loaded ← %s (step %d)", path, self.step)
+        logger.info("loaded <- %s (step %d)", path, self.step)
 
 
 # ── factory helpers ───────────────────────────────────────────────────────────
@@ -581,10 +664,14 @@ def build_code_grpo_trainer(
 ) -> GRPOTrainer:
     """GRPO trainer for code reasoning (Bespoke-Stratos / OpenThoughts code split).
 
-    Uses exact-match reward — the reference is the expected output.
+    Bespoke-Stratos is math-heavy (~10 K math / ~5 K code). ExactMatch against the
+    full long reference answer is essentially always 0, giving no gradient signal.
+    Use NumericAnswerReward (covers the math rows) + a boxed-answer regex reward
+    (rewards the model for producing a \\boxed{} final answer) + a length penalty.
     """
     reward = CompositeReward([
-        (ExactMatchReward(), 0.9),
+        (NumericAnswerReward(), 0.7),
+        (RegexMatchReward(pattern=r"\\boxed\{[^}]*\}"), 0.2),
         (LengthPenaltyReward(target_length=96, tolerance=32, penalty_per_token=0.005), 0.1),
     ])
     return GRPOTrainer(model, reward, tokenizer, config, ref_model)

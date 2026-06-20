@@ -207,7 +207,10 @@ class DIMBA(nn.Module):
             self.self_cond_proj = None
 
         # Timestep embeddings
-        self.timestep_embed = TimestepEmbedding(time_embed_dim=128, out_dim=512)
+        self.timestep_embed = TimestepEmbedding(
+            time_embed_dim=128, out_dim=512,
+            max_steps=max(num_diffusion_steps, 1),
+        )
 
         # Diffusion schedule (now with a real zero-terminal-SNR option)
         self.noise_schedule = CosineNoiseSchedule(
@@ -648,7 +651,9 @@ class DIMBA(nn.Module):
             t: Optional timesteps ``[B]`` (default all-zero).
             return_hidden_states: Collect the residual-stream input to each block.
             return_matrices: Materialize each block's ``(fwd, bwd)`` mixing matrices
-                (requires a TorchMamba2 mixer, i.e. ``use_simple_mamba=False``).
+                (requires the pure-PyTorch TorchMamba2 backend: use_simple_mamba=False
+                AND mamba_ssm not installed; the CUDA mamba_ssm kernels do not expose
+                materialize_mixing_matrix).
             drop_cond: Use the null conditioning (default) rather than the pooled prompt.
 
         Returns:

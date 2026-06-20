@@ -33,9 +33,17 @@ def _split_into_blocks(text: str, num_blocks: int, min_chars: int = 20) -> List[
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     sentences = [s for s in sentences if len(s) >= min_chars]
     if not sentences:
-        # Fallback: split by chars
-        chunk = len(text) // num_blocks
-        return [text[i * chunk:(i + 1) * chunk].strip() for i in range(num_blocks)]
+        # Fallback: split on word boundaries, never mid-token
+        words = text.strip().split()
+        if not words:
+            return [""] * num_blocks
+        if len(words) <= num_blocks:
+            return words + [""] * (num_blocks - len(words))
+        per = len(words) // num_blocks
+        return [
+            " ".join(words[i * per : (i + 1) * per if i < num_blocks - 1 else len(words)])
+            for i in range(num_blocks)
+        ]
 
     if len(sentences) <= num_blocks:
         # Pad with empty if fewer sentences than blocks (skip empty blocks during training)
@@ -87,13 +95,17 @@ class SmolTalkDataset(Dataset):
         row = self._data[idx]
         messages = row.get("messages", [])
         prompt, response = "", ""
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                prompt = content
-            elif role == "assistant":
-                response = content
+        # Take the first user turn and the first assistant reply that follows it.
+        # This preserves a coherent, context-complete single-turn exchange and
+        # avoids silently dropping context or mis-pairing turns in multi-turn rows.
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user":
+                prompt = msg.get("content") or ""
+                for nxt in messages[i + 1:]:
+                    if nxt.get("role") == "assistant":
+                        response = nxt.get("content") or ""
+                        break
+                break
         return {"prompt": prompt, "reasoning": "", "response": response}
 
 
@@ -125,8 +137,8 @@ class OrcaMathDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, str]:
         row = self._data[idx]
-        question = row.get("question", "")
-        answer_full = row.get("answer", "")
+        question = row.get("question") or ""
+        answer_full = row.get("answer") or ""
         # Last line is typically the numeric answer; everything before = reasoning
         lines = [l.strip() for l in answer_full.splitlines() if l.strip()]
         if len(lines) > 1:
@@ -206,43 +218,74 @@ class BlockCoTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = self.base[idx]
-        prompt_ids = self._pad_or_trunc(self._encode(item["prompt"]), self.max_prompt_len)
-        response_ids = self._pad_or_trunc(self._encode(item["response"]), self.response_len)
 
-        reasoning = item.get("reasoning", "")
+        # Bug 5: coerce None values to empty string so _encode / .strip() never crash.
+        prompt = item.get("prompt") or ""
+        response = item.get("response") or ""
+        reasoning = item.get("reasoning") or ""
+
+        # Encode prompt; record the true (pre-padding) length.
+        prompt_raw = self._encode(prompt)[: self.max_prompt_len]
+        prompt_true = len(prompt_raw)
+        prompt_ids = self._pad_or_trunc(prompt_raw, self.max_prompt_len)
+
+        # Encode response; record the true (pre-padding) length.
+        response_raw = self._encode(response)[: self.response_len]
+        response_true = len(response_raw)
+        response_ids = self._pad_or_trunc(response_raw, self.response_len)
+
+        has_reasoning = bool(reasoning.strip())
+
+        # Build per-block token lists and record each block's real (pre-pad) length.
         think_ids_list: List[List[int]] = []
+        block_real_lens: List[int] = []
 
-        if reasoning.strip():
+        if has_reasoning:
             blocks_text = _split_into_blocks(reasoning, self.num_think_blocks)
             for bt in blocks_text:
                 if bt.strip():
-                    think_ids_list.append(
-                        self._pad_or_trunc(self._encode(bt), self.block_size)
-                    )
+                    raw = self._encode(bt)[: self.block_size]
+                    block_real_lens.append(len(raw))
+                    think_ids_list.append(self._pad_or_trunc(raw, self.block_size))
 
-        # Pad missing blocks with zeros (masked out during loss computation)
+        # Pad missing blocks with pad_id (shape-stable for collate); real_len = 0.
         while len(think_ids_list) < self.num_think_blocks:
             think_ids_list.append([self.pad_id] * self.block_size)
+            block_real_lens.append(0)
 
-        # Build full sequence for SFT: [prompt | think*N | response]
+        # Build full sequence AND the loss mask in a single pass so they stay in sync.
+        # Mask rules:
+        #   prompt positions          -> 0 (never train on prompt)
+        #   think_start/think_end     -> 1 if the block has real tokens, else 0
+        #   think token positions     -> 1 for real tokens, 0 for pad tail / empty blocks
+        #   response positions        -> 1 for real tokens, 0 for pad tail
         full: List[int] = list(prompt_ids)
-        for block_ids in think_ids_list:
+        mask: List[int] = [0] * self.max_prompt_len  # prompt never trained
+
+        for block_ids, block_real_len in zip(think_ids_list, block_real_lens):
+            real_block = block_real_len > 0
             if self.think_start_id is not None:
                 full.append(self.think_start_id)
+                mask.append(1 if real_block else 0)
             full.extend(block_ids)
+            mask.extend([1] * block_real_len + [0] * (self.block_size - block_real_len))
             if self.think_end_id is not None:
                 full.append(self.think_end_id)
-        full.extend(response_ids)
+                mask.append(1 if real_block else 0)
 
-        # Response mask: 1 on response positions (for loss computation)
-        prefix_len = len(full) - self.response_len
-        response_mask = [0] * prefix_len + [1] * self.response_len
+        full.extend(response_ids)
+        mask.extend([1] * response_true + [0] * (self.response_len - response_true))
+
+        # Prompt mask: True for the first max_prompt_len positions (prompt is kept
+        # clean by DIMBA.forward so the model can condition on it, matching inference).
+        prompt_mask = [True] * self.max_prompt_len + [False] * (len(full) - self.max_prompt_len)
 
         return {
             "input_ids": torch.tensor(full, dtype=torch.long),
             "prompt_ids": torch.tensor(prompt_ids, dtype=torch.long),
             "response_ids": torch.tensor(response_ids, dtype=torch.long),
             "think_ids": torch.tensor(think_ids_list, dtype=torch.long),  # [num_blocks, block_size]
-            "response_mask": torch.tensor(response_mask, dtype=torch.float),
-            "has_reasoning": torch.tensor(bool(reasoning.strip()), dtype=torch.bool),
+            "response_mask": torch.tensor(mask, dtype=torch.float),
+            "prompt_mask": torch.tensor(prompt_mask, dtype=torch.bool),
+            "has_reasoning": torch.tensor(has_reasoning, dtype=torch.bool),
         }

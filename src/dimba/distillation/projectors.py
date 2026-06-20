@@ -123,7 +123,7 @@ class HeadAligner(nn.Module):
         """
         if self._identity:
             return M
-        return torch.einsum("oi,bilm->bolm", self.weight, M)
+        return torch.einsum("oi,bilm->bolm", self.weight.to(M.dtype), M)
 
 
 class LayerMap:

@@ -75,6 +75,12 @@ class CosineNoiseSchedule(nn.Module):
         # arXiv:2410.14171). Large noise_df -> Gaussian; small -> heavier tails.
         self.noise_dist = noise_dist
         self.noise_df = float(noise_df)
+        if self.noise_dist == "student_t" and self.noise_df <= 2.0:
+            raise ValueError(
+                f"student_t noise requires df > 2 for finite (rescalable) variance; "
+                f"got noise_df={self.noise_df}. The SNR schedule assumes unit-variance "
+                f"noise, which is impossible for df <= 2."
+            )
 
         alphas_cumprod = self._compute_alphas_cumprod()
         alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]])
@@ -138,10 +144,12 @@ class CosineNoiseSchedule(nn.Module):
         """
         if self.noise_dist == "student_t":
             df = self.noise_df
-            n = torch.distributions.StudentT(df).sample(x_0.shape).to(x_0.device, x_0.dtype)
-            if df > 2.0:
-                n = n * math.sqrt((df - 2.0) / df)
-            return n
+            # df > 2 is enforced in __init__, so rescaling is always valid here.
+            n = torch.distributions.StudentT(df).sample(x_0.shape) * math.sqrt((df - 2.0) / df)
+            # float16 max is ~65504; heavy tails can overflow on cast -> Inf in x_t.
+            if x_0.dtype == torch.float16:
+                n = n.clamp(-1e4, 1e4)
+            return n.to(x_0.device, x_0.dtype)
         return torch.randn_like(x_0)
 
     def sample_timesteps(
@@ -249,7 +257,17 @@ class FlowMatchingSchedule(nn.Module):
         self.logit_std = logit_std
 
     def sample_timesteps(self, batch: int, device: torch.device) -> torch.Tensor:
-        """Sample continuous ``t ∈ (0, 1)`` per example. Returns ``[B]`` float tensor."""
+        """Sample continuous ``t ∈ (0, 1)`` per example. Returns ``[B]`` float tensor.
+
+        .. warning::
+            This method must be called explicitly by the training loop (trainer or
+            script) to obtain logit-normal timesteps.  The model's ``forward()``
+            receives ``t`` as an argument from the caller and does **not** call this
+            method internally.  Training scripts that sample a uniform-integer ``t``
+            and convert via ``t.float() / (T-1)`` bypass this distribution entirely —
+            see ``scripts/train_4090.py`` and ``src/dimba/training/trainer.py``
+            (default ``timestep_sampling="uniform"``).
+        """
         if self.logit_normal_sampling:
             u = torch.sigmoid(
                 torch.randn(batch, device=device) * self.logit_std + self.logit_mean

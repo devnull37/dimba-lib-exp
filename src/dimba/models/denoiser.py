@@ -70,6 +70,7 @@ def _make_mixer(
     d_conv: int,
     expand: int,
     use_simple_mamba: bool,
+    headdim: int = 64,
 ) -> nn.Module:
     """Construct a single (causal) SSM mixer using the best available backend.
 
@@ -88,12 +89,12 @@ def _make_mixer(
         # and runs as-is on CPU/MPS (Apple Silicon, etc.).
         from .torch_mamba2 import TorchMamba2
 
-        return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
 
     # mamba_ssm kernels (CUDA). Mamba2 and Mamba take slightly different kwargs;
     # fall back gracefully rather than crash, and warn once if we can't use them.
     try:
-        return _MAMBA_CLS(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        return _MAMBA_CLS(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
     except (TypeError, ValueError, AssertionError, RuntimeError) as exc:  # pragma: no cover - CUDA only
         if not _FALLBACK_WARNED:
             warnings.warn(
@@ -104,7 +105,7 @@ def _make_mixer(
             _FALLBACK_WARNED = True
         from .torch_mamba2 import TorchMamba2
 
-        return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
 
 
 class _BlockFFN(nn.Module):
@@ -167,6 +168,7 @@ class Mamba2Block(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        headdim: int = 64,
         bidirectional: bool = True,
         use_simple_mamba: bool = False,
         bidir_merge: str = "sum",
@@ -174,6 +176,7 @@ class Mamba2Block(nn.Module):
         ffn_mult: int = 4,
         ffn_type: str = "mlp",
         ffn_hidden: Optional[int] = None,
+        dropout: float = 0.0,
         # Accepted for backward compatibility; only used by the Mamba-1 kernel.
         dt_rank: str = "auto",
         dt_min: float = 0.001,
@@ -188,10 +191,14 @@ class Mamba2Block(nn.Module):
         self.bidirectional = bidirectional
         self.bidir_merge = bidir_merge
         self.norm = RMSNorm(d_model)
+        # Dropout is applied on each sub-layer branch *before* the residual add,
+        # NOT on the residual stream itself, so the AdaLN-Zero identity-at-init
+        # guarantee is preserved (gate=0 at init -> branch is 0 -> dropout(0)=0).
+        self.dropout: nn.Module = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
-        self.mamba_fwd = _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba)
+        self.mamba_fwd = _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba, headdim=headdim)
         self.mamba_bwd = (
-            _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba)
+            _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba, headdim=headdim)
             if bidirectional
             else None
         )
@@ -229,9 +236,9 @@ class Mamba2Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Pre-norm + (bi)directional mix + residual, then optional FFN sub-layer."""
-        x = x + self._mix(self.norm(x))
+        x = x + self.dropout(self._mix(self.norm(x)))
         if self.ffn is not None:
-            x = x + self.ffn(self.norm2(x))
+            x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
 
     def forward_adaln(
@@ -252,13 +259,13 @@ class Mamba2Block(nn.Module):
         """
         h = self.norm(x)
         h = h * (1 + scale) + shift
-        x = x + gate * self._mix(h)
+        x = x + self.dropout(gate * self._mix(h))
         if self.ffn is not None:
             if scale2 is not None:
                 h2 = self.norm2(x) * (1 + scale2) + shift2
-                x = x + gate2 * self.ffn(h2)
+                x = x + self.dropout(gate2 * self.ffn(h2))
             else:
-                x = x + self.ffn(self.norm2(x))
+                x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
 
     def materialize_matrices(self, h_normed: torch.Tensor):
@@ -273,8 +280,12 @@ class Mamba2Block(nn.Module):
         """
         if not hasattr(self.mamba_fwd, "materialize_mixing_matrix"):
             raise NotImplementedError(
-                "Matrix-orientation distillation requires a mixer exposing "
-                "materialize_mixing_matrix; use use_simple_mamba=False (TorchMamba2)."
+                f"Matrix-orientation distillation requires a mixer exposing "
+                f"materialize_mixing_matrix. Got {type(self.mamba_fwd).__name__}. "
+                f"This needs the pure-PyTorch TorchMamba2 backend, which is only "
+                f"selected when use_simple_mamba=False AND mamba_ssm is absent "
+                f"(HAS_MAMBA_SSM={HAS_MAMBA_SSM}). On a CUDA box with mamba_ssm "
+                f"installed, build with a force-torch-mixer flag to enable alignment."
             )
         m_fwd = self.mamba_fwd.materialize_mixing_matrix(h_normed)
         m_bwd = None
@@ -317,6 +328,7 @@ class Mamba2Denoiser(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        headdim: int = 64,
         conditioning_type: Literal["film", "additive", "adaln"] = "adaln",
         cond_dim: int = 512,
         time_embed_dim: int = 512,
@@ -344,6 +356,7 @@ class Mamba2Denoiser(nn.Module):
                     d_state=d_state,
                     d_conv=d_conv,
                     expand=expand,
+                    headdim=headdim,
                     bidirectional=bidirectional,
                     use_simple_mamba=use_simple_mamba,
                     bidir_merge=bidir_merge,
@@ -351,6 +364,7 @@ class Mamba2Denoiser(nn.Module):
                     ffn_mult=ffn_mult,
                     ffn_type=ffn_type,
                     ffn_hidden=ffn_hidden,
+                    dropout=dropout,
                 )
                 for _ in range(num_layers)
             ]
@@ -426,6 +440,34 @@ class Mamba2Denoiser(nn.Module):
         # Distillation-alignment collection path: capture per-block intermediates.
         # Gradient checkpointing is bypassed here so the captured tensors are real
         # graph nodes the alignment losses can backprop through.
+        #
+        # WARNING (return_matrices=True): materialize_mixing_matrix builds a full
+        # [B, nheads, L, L] matrix per block WITHOUT chunking, costing
+        # O(num_layers * B * nheads * L^2) memory in fp32 plus the autograd graph.
+        # This is intentional for distillation at modest L, but will OOM at long
+        # sequences where the normal chunked forward() succeeds.  Raise early with a
+        # clear message rather than an opaque CUDA OOM.
+        if return_matrices and x.shape[1] > 0:
+            B, L, _ = x.shape
+            # Use a conservative nheads estimate; the real count is mixer-specific.
+            _nheads_est = max(1, self.d_model // 64)
+            _budget = B * _nheads_est * L * L * self.num_layers
+            # Warn at >256 M elements (~1 GB fp32); hard-fail at >2 B elements (~8 GB).
+            if _budget > 2_000_000_000:
+                raise RuntimeError(
+                    f"return_matrices=True would materialize ~{_budget/1e9:.1f}G fp32 "
+                    f"elements across {self.num_layers} layers (B={B}, L={L}). "
+                    "Use shorter sequences or disable return_matrices to avoid OOM."
+                )
+            if _budget > 256_000_000:
+                warnings.warn(
+                    f"return_matrices=True: estimated {_budget/1e6:.0f}M fp32 elements "
+                    f"across {self.num_layers} layers (B={B}, L={L}). "
+                    "Peak memory is O(num_layers * B * nheads * L^2); "
+                    "consider shorter sequences for Stage-1 distillation.",
+                    ResourceWarning,
+                    stacklevel=2,
+                )
         hidden_states, block_outputs, mats_fwd, mats_bwd = [], [], [], []
         for block, cond_layer in zip(self.blocks, self.conditioning):
             if return_hidden_states:
@@ -460,17 +502,20 @@ class Mamba2Denoiser(nn.Module):
         return block.norm(cond_layer(x, combined_cond))
 
     def _block_forward(self, block, cond_layer, x, combined_cond):
-        """Condition + mix + dropout for a single denoiser block."""
+        """Condition + mix for a single denoiser block.
+
+        Dropout is applied inside each block on the sub-layer branches (not here
+        on the residual stream), preserving the AdaLN-Zero identity-at-init guarantee.
+        """
         if self.conditioning_type == "adaln":
             params = cond_layer(combined_cond)
-            if len(params) == 6:
-                out = block.forward_adaln(x, *params)
-            else:
-                out = block.forward_adaln(x, *params)
+            if len(params) not in (3, 6):
+                raise ValueError(
+                    f"AdaLN conditioning produced {len(params)} params; expected 3 or 6"
+                )
+            out = block.forward_adaln(x, *params)
         else:
             out = block(cond_layer(x, combined_cond))
-        if self.dropout is not None:
-            out = self.dropout(out)
         return out
 
 

@@ -96,7 +96,14 @@ class TorchMamba2(nn.Module):
         self.use_chunked = use_chunked
 
         self.d_inner = expand * d_model
-        assert self.d_inner % headdim == 0, "d_inner must be divisible by headdim"
+        if self.d_inner % headdim != 0:
+            raise ValueError(
+                f"d_inner = expand*d_model = {expand}*{d_model} = {self.d_inner} "
+                f"is not divisible by headdim={headdim}. Pick a d_model/expand whose "
+                f"product is a multiple of {headdim}, or pass a headdim that divides "
+                f"{self.d_inner} (e.g. a divisor like "
+                f"{[h for h in (8,16,32,48,64,80,96,128) if self.d_inner % h == 0] or [1]})."
+            )
         self.nheads = self.d_inner // headdim
         assert self.nheads % ngroups == 0, "nheads must be divisible by ngroups"
         self.conv_dim = self.d_inner + 2 * ngroups * d_state

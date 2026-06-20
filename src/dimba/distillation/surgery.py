@@ -126,6 +126,23 @@ def build_student_from_teacher(
             _warn(f"surgery: could not copy embeddings ({exc}); skipping.")
 
     # ------------------------------------------------------------------ output head
+    # Detect whether the teacher is weight-tied (lm_head shares storage with wte).
+    # When tied, the same matrix will be copied into both token_embed and output_head,
+    # but the student is NOT weight-tied by default, so they will train independently.
+    try:
+        _teacher_tied = (
+            teacher.output_head_weight() is teacher.input_embedding_weight()
+        )
+    except Exception:  # noqa: BLE001
+        _teacher_tied = False
+    if _teacher_tied and not dimba_kwargs.get("use_weight_tying", False):
+        _warn(
+            "surgery: teacher is weight-tied (lm_head shares storage with wte) but "
+            "student is not; embedding and head are initialized from the same matrix "
+            "but will train independently (tying invariant intentionally broken). "
+            "Pass use_weight_tying=True in dimba_overrides to preserve tying."
+        )
+
     if inherit_head:
         try:
             teacher_head_w = teacher.output_head_weight()  # [Vt, dt] or None
@@ -153,7 +170,10 @@ def build_student_from_teacher(
 
     # ------------------------------------------------------------------ per-layer FFN
     if inherit_ffn and block_ffn:
+        n_pairs = 0
+        n_loaded = 0
         for student_idx, teacher_idx in layer_map.pairs():
+            n_pairs += 1
             block = model.denoiser.blocks[student_idx]
             if block.ffn is None:
                 # block_ffn=True but this particular block has no ffn (shouldn't happen,
@@ -211,10 +231,23 @@ def build_student_from_teacher(
                     teacher_idx,
                     student_idx,
                 )
+                n_loaded += 1
             except Exception as exc:  # noqa: BLE001
                 _warn(
                     f"surgery: load_state_dict failed for block[{student_idx}].ffn "
                     f"({exc}); skipping pair ({student_idx}, {teacher_idx})."
                 )
+
+        if n_pairs > 0 and n_loaded == 0:
+            _warn(
+                "surgery: inherit_ffn=True and block_ffn=True but ZERO of "
+                f"{n_pairs} FFN layer pairs were inherited — every pair was skipped. "
+                "This almost always means an ffn_type/key-name or shape mismatch "
+                "between teacher and student (e.g. student built as 'mlp' but teacher "
+                "FFN is swiglu). The student will train with RANDOMLY-INITIALIZED FFNs. "
+                "Check that teacher.ffn_type matches the teacher's actual MLP structure."
+            )
+        elif 0 < n_loaded < n_pairs:
+            _warn(f"surgery: only {n_loaded}/{n_pairs} FFN pairs inherited; rest skipped.")
 
     return model, layer_map

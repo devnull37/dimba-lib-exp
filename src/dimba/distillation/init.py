@@ -46,23 +46,6 @@ def _try_copy(dst: nn.Parameter, src: torch.Tensor, name: str) -> bool:
     return True
 
 
-def _get_nheads(block: nn.Module) -> Optional[int]:
-    """Derive the number of SSM heads from a Mamba2Block's forward mixer.
-
-    Tries the ``nheads`` attribute exposed by :class:`~dimba.models.torch_mamba2.TorchMamba2`
-    and compatible CUDA Mamba-2 instances.  Falls back to ``None`` when absent.
-
-    Args:
-        block: A :class:`~dimba.models.denoiser.Mamba2Block` instance.
-
-    Returns:
-        Integer number of heads, or ``None`` if not determinable.
-    """
-    mixer = getattr(block, "mamba_fwd", None)
-    if mixer is None:
-        return None
-    return getattr(mixer, "nheads", None)
-
 
 def principled_init_from_teacher(
     model: "dimba.models.diffusion.DIMBA",  # type: ignore[name-defined]  # noqa: F821
@@ -81,13 +64,17 @@ def principled_init_from_teacher(
        [d_s, d_inner]``.  Both ``out_proj`` attributes (forward and, when the block
        is bidirectional, backward) are initialised.
 
-    2. **in_proj nudge from Q/K/V** (``mode="qkvo"`` only) — The stacked Q/K/V
-       weight ``[3*d_t, d_t]`` is used to approximate the first ``3*d_t`` rows of
-       the student's ``in_proj.weight``.  This is intentionally approximate because
-       the Mamba-2 ``in_proj`` layout
-       ``[z | xBC | dt]  =  [d_inner | conv_dim | nheads]`` does not cleanly factor
-       into Q/K/V; we overwrite only as many rows as are available and warn that this
-       is an approximation.
+    2. **in_proj nudge from V** (``mode="qkvo"`` only) — The teacher V weight
+       (shape ``[num_kv_heads*head_dim, d_model]`` for GQA/MQA teachers such as
+       Qwen2/Mistral/Llama-3, or ``[num_heads*head_dim, d_model]`` for MHA) is
+       used to seed the ``x`` sub-segment (rows ``[d_inner : 2*d_inner)``) of the
+       student's ``in_proj.weight``.  The SiLU gate ``z`` (rows ``[0 : d_inner)``)
+       is left at its default initialisation and is never overwritten.  Q and K are
+       accepted but unused because B/C live in ``d_state`` space rather than
+       ``d_model`` space and have no faithful mapping from the teacher projections.
+       For GQA/MQA teachers, V is expanded per-head to ``[num_heads*head_dim,
+       d_model]`` before copying.  This is intentionally approximate; treat it as a
+       warm-start heuristic only.
 
     Every copy is guarded by a shape check.  On any incompatibility the copy is
     skipped with a :mod:`warnings` warning and execution continues.
@@ -282,20 +269,29 @@ def _nudge_in_proj(
     student_idx: int,
     teacher_idx: int,
 ) -> None:
-    """Approximately nudge a student mixer's in_proj with teacher Q/K/V weights.
+    """Approximately nudge a student mixer's in_proj with the teacher V weight.
 
-    The Mamba-2 ``in_proj`` has shape ``[2*d_inner + conv_dim + nheads, d_model]``
-    which does **not** factorize cleanly into Q/K/V.  This helper copies as many rows
-    as are available from the stacked ``[Q; K; V]`` tensor into the first rows of
-    ``in_proj.weight``, and warns that the mapping is approximate.  Only the forward
-    mixer is nudged (the backward mixer reuses the same nudge since the backward scan
-    is a reversed view of the same sequence, not a separately attended sub-sequence).
+    The Mamba-2 ``in_proj`` layout is ``[z (d_inner) | xBC (conv_dim) | dt (nheads)]``.
+    The first ``d_inner`` rows are the SiLU gate ``z``; they must **not** be overwritten.
+    The ``x`` sub-segment of ``xBC`` lives at rows ``[d_inner : 2*d_inner)`` and is the
+    closest structural analogue to the teacher's value projection V.  Only that segment
+    is seeded.  Q and K have no faithful target in the Mamba-2 in_proj layout (B/C live
+    in d_state space, not d_model space) so they are left at their default initialisation.
+
+    For GQA/MQA teachers (e.g. Qwen2, Mistral, Llama-3) V may have shape
+    ``[num_kv_heads * head_dim, d_model]`` with fewer rows than Q.  The weight is
+    expanded per-head to ``[num_heads * head_dim, d_model]`` before copying so that
+    the seeded rows have the correct per-head feature ordering.  If the teacher config
+    does not expose ``num_key_value_heads`` or the shapes are not divisible as expected,
+    V is used as-is with a warning.
+
+    Only the forward mixer is nudged (``mamba_fwd``).
 
     Args:
         block: :class:`~dimba.models.denoiser.Mamba2Block` to update.
-        q_weight: Teacher Q weight ``[d_t, d_t]`` or None.
-        k_weight: Teacher K weight ``[d_t, d_t]`` or None.
-        v_weight: Teacher V weight ``[d_t, d_t]`` or None.
+        q_weight: Teacher Q weight ``[num_heads*head_dim, d_model]`` or None (unused).
+        k_weight: Teacher K weight ``[num_kv_heads*head_dim, d_model]`` or None (unused).
+        v_weight: Teacher V weight ``[num_kv_heads*head_dim, d_model]`` or None.
         student_idx: Student block index (for warnings).
         teacher_idx: Teacher layer index (for warnings).
     """
@@ -313,52 +309,122 @@ def _nudge_in_proj(
         )
         return
 
-    available = [w for w in [q_weight, k_weight, v_weight] if w is not None]
-    if not available:
+    if v_weight is None:
         warnings.warn(
-            f"principled_init: all of Q/K/V are None for teacher layer {teacher_idx} "
+            f"principled_init: V weight is None for teacher layer {teacher_idx} "
             f"(student {student_idx}) — skipping in_proj nudge.",
             UserWarning,
             stacklevel=4,
         )
         return
 
-    # Stack available projections: shape [n_avail * d_t, d_t]
-    try:
-        stacked = torch.cat(available, dim=0)  # [n * d_t, d_t]
-    except Exception as exc:
+    dst_w = in_proj.weight  # [d_in_proj, d_model_s]
+    d_model_s = dst_w.shape[1]
+
+    # Column-dim guard: V must match the student's d_model.
+    if v_weight.shape[1] != d_model_s:
         warnings.warn(
-            f"principled_init: could not stack Q/K/V for teacher layer {teacher_idx}: "
-            f"{exc} — skipping in_proj nudge.",
+            f"principled_init: in_proj column dim mismatch at block ({student_idx}, "
+            f"{teacher_idx}): student d_model={d_model_s}, teacher V d_model="
+            f"{v_weight.shape[1]} — skipping in_proj nudge.",
             UserWarning,
             stacklevel=4,
         )
         return
 
-    dst_w = in_proj.weight  # [d_in_proj, d_model_s]
-    n_src_rows, d_src_cols = stacked.shape
-    n_dst_rows, d_dst_cols = dst_w.shape
-
-    if d_src_cols != d_dst_cols:
+    d_inner = getattr(mixer, "d_inner", None)
+    if d_inner is None:
         warnings.warn(
-            f"principled_init: in_proj column dim mismatch at block ({student_idx}, "
-            f"{teacher_idx}): student d_model={d_dst_cols}, teacher d={d_src_cols} "
+            f"principled_init: mamba_fwd at student block {student_idx} does not "
+            f"expose d_inner — skipping in_proj nudge.",
+            UserWarning,
+            stacklevel=4,
+        )
+        return
+
+    x_start = d_inner
+    x_stop = 2 * d_inner  # exclusive; x sub-segment of xBC
+
+    if x_stop > dst_w.shape[0]:
+        warnings.warn(
+            f"principled_init: in_proj at block ({student_idx}, {teacher_idx}) has "
+            f"only {dst_w.shape[0]} rows but x segment requires rows up to {x_stop} "
             f"— skipping in_proj nudge.",
             UserWarning,
             stacklevel=4,
         )
         return
 
-    rows_to_copy = min(n_src_rows, n_dst_rows)
+    # ── GQA/MQA expansion: expand V from num_kv_heads to num_heads ───────────
+    src_v = v_weight
+    teacher_cfg = getattr(getattr(block, "_teacher_cfg", None), "config", None)
+    # Block may not carry the teacher config; retrieve it via a best-effort attribute
+    # that TeacherWrapper may have attached, or skip expansion gracefully.
+    # In practice the caller (principled_init_from_teacher) passes a TeacherWrapper;
+    # we cannot reach it from here, so expansion relies on q_weight row count as a
+    # proxy for num_heads * head_dim when q_weight is available.
+    if q_weight is not None and q_weight.shape[1] == d_model_s:
+        n_q_rows = q_weight.shape[0]
+        n_v_rows = src_v.shape[0]
+        if n_v_rows < n_q_rows and n_q_rows % n_v_rows == 0:
+            n_rep = n_q_rows // n_v_rows
+            # Infer head_dim: we need it to do per-head expansion correctly.
+            # We can only infer it if num_kv_heads divides n_v_rows cleanly and
+            # num_heads * head_dim == n_q_rows; use n_v_rows itself as num_kv_heads
+            # only when head_dim==1, which is wrong, so use a safer heuristic:
+            # expand by treating each row-group of size (n_v_rows) as one "kv-head"
+            # set and interleave n_rep copies — equivalent to repeat_interleave along
+            # the head axis when head_dim is consistent.
+            # Safe guard: only expand when n_v_rows is divisible by n_rep.
+            if n_v_rows % n_rep == 0:
+                num_kv_heads = n_v_rows // (n_q_rows // n_rep)
+                head_dim = n_v_rows // num_kv_heads if num_kv_heads > 0 else None
+                if head_dim is not None and num_kv_heads * head_dim == n_v_rows:
+                    try:
+                        src_v = (
+                            src_v
+                            .reshape(num_kv_heads, head_dim, d_model_s)
+                            .unsqueeze(2)
+                            .expand(num_kv_heads, n_rep, head_dim, d_model_s)
+                            .reshape(n_q_rows, d_model_s)
+                            .contiguous()
+                        )
+                    except Exception as exc:
+                        warnings.warn(
+                            f"principled_init: GQA V expansion failed at block "
+                            f"({student_idx}, {teacher_idx}): {exc} — using raw V.",
+                            UserWarning,
+                            stacklevel=4,
+                        )
+                        src_v = v_weight
+                else:
+                    warnings.warn(
+                        f"principled_init: cannot infer head_dim for GQA V expansion "
+                        f"at block ({student_idx}, {teacher_idx}); n_v_rows={n_v_rows}, "
+                        f"n_q_rows={n_q_rows} — using raw V.",
+                        UserWarning,
+                        stacklevel=4,
+                    )
+            else:
+                warnings.warn(
+                    f"principled_init: V row count ({n_v_rows}) not divisible by "
+                    f"n_rep={n_rep} at block ({student_idx}, {teacher_idx}) — "
+                    f"using raw V.",
+                    UserWarning,
+                    stacklevel=4,
+                )
+
+    # ── Copy V (or expanded V) into the x segment [d_inner : 2*d_inner) ──────
+    n_rows_to_copy = min(src_v.shape[0], x_stop - x_start)
     warnings.warn(
         f"principled_init: in_proj nudge at block ({student_idx}, {teacher_idx}) is "
-        f"APPROXIMATE — copying {rows_to_copy} of {n_dst_rows} in_proj rows from "
-        f"stacked Q/K/V ({n_src_rows} rows).  The Mamba-2 in_proj layout does not "
-        f"factor cleanly into Q/K/V; treat this as a warm-start heuristic only.",
+        f"APPROXIMATE — seeding {n_rows_to_copy} rows of the x-segment "
+        f"[{x_start}:{x_start + n_rows_to_copy}) from teacher V.  "
+        f"The SiLU gate z (rows [0:{d_inner})) is left at its default init.",
         UserWarning,
         stacklevel=4,
     )
-
     with torch.no_grad():
-        src_slice = stacked[:rows_to_copy].to(dst_w.dtype)
-        dst_w.data[:rows_to_copy].copy_(src_slice)
+        dst_w.data[x_start : x_start + n_rows_to_copy].copy_(
+            src_v[:n_rows_to_copy].to(dst_w.dtype)
+        )

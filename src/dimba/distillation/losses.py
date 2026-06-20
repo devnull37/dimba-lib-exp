@@ -103,10 +103,13 @@ def stage1_matrix_loss(
     for si, ti in pairs:
         # ---- forward mixing matrix ----
         ms_fwd: Optional[Tensor] = matrices_fwd[si] if si < len(matrices_fwd) else None
-        attn: Tensor = teacher_out.attentions[ti]  # [B, Ht, L, L]
+        attn: Tensor = teacher_out.attentions[ti].float()  # [B, Ht, L, L]  # teacher fp32; explicit is safe
 
         if ms_fwd is not None:
-            aligned_fwd: Tensor = head_aligners[si](ms_fwd)  # [B, Ht, L, L]
+            # Cast student matrix to fp32 before the HeadAligner einsum so that
+            # the aligner weight (fp32, kept out of bf16 student dtype cast) and
+            # the input matrix are the same dtype.  mse_loss is then fp32 too.
+            aligned_fwd: Tensor = head_aligners[si](ms_fwd.float())  # [B, Ht, L, L]
             if teacher_type == "causal":
                 target_fwd = attn
             else:
@@ -120,7 +123,7 @@ def stage1_matrix_loss(
                 matrices_bwd[si] if matrices_bwd and si < len(matrices_bwd) else None
             )
             if ms_bwd is not None:
-                aligned_bwd: Tensor = head_aligners[si](ms_bwd)  # [B, Ht, L, L]
+                aligned_bwd: Tensor = head_aligners[si](ms_bwd.float())  # [B, Ht, L, L]
                 if teacher_type == "causal":
                     target_bwd = attn.transpose(-1, -2)
                 else:
@@ -202,7 +205,7 @@ def stage2_hidden_loss(
         proj: Tensor = projectors[si](so)  # [B, L, d_teacher]
         # teacher hidden_states[0] = token embeddings; [ti+1] = output of layer ti.
         target: Tensor = teacher_out.hidden_states[ti + 1]  # [B, L, d_teacher]
-        loss_acc = loss_acc + F.mse_loss(proj, target)
+        loss_acc = loss_acc + F.mse_loss(proj.float(), target.float())
 
     loss_avg = loss_acc / len(pairs)
     parts: Dict[str, Tensor] = {"stage2": loss_avg}
@@ -260,8 +263,8 @@ def stage3_kd_loss(
 
     T = float(kd_temp)
     # Scale logits by temperature.
-    s_scaled = student_logits / T  # [B, L, V]
-    t_scaled = teacher_logits / T  # [B, L, V]
+    s_scaled = student_logits.float() / T  # [B, L, V]
+    t_scaled = teacher_logits.float() / T  # [B, L, V]
 
     # Teacher provides the soft target distribution (detach so no gradient flows back).
     soft_targets = F.softmax(t_scaled, dim=-1).detach()  # [B, L, V]
@@ -271,6 +274,7 @@ def stage3_kd_loss(
     # F.kl_div expects (log_input, target) where it computes sum(target*(log target - log input)).
     # reduction='batchmean' divides by B; we need mean over B*L, so use 'sum' + manual divide.
     B, L, _V = student_logits.shape
-    kl = F.kl_div(log_student, soft_targets, reduction="sum") / (B * L)
+    denom = max(1, B * L)  # avoid 0/0 -> nan on an empty/degenerate batch
+    kl = F.kl_div(log_student, soft_targets, reduction="sum") / denom
 
     return kl * (T * T)

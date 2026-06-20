@@ -125,27 +125,30 @@ def _get_student_nheads(block: nn.Module, fallback: int) -> int:
     return fallback
 
 
-def _iter_batches(dataloader: Iterable) -> Iterator[torch.Tensor]:
-    """Yield ``input_ids`` tensors from a dataloader regardless of batch format.
+def _iter_batches(
+    dataloader: Iterable,
+) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """Yield ``(input_ids, attention_mask)`` pairs from a dataloader regardless of batch format.
 
     Accepts dataloaders that yield:
-    - plain ``torch.Tensor`` of shape ``[B, L]``.
-    - dicts / mappings with an ``'input_ids'`` key.
+    - plain ``torch.Tensor`` of shape ``[B, L]`` — attention_mask will be None.
+    - dicts / mappings with an ``'input_ids'`` key — attention_mask taken from
+      ``'attention_mask'`` if present, else None.
 
     Args:
         dataloader: Any iterable that produces batches.
 
     Yields:
-        ``input_ids`` tensors ``[B, L]``.
+        ``(input_ids, attention_mask)`` where attention_mask may be None.
     """
     for batch in dataloader:
         if isinstance(batch, torch.Tensor):
-            yield batch
+            yield batch, None
         elif isinstance(batch, dict):
-            yield batch["input_ids"]
+            yield batch["input_ids"], batch.get("attention_mask")
         else:
             # Try index 0 for tuple batches
-            yield batch[0]
+            yield batch[0], None
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +209,14 @@ class DistillationTrainer:
         self.head_aligners: nn.ModuleList = nn.ModuleList(head_aligner_list)
         self.projectors: nn.ModuleList = nn.ModuleList(projector_list)
 
-        # Move auxiliary modules to the same device AND dtype as the student model.
+        # Move auxiliary modules to the student device.
+        # head_aligners are kept in fp32 so that the einsum with fp32 mixing matrices
+        # (from TorchMamba2.materialize_mixing_matrix) is dtype-consistent and the
+        # stage1 MSE loss is computed in fp32 — matching the fp32 teacher attentions.
+        # projectors are cast to the student dtype so they stay on the same compute path
+        # as the student block outputs in stage2.
         _student_param = next(model.parameters())
-        self.head_aligners.to(device=_student_param.device, dtype=_student_param.dtype)
+        self.head_aligners.to(device=_student_param.device)
         self.projectors.to(device=_student_param.device, dtype=_student_param.dtype)
 
         logger.info(
@@ -355,13 +363,17 @@ class DistillationTrainer:
         needs_matrices = stage_name == "stage1"
         use_simple = bool(self.model.config.get("use_simple_mamba", False))
         if needs_matrices and use_simple:
+            # Short-circuit: stage1 is a no-op with use_simple_mamba=True because
+            # there are no mixing matrices to align.  Skip entirely rather than
+            # burning n_steps of zero-loss optimizer steps.
             warnings.warn(
-                "DistillationTrainer: stage1 requires return_matrices=True but "
-                "use_simple_mamba=True — stage1 matrix loss will be skipped (no matrices).",
+                "DistillationTrainer: stage1 is a no-op with use_simple_mamba=True "
+                "(no mixing matrices to align); skipping the stage entirely instead "
+                "of running %d zero-loss steps." % n_steps,
                 UserWarning,
                 stacklevel=2,
             )
-            needs_matrices = False
+            return
 
         # ---- KD / loss overrides ----
         kd_weight: float = float(stage.get("kd_weight", self.config.kd_weight))
@@ -377,17 +389,19 @@ class DistillationTrainer:
 
         # ---- Training loop ----
         self.model.train()
+        self.head_aligners.train()
+        self.projectors.train()
         batch_iterator = _iter_batches(dataloader)
         step = 0
 
         while step < n_steps:
             try:
-                input_ids = next(batch_iterator)  # type: ignore[call-overload]
+                input_ids, attention_mask = next(batch_iterator)  # type: ignore[call-overload]
             except StopIteration:
                 # Restart the dataloader iterator when exhausted.
                 batch_iterator = _iter_batches(dataloader)
                 try:
-                    input_ids = next(batch_iterator)  # type: ignore[call-overload]
+                    input_ids, attention_mask = next(batch_iterator)  # type: ignore[call-overload]
                 except StopIteration:
                     logger.warning(
                         "DistillationTrainer: dataloader exhausted after %d steps "
@@ -397,7 +411,10 @@ class DistillationTrainer:
                     )
                     break
 
-            input_ids = input_ids.to(next(self.model.parameters()).device)
+            _device = next(self.model.parameters()).device
+            input_ids = input_ids.to(_device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(_device)
 
             optimizer.zero_grad()
 
@@ -412,6 +429,7 @@ class DistillationTrainer:
                     min_snr_gamma=min_snr_gamma,
                     kd_weight=kd_weight,
                     kd_temp=kd_temp,
+                    loss_mask=attention_mask,
                 )
 
             loss.backward()
@@ -515,6 +533,7 @@ class DistillationTrainer:
         min_snr_gamma: float,
         kd_weight: float,
         kd_temp: float,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute the stage-3 diffusion + optional KD loss for one minibatch.
 
@@ -524,6 +543,7 @@ class DistillationTrainer:
             min_snr_gamma: Min-SNR gamma clamp value.
             kd_weight: Weight applied to the soft-label KD term.
             kd_temp: Temperature for the soft-label KD distribution.
+            loss_mask: Optional padding mask ``[B, L]`` (1 = real token, 0 = pad).
 
         Returns:
             Scalar loss tensor with gradients.
@@ -545,29 +565,32 @@ class DistillationTrainer:
             t,
             ce_loss_weight=ce_loss_weight,
             min_snr_gamma=min_snr_gamma,
+            loss_mask=loss_mask,
         )
 
         if self.config.share_vocab and kd_weight > 0.0:
             teacher_out: TeacherOutputs = self.teacher(input_ids)
             if teacher_out.logits is not None:
-                # Obtain student logits via the output head on the denoised state.
-                # Use a t=0 clean pass to get a representative logit distribution.
+                # Obtain student logits via a t=0 clean pass through the full
+                # decode-then-head pipeline.  predict_token_logits handles
+                # encode_latent -> denoiser -> _to_x0_latent -> decode_latent ->
+                # output_head correctly for both latent and non-latent modes,
+                # avoiding the shape mismatch that arises from passing the raw
+                # d_latent denoiser output directly to output_head (which expects
+                # d_model decoded-embedding space).
                 t_zero = torch.zeros(B, dtype=torch.long, device=device)
-                align = self.model.align_forward(
-                    input_ids,
-                    return_hidden_states=True,
-                    return_matrices=False,
-                    drop_cond=True,
+                student_logits: torch.Tensor = self.model.predict_token_logits(
+                    input_ids, t_zero
                 )
-                denoiser_out: torch.Tensor = align["denoiser_out"]  # [B, L, d_latent]
-                student_logits: torch.Tensor = self.model.output_head(denoiser_out)
 
                 teacher_logits: torch.Tensor = teacher_out.logits
 
                 # Require matching vocab sizes for soft-label KD.
                 if student_logits.shape[-1] == teacher_logits.shape[-1]:
                     kd_loss = stage3_kd_loss(
-                        student_logits, teacher_logits, kd_temp=kd_temp
+                        student_logits,
+                        teacher_logits.to(student_logits.dtype),
+                        kd_temp=kd_temp,
                     )
                     loss = loss + kd_weight * kd_loss
                 else:

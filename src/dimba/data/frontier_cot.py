@@ -32,19 +32,33 @@ from torch.utils.data import ConcatDataset, Dataset
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_OPEN_THINK_RE = re.compile(r"<think>", re.IGNORECASE)
 
 
 def _extract_think_response(text: str) -> tuple[str, str]:
     """Split ``<think>...</think>response`` into ``(reasoning, response)``.
 
+    Joins ALL think blocks into reasoning (handles multi-step traces).
+    If a ``<think>`` is unterminated (truncated trace), everything after it
+    is treated as reasoning so raw CoT does not leak into the response.
     Falls back to ``("", text)`` when no think block is found — the example
     is then treated as a direct-answer sample by ``BlockCoTDataset``.
     """
-    m = _THINK_RE.search(text)
-    if m:
-        reasoning = m.group(1).strip()
+    matches = _THINK_RE.findall(text)
+    if matches:
+        reasoning = "\n\n".join(m.strip() for m in matches if m.strip())
         response = _THINK_RE.sub("", text).strip()
+        # Guard against a trailing unterminated <think> after the last close tag.
+        if _OPEN_THINK_RE.search(response):
+            head, _, tail = response.partition("<think>")
+            reasoning = (reasoning + "\n\n" + tail.strip()).strip()
+            response = head.strip()
         return reasoning, response
+    # No closed block. If an opening <think> exists, the trace is truncated:
+    # treat everything after it as reasoning so raw CoT does not leak as answer.
+    om = _OPEN_THINK_RE.search(text)
+    if om:
+        return text[om.end():].strip(), text[:om.start()].strip()
     return "", text.strip()
 
 
@@ -56,8 +70,8 @@ def _parse_conversations(conversations: List[Dict]) -> tuple[str, str]:
     """
     prompt, assistant = "", ""
     for turn in conversations:
-        role = turn.get("from", turn.get("role", "")).lower()
-        value = turn.get("value", turn.get("content", "")).strip()
+        role = (turn.get("from") or turn.get("role") or "").lower()
+        value = (turn.get("value") or turn.get("content") or "").strip()
         if role in ("human", "user"):
             prompt = value
         elif role in ("gpt", "assistant"):
@@ -79,7 +93,11 @@ class KelexineFableTracesDataset(Dataset):
         from datasets import load_dataset
         ds = load_dataset("kelexine/fable-5-sft-traces", split=split,
                           trust_remote_code=True)
-        ds = ds.filter(lambda r: r.get("task_type") == "reasoning")
+        assert "task_type" in ds.column_names, (
+            f"kelexine/fable-5-sft-traces missing 'task_type' column; "
+            f"got {ds.column_names}"
+        )
+        ds = ds.filter(lambda r: r["task_type"] == "reasoning")
         if max_examples is not None:
             ds = ds.select(range(min(max_examples, len(ds))))
         self._data = ds
@@ -111,7 +129,14 @@ class FusionCubeFableCoTDataset(Dataset):
         from datasets import load_dataset
         ds = load_dataset("TheFusionCube/Fable-5-CoT-Traces", split=split,
                           trust_remote_code=True)
-        ds = ds.filter(lambda r: not r.get("truncated", False))
+        if "truncated" in ds.column_names:
+            ds = ds.filter(lambda r: not r["truncated"])
+        else:
+            import logging
+            logging.getLogger(__name__).warning(
+                "FusionCube: no 'truncated' column (cols=%s); keeping all rows",
+                ds.column_names,
+            )
         if max_examples is not None:
             ds = ds.select(range(min(max_examples, len(ds))))
         self._data = ds
@@ -253,21 +278,25 @@ class GlaiveReasoningDataset(Dataset):
     ``prompt`` / ``response`` columns; ``<think>`` is inline in ``response``.
 
     Args:
-        max_examples: Default 50_000.  Pass None for the full 22 M (slow).
+        max_examples: Default 50_000.  Must be a finite int; the source has
+            ~22 M rows and buffering them all OOMs.
     """
 
     def __init__(self, split: str = "train",
                  max_examples: Optional[int] = 50_000) -> None:
-        from datasets import load_dataset
+        from datasets import load_dataset, Dataset as HFDataset
+        if max_examples is None:
+            raise ValueError(
+                "GlaiveReasoningDataset requires a finite max_examples; the source has "
+                "~22M rows and buffering them all OOMs. Pass an int (default 50_000)."
+            )
         # Stream to avoid downloading all 22M rows before selecting.
-        ds_stream = load_dataset("glaiveai/reasoning-v1-20m", split=split,
-                                 trust_remote_code=True, streaming=True)
-        rows = []
-        for i, row in enumerate(ds_stream):
-            if max_examples is not None and i >= max_examples:
-                break
-            rows.append(row)
-        self._data = rows
+        stream = load_dataset("glaiveai/reasoning-v1-20m", split=split,
+                              trust_remote_code=True, streaming=True)
+        rows = list(stream.take(max_examples))
+        # Materialize into an Arrow-backed Dataset so DataLoader workers
+        # memory-map and share it instead of pickling the rows into each worker.
+        self._data = HFDataset.from_list(rows)
 
     def __len__(self) -> int:
         return len(self._data)

@@ -69,8 +69,10 @@ class TokenEmbedding(nn.Module):
 
         new_embedding = nn.Embedding(new_vocab_size, self.embed_dim,
                                      padding_idx=padding_idx).to(device=device, dtype=dtype)
-        nn.init.zeros_(new_embedding.weight)
+        # Copy existing rows first, then mean-initialize new rows so the new tokens
+        # are not in a zero-logit / zero-embedding degenerate state.
         new_embedding.weight.data[:old_size] = old_weight
+        new_embedding.weight.data[old_size:] = old_weight.mean(dim=0, keepdim=True)
         self.embedding = new_embedding
         self.vocab_size = new_vocab_size
 
@@ -86,9 +88,10 @@ class TimestepEmbedding(nn.Module):
         out_dim: Output dimension after MLP projection
     """
 
-    def __init__(self, time_embed_dim: int = 128, out_dim: int = 512):
+    def __init__(self, time_embed_dim: int = 128, out_dim: int = 512, max_steps: int = 10000):
         super().__init__()
         self.time_embed_dim = time_embed_dim
+        self.max_steps = int(max_steps)
 
         # Sinusoidal position encoding
         pe = self._create_position_encoding()
@@ -107,12 +110,15 @@ class TimestepEmbedding(nn.Module):
         Uses standard transformer-style positional encoding.
         """
         dim = self.time_embed_dim
-        position = torch.arange(10000, dtype=torch.float32)  # Support up to 10k timesteps
+        n = self.max_steps
+        position = torch.arange(n, dtype=torch.float32)
 
         # Dimension indices for even/odd positions
+        # NOTE: 10000.0 here is the frequency base constant of the sinusoidal formula,
+        # not the number of timesteps; only the row count n changes with max_steps.
         div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * -(math.log(10000.0) / dim))
 
-        pe = torch.zeros(10000, dim)
+        pe = torch.zeros(n, dim)
         pe[:, 0::2] = torch.sin(position.unsqueeze(1) * div_term)
         pe[:, 1::2] = torch.cos(position.unsqueeze(1) * div_term)
 

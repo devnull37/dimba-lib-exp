@@ -214,22 +214,30 @@ class TeacherWrapper(nn.Module):
             output_attentions=True,
             trust_remote_code=trust_remote_code,
             torch_dtype=dtype,
+            attn_implementation="eager",
         )
 
+        def _load_model(auto_cls, fallback_cls, path, kwargs):
+            """Try loading with eager attn; retry without it for custom models."""
+            try:
+                return auto_cls.from_pretrained(path, **kwargs)
+            except Exception:
+                pass
+            # Some custom/remote-code models reject attn_implementation; retry without.
+            kwargs_no_eager = {k: v for k, v in kwargs.items() if k != "attn_implementation"}
+            try:
+                return auto_cls.from_pretrained(path, **kwargs_no_eager)
+            except Exception:
+                return fallback_cls.from_pretrained(path, **kwargs_no_eager)
+
         if teacher_type == "causal":
-            try:
-                self._hf_model = AutoModelForCausalLM.from_pretrained(
-                    model_id_or_path, **load_kwargs
-                )
-            except Exception:
-                self._hf_model = AutoModel.from_pretrained(model_id_or_path, **load_kwargs)
+            self._hf_model = _load_model(
+                AutoModelForCausalLM, AutoModel, model_id_or_path, load_kwargs
+            )
         else:
-            try:
-                self._hf_model = AutoModelForMaskedLM.from_pretrained(
-                    model_id_or_path, **load_kwargs
-                )
-            except Exception:
-                self._hf_model = AutoModel.from_pretrained(model_id_or_path, **load_kwargs)
+            self._hf_model = _load_model(
+                AutoModelForMaskedLM, AutoModel, model_id_or_path, load_kwargs
+            )
 
         self._hf_model.to(device=device, dtype=dtype)
         self._hf_model.eval()
@@ -376,18 +384,22 @@ class TeacherWrapper(nn.Module):
         outputs = self._hf_model(**kwargs)
 
         hidden_states: Tuple = outputs.hidden_states  # tuple length L+1
-        attentions: Tuple = outputs.attentions  # tuple length L
+        attentions = outputs.attentions  # tuple length L, or None when backend returns nothing
 
         logits: Optional[torch.Tensor] = getattr(outputs, "logits", None)
+
+        # Guard against the whole attentions field being None (SDPA/Flash backend even
+        # with output_attentions=True on some recent transformers versions).
+        B, L = input_ids.shape
+        if attentions is None:
+            attentions = (None,) * self.num_layers
 
         # Some models return None attentions per layer (e.g. Flash-Attention variants).
         # Replace None entries with zero tensors of the expected shape.
         cleaned_attentions: List[torch.Tensor] = []
-        B, L = input_ids.shape
         for attn in attentions:
             if attn is None:
                 nh = self.num_heads
-                dt = self.d_model
                 cleaned_attentions.append(
                     torch.zeros(B, nh, L, L, dtype=self._dtype, device=input_ids.device)
                 )

@@ -249,7 +249,7 @@ def sample_from_model(
 
         # Pull the prediction toward the token manifold in the final `clamp_from`
         # fraction of steps (soft = expected embedding, hard = nearest token).
-        if clamp_mode != "none" and (i + 1) / n_steps >= (1.0 - clamp_from):
+        if clamp_mode != "none" and clamp_from > 0 and (i + 1) / n_steps >= (1.0 - clamp_from):
             if clamp_mode == "soft":
                 x0_hat = _soft_clamp_latent_to_tokens(model, x0_hat, temperature)
             else:
@@ -418,12 +418,12 @@ def sample_from_model_flow(
     # Uniform time grid from t=1 → t=0
     ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
 
-    def _velocity(xt, t_val):
+    def _velocity(xt, t_val, x_self_cond=None):
         t_batch = torch.full((batch_size,), t_val, device=device)
         # model's denoise_to_x0_latent returns x0 prediction; velocity = (xt - x0) / t
-        x0_hat = model.denoise_flow(xt, t_batch, cond)
+        x0_hat = model.denoise_flow(xt, t_batch, cond, x_self_cond)
         if use_cfg:
-            x0_uncond = model.denoise_flow(xt, t_batch, uncond)
+            x0_uncond = model.denoise_flow(xt, t_batch, uncond, x_self_cond)
             x0_hat = x0_uncond + guidance_scale * (x0_hat - x0_uncond)
         # v = (x_t - x0) / t  (rearranged from x_t = (1-t)*x0 + t*noise)
         v = (xt - x0_hat) / max(t_val, 1e-5)
@@ -436,7 +436,7 @@ def sample_from_model_flow(
         t_nxt = float(ts[i + 1])
         dt = t_nxt - t_cur  # negative (integrating backward)
 
-        v_cur, x0_hat = _velocity(x_t, t_cur)
+        v_cur, x0_hat = _velocity(x_t, t_cur, x_self_cond)
         x_self_cond = x0_hat
 
         if sampler == "heun" and i < num_steps - 1:
@@ -444,7 +444,7 @@ def sample_from_model_flow(
             x_mid = x_t + v_cur * dt
             if prompt_latent is not None:
                 x_mid[:, :prompt_len, :] = prompt_latent
-            v_nxt, _ = _velocity(x_mid, t_nxt)
+            v_nxt, _ = _velocity(x_mid, t_nxt, x_self_cond)
             # Corrector: average the two velocities
             x_t = x_t + 0.5 * (v_cur + v_nxt) * dt
         else:
@@ -503,5 +503,4 @@ class DDIMSampler:
             top_p=top_p,
             guidance_scale=guidance_scale,
             eta=self.ddim_eta,
-            device=self.device,
         )
