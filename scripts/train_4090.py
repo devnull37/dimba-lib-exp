@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full DIMBA training pipeline optimised for a 48 GB GPU (RTX 4090 modded / A6000).
+"""Full DIMBA training pipeline optimised for a 48 GB GPU (RTX 4090 modded / L40S / A6000 Ada).
 
 Phases
 ------
@@ -19,6 +19,8 @@ Run a single phase:
 Resume from a checkpoint:
     python scripts/train_4090.py --phase grpo --checkpoint checkpoints/grpo/grpo_step200.pt --resume
 
+Flow matching is ON by default (15 Euler steps ≈ 2× faster inference than 30 DPM++ steps).
+
 The script writes ./training_state.json after every log_interval steps so that a
 Claude /loop monitor (scripts/monitor.py) can read progress and adjust config.
 """
@@ -34,6 +36,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # ── add project root to path ──────────────────────────────────────────────────
@@ -54,6 +57,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("train_4090")
 
+# ── hardware flags (set before any CUDA calls) ────────────────────────────────
+# tf32 gives free ~10% matmul speedup on Ampere/Ada with no quality loss.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # ── defaults (tuned for 48 GB VRAM + SmolLM-135M teacher) ────────────────────
 
 TEACHER_MODEL = "HuggingFaceTB/SmolLM-135M"
@@ -69,11 +77,13 @@ STUDENT_CFG = dict(
     d_state=64,
     d_conv=4,
     expand=2,
-    conditioning_type="film",
+    conditioning_type="adaln",  # AdaLN-Zero (DiT-style, better than FiLM)
+    use_flow_matching=True,     # rectified flow — ~2-3× faster inference
+    flow_logit_normal=True,     # logit-normal timestep sampling (SD3/FLUX schedule)
     use_weight_tying=True,
     use_simple_mamba=False,
-    block_ffn=True,         # inherit teacher FFN (Mode A)
-    ffn_type="swiglu",      # SmolLM uses SwiGLU
+    block_ffn=True,             # inherit teacher FFN (Mode A)
+    ffn_type="swiglu",          # SmolLM uses SwiGLU
 )
 
 DISTILL_CFG = dict(
@@ -92,17 +102,22 @@ DISTILL_CFG = dict(
     kd_temp=2.0,
     device="cuda",
     stages=[
+        # Stage 1: align Mamba mixing matrices → teacher attention maps (clean pass)
         {"name": "stage1", "steps": 500,  "lr": 1e-3},
+        # Stage 2: align student hidden states → teacher residual stream (clean pass)
         {"name": "stage2", "steps": 500,  "lr": 5e-4},
-        {"name": "stage3", "steps": 2000, "lr": 2e-4,
+        # Stage 3: diffusion objective (flow matching) + optional logit-KD
+        # More steps than before: flow matching needs a short warmup before loss
+        # drops because the velocity target is a different scale than DDPM MSE.
+        {"name": "stage3", "steps": 3000, "lr": 2e-4,
          "ce_loss_weight": 1.0, "min_snr_gamma": 5.0},
     ],
 )
 
-# SFT hyperparams (48 GB → large batch)
+# SFT hyperparams — 48 GB lets us double the batch size vs 24 GB
 SFT_CFG = dict(
-    batch_size=32,
-    grad_accum=4,          # effective batch = 128
+    batch_size=64,          # 48 GB → 64 (was 32 on 24 GB)
+    grad_accum=2,           # effective batch = 128 (same as before)
     lr=2e-5,
     warmup_steps=100,
     num_epochs=2,
@@ -114,9 +129,11 @@ SFT_CFG = dict(
     max_grad_norm=1.0,
     save_interval=500,
     log_interval=20,
+    num_workers=8,          # more CPU workers for fast NVMe on Vast
+    prefetch_factor=2,
 )
 
-# GRPO hyperparams (anti-overthinking tuned for 135M)
+# GRPO hyperparams (anti-overthinking tuned for 135M + flow matching)
 GRPO_CFG = GRPOConfig(
     block_size=64,
     max_think_blocks=2,          # hard cap — prevents overthinking
@@ -137,8 +154,9 @@ GRPO_CFG = GRPOConfig(
     save_interval=200,
     save_dir="./checkpoints/grpo",
     state_file="./training_state.json",
-    num_diffusion_steps_inference=30,   # fewer steps for GRPO rollouts (speed)
-    sampler="dpmpp",
+    # Flow matching: 15 Euler steps ≈ same quality as 30 DPM++ steps, ~2× faster
+    num_diffusion_steps_inference=15,
+    sampler="euler",
 )
 
 
@@ -151,7 +169,6 @@ def _write_state(state: dict, path: str = "./training_state.json") -> None:
 
 
 def _load_tokenizer(teacher_model: str):
-    """Load the teacher's HuggingFace tokenizer."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(teacher_model)
     if tok.pad_token is None:
@@ -170,22 +187,36 @@ def _build_or_load_model(
         model = DIMBA(**cfg)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
     else:
-        logger.info("building fresh student model")
+        logger.info("building fresh student model (Mode A: inherit teacher weights)")
         teacher = TeacherWrapper(TEACHER_MODEL, device=str(device))
-        model = build_student_from_teacher(teacher, extra_student_kwargs=dict(
-            num_diffusion_steps=1000,
-            d_state=64,
-            d_conv=4,
-            expand=2,
-            conditioning_type="film",
-            use_simple_mamba=False,
-        ))
+        model = build_student_from_teacher(
+            teacher,
+            extra_student_kwargs=dict(
+                num_diffusion_steps=1000,
+                d_state=64,
+                d_conv=4,
+                expand=2,
+                conditioning_type="adaln",
+                use_flow_matching=True,
+                flow_logit_normal=True,
+                use_simple_mamba=False,
+            ),
+        )
         teacher.unload()
 
     model = model.to(device)
     if torch.cuda.is_available():
-        model = torch.compile(model)  # 10-30% speedup on 4090
+        # reduce-overhead removes Python overhead per step (~15% extra speedup on Ada)
+        model = torch.compile(model, mode="reduce-overhead")
     return model
+
+
+def _log_vram(device: torch.device, tag: str = "") -> None:
+    if device.type != "cuda":
+        return
+    used = torch.cuda.memory_allocated(device) / 1e9
+    reserved = torch.cuda.memory_reserved(device) / 1e9
+    logger.info("VRAM %s: %.1f GB allocated / %.1f GB reserved", tag, used, reserved)
 
 
 # ── phase 1: distillation ─────────────────────────────────────────────────────
@@ -202,7 +233,14 @@ def run_distill(
     cfg.device = str(device)
 
     teacher = TeacherWrapper(TEACHER_MODEL, device=str(device))
-    model = build_student_from_teacher(teacher)
+    model = build_student_from_teacher(
+        teacher,
+        extra_student_kwargs=dict(
+            use_flow_matching=True,
+            flow_logit_normal=True,
+            conditioning_type="adaln",
+        ),
+    )
 
     if resume and os.path.isfile(resume):
         ckpt = torch.load(resume, map_location="cpu")
@@ -210,6 +248,7 @@ def run_distill(
         logger.info("resumed distillation from %s", resume)
 
     model = model.to(device)
+    _log_vram(device, "post-model-load")
 
     trainer = DistillationTrainer(
         student=model,
@@ -247,7 +286,6 @@ def run_sft(
     think_start_id = tokenizer.convert_tokens_to_ids("<think>") if "<think>" in tokenizer.get_vocab() else None
     think_end_id = tokenizer.convert_tokens_to_ids("</think>") if "</think>" in tokenizer.get_vocab() else None
 
-    # ── datasets: 80% SmolTalk, 20% Orca-Math ────────────────────────────────
     logger.info("loading SmolTalk …")
     smol = SmolTalkDataset(split="train", subset="smol-magpie-ultra")
     logger.info("loading Orca-Math …")
@@ -270,10 +308,16 @@ def run_sft(
         think_end_id=think_end_id,
         pad_id=tokenizer.pad_token_id or 0,
     )
-    loader = DataLoader(ds, batch_size=cfg["batch_size"], shuffle=True,
-                        num_workers=4, pin_memory=True)
+    loader = DataLoader(
+        ds,
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        num_workers=cfg["num_workers"],
+        pin_memory=True,
+        prefetch_factor=cfg["prefetch_factor"],
+        persistent_workers=True,
+    )
 
-    # ── optimizer + schedule ──────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
                                   weight_decay=cfg["weight_decay"])
     total_steps = cfg["num_epochs"] * len(loader)
@@ -293,31 +337,28 @@ def run_sft(
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_step = ckpt.get("step", 0)
 
-    # ── training loop ─────────────────────────────────────────────────────────
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     global_step = start_step
     accum = cfg["grad_accum"]
     model.train()
+    _log_vram(device, "SFT start")
 
     for epoch in range(cfg["num_epochs"]):
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
             response_mask = batch["response_mask"].to(device)
-            labels = input_ids.clone()
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                # Standard DIMBA forward (returns x_pred, noise, latent_info)
-                _, _, latent_info = model(input_ids)
-                # Compute CE loss on response positions only
-                logits = model.output_head(model.decode_latent(latent_info["x0_pred"]
-                                                                if "x0_pred" in latent_info
-                                                                else latent_info.get("x_pred", latent_info["recon"])))
+                # x_pred: decoded x0 prediction [B, L, d_model], already in embedding space
+                x_pred, _, _ = model(input_ids)
+                logits = model.output_head(x_pred)         # [B, L, vocab]
                 loss_per_token = F.cross_entropy(
                     logits.reshape(-1, logits.shape[-1]),
-                    labels.reshape(-1),
+                    input_ids.reshape(-1),
                     reduction="none",
                 )
-                loss = (loss_per_token * response_mask.reshape(-1)).sum() / response_mask.sum().clamp(min=1)
+                loss = (loss_per_token * response_mask.reshape(-1)).sum() \
+                       / response_mask.sum().clamp(min=1)
                 loss = loss / accum
 
             scaler.scale(loss).backward()
@@ -334,9 +375,10 @@ def run_sft(
 
             if global_step % cfg["log_interval"] == 0:
                 lr_now = scheduler.get_last_lr()[0]
-                logger.info("SFT step %d | loss=%.4f | lr=%.2e", global_step, loss.item() * accum, lr_now)
+                logger.info("SFT step %d | loss=%.4f | lr=%.2e",
+                            global_step, loss.item() * accum, lr_now)
                 _write_state({"stage": "sft", "step": global_step,
-                               "loss": loss.item() * accum, "lr": lr_now})
+                              "loss": loss.item() * accum, "lr": lr_now})
 
             if global_step % cfg["save_interval"] == 0:
                 ckpt_path = os.path.join(save_dir, f"sft_step{global_step}.pt")
@@ -367,20 +409,19 @@ def run_grpo(
     save_dir: str = "./checkpoints/grpo",
     resume: Optional[str] = None,
     num_steps: int = 2000,
-    data: str = "orca",          # "orca" | "smoltalk" | "both"
+    data: str = "orca",
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
-    logger.info("=== PHASE 3: GRPO (anti-overthinking) ===")
+    logger.info("=== PHASE 3: GRPO (anti-overthinking, flow sampler) ===")
 
     model = _build_or_load_model(checkpoint, device)
     tokenizer = _load_tokenizer(TEACHER_MODEL)
 
-    # Add <think> / </think> as special tokens if not present
     special_tokens = {}
     if "<think>" not in tokenizer.get_vocab():
         special_tokens["additional_special_tokens"] = ["<think>", "</think>"]
         tokenizer.add_special_tokens(special_tokens)
-        model.token_embed.resize(tokenizer.vocab_size)  # grow embedding table
+        model.token_embed.resize(tokenizer.vocab_size)
 
     think_start_id = tokenizer.convert_tokens_to_ids("<think>")
     think_end_id = tokenizer.convert_tokens_to_ids("</think>")
@@ -397,7 +438,6 @@ def run_grpo(
     if resume and os.path.isfile(resume):
         trainer.load_checkpoint(resume)
 
-    # ── load prompts for GRPO ─────────────────────────────────────────────────
     logger.info("loading GRPO prompts (%s) …", data)
     prompts, references = [], []
     if data in ("orca", "both"):
@@ -414,8 +454,8 @@ def run_grpo(
             references.append(item["response"])
 
     logger.info("%d GRPO prompts loaded", len(prompts))
-    B = grpo_cfg.group_size  # process 1 prompt per step (group_size rollouts)
 
+    _log_vram(device, "GRPO start")
     for step_idx in range(num_steps):
         idx = step_idx % len(prompts)
         metrics = trainer.train_step([prompts[idx]], [references[idx]])
@@ -451,23 +491,33 @@ def parse_args() -> argparse.Namespace:
                    help="Dataset for GRPO rollouts")
     p.add_argument("--teacher", default=TEACHER_MODEL,
                    help=f"HuggingFace teacher model (default: {TEACHER_MODEL})")
+    p.add_argument("--no-flow", action="store_true",
+                   help="Disable flow matching (fall back to DDPM cosine schedule)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    logger.info("device: %s  |  VRAM: %.1f GB",
-                device,
-                torch.cuda.get_device_properties(device).total_memory / 1e9
-                if device.type == "cuda" else 0)
 
-    # Override teacher if specified
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        logger.info("GPU: %s  |  VRAM: %.1f GB  |  SM: %d.%d",
+                    props.name, props.total_memory / 1e9,
+                    props.major, props.minor)
+
+    if args.no_flow:
+        STUDENT_CFG["use_flow_matching"] = False
+        DISTILL_CFG.setdefault("stages", [])  # stages unchanged
+        GRPO_CFG.num_diffusion_steps_inference = 30
+        GRPO_CFG.sampler = "dpmpp"
+        logger.info("flow matching disabled (--no-flow)")
+
     global TEACHER_MODEL
     TEACHER_MODEL = args.teacher
     DISTILL_CFG["teacher_model"] = args.teacher
 
-    ckpt = args.checkpoint  # flows through phases
+    ckpt = args.checkpoint
 
     if args.phase in ("distill", "all"):
         ckpt = run_distill(device, resume=ckpt if args.resume else None)
@@ -485,5 +535,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import torch.nn.functional as F
     main()

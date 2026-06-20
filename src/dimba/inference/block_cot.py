@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 from typing import Optional, Dict, Any
 
-from ..diffusion.sampling import sample_from_model
+from ..diffusion.sampling import sample_from_model, sample_from_model_flow
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -124,7 +124,14 @@ def block_sample_from_model(
                                    dtype=torch.long, device=device)
             gen_prefix = torch.cat([gen_prefix, start_tok], dim=1) if gen_prefix is not None else start_tok
 
-        block = sample_from_model(model, gen_prefix, block_size, **sample_kwargs)  # [B, block_size]
+        if getattr(model, "use_flow_matching", False):
+            block = sample_from_model_flow(
+                model, gen_prefix, seq_len=block_size,
+                num_steps=sample_kwargs.get("num_steps", 20),
+                sampler=sample_kwargs.get("sampler", "euler"),
+            )
+        else:
+            block = sample_from_model(model, gen_prefix, block_size, **sample_kwargs)  # [B, block_size]
 
         if adaptive_stop and _is_degenerate(block, eos_id, rep_threshold, think_blocks):
             break
@@ -142,7 +149,14 @@ def block_sample_from_model(
         prefix = torch.cat(parts, dim=1)
 
     # Generate final response conditioned on prefix (prompt + all think blocks)
-    response = sample_from_model(model, prefix, response_len, **sample_kwargs)  # [B, response_len]
+    if getattr(model, "use_flow_matching", False):
+        response = sample_from_model_flow(
+            model, prefix, seq_len=response_len,
+            num_steps=sample_kwargs.get("num_steps", 20),
+            sampler=sample_kwargs.get("sampler", "euler"),
+        )
+    else:
+        response = sample_from_model(model, prefix, response_len, **sample_kwargs)
 
     full_ids = torch.cat([prefix, response], dim=1) if prefix is not None else response
 
