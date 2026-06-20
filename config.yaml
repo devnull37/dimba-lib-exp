@@ -83,3 +83,26 @@ progressive_checkpoints:
   milestones: [1000000000, 5000000000, 10000000000, 30000000000]  # 1B, 5B, 10B, 30B params
   save_dir: "./progressive_checkpoints"
   # Resume from progressive checkpoint: set checkpoint_path to the milestone checkpoint file
+
+# Cross-architecture distillation (scripts/distill.py)
+# Distill a pretrained HuggingFace Transformer teacher into DIMBA's Mamba-2 student.
+distillation:
+  teacher_model: "sshleifer/tiny-gpt2"  # HF id or local path (any causal/bidirectional Transformer)
+  teacher_type: "causal"                # 'causal' (GPT/Llama/Qwen/Pythia) | 'bidirectional' (BERT)
+  mode: "convert"                       # 'convert' (inherit teacher FFN) | 'assist' (FFN-less)
+  block_ffn: true                       # add a channel-mixing FFN to each Mamba block (Mode A)
+  inherit_embeddings: true              # copy teacher token embeddings into the student
+  inherit_ffn: true                     # copy teacher per-layer MLP weights into the student blocks
+  inherit_head: true                    # copy teacher LM head into the student output head
+  principled_init: false                # experimental Attention-to-Mamba Q/K/V/O init (Stage 0)
+  layer_map_mode: "uniform"             # 'uniform' | 'last' | 'explicit'
+  num_student_layers: null              # null -> match teacher depth; or an int subset
+  share_vocab: false                    # true -> enable Stage-3 logit KD (teacher shares DIMBA's vocab)
+  kd_weight: 1.0
+  kd_temp: 2.0
+  device: "cpu"
+  # Staged schedule: matrix-orientation -> hidden-state alignment -> end-to-end (+optional KD).
+  stages:
+    - { name: stage1, steps: 500, lr: 1.0e-3 }
+    - { name: stage2, steps: 500, lr: 5.0e-4 }
+    - { name: stage3, steps: 1000, lr: 2.0e-4, ce_loss_weight: 1.0, min_snr_gamma: 5.0 }
