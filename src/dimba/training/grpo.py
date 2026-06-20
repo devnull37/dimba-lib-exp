@@ -1,27 +1,34 @@
-"""GRPO (Group Relative Policy Optimization) for DIMBA block-CoT models.
+"""GRPO / MGPO training for DIMBA block-CoT models.
 
-Implements diffu-GRPO (d1 paper, arXiv:2504.12216) adapted for DIMBA's
-Gaussian continuous diffusion and block-CoT generation format.
+Implements diffu-GRPO (d1, arXiv:2504.12216) with three improvements from
+VibeThinker (arXiv:2606.16140):
 
-Algorithm per step
-    1. For each prompt in the batch, generate G completions via block CoT.
-    2. Score completions with a verifiable reward function.
-    3. Compute group-relative advantages: A_i = (r_i - μ) / (σ + ε).
-    4. Estimate policy log-prob of each completion using the ELBO surrogate
-       (antithetic timestep sampling for variance reduction, VRPO-style).
-    5. GRPO loss = -mean(A_i * lp_i) + β * KL(policy ∥ ref).
-    6. Anti-overthinking: thinking-length penalty subtracted from reward.
+  MGPO weighting      Prompts where the model's group accuracy p(q) ≈ 0.5
+                      (capability boundary) are upweighted.  Easy wins
+                      (p≈1) and hopeless prompts (p≈0) contribute little.
+                      w(q) = exp(-γ · (p(q) - 0.5)² / 0.25)
+
+  Long2Short reward   Within each group, correct-but-shorter completions get
+                      a normalised brevity bonus instead of a fixed per-token
+                      penalty.  Only applied to completions where r > 0.
+                      bonus_i = λ · (s_i - s̄) / (max|s_j - s̄| + ε)
+                      where s_i = 1/L_i  (inverse total length).
+
+  LR warmup           Linear warmup then cosine decay — previously missing
+                      from the GRPO optimizer.
 
 References
-    d1 / diffu-GRPO:      arXiv:2504.12216
-    GRPO / DeepSeekMath:  arXiv:2402.03300
-    LLaDA 1.5 / VRPO:     arXiv:2505.19223  (antithetic timesteps)
+    d1 / diffu-GRPO:        arXiv:2504.12216
+    GRPO / DeepSeekMath:    arXiv:2402.03300
+    LLaDA 1.5 / VRPO:       arXiv:2505.19223  (antithetic timesteps)
+    VibeThinker / MGPO:     arXiv:2606.16140
 """
 from __future__ import annotations
 
 import copy
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field, asdict
@@ -42,20 +49,24 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GRPOConfig:
-    """Hyperparameters for GRPO training.
+    """Hyperparameters for GRPO/MGPO training.
 
-    Anti-overthinking knobs
-        max_think_blocks:       hard cap on thinking blocks generated (2 is good for 135M).
-        thinking_length_weight: reward penalty per think token (0.01–0.05 range).
-        min_response_reward:    completions with no think blocks get a small bonus if
-                                they answer correctly — encourages direct answers for easy
-                                prompts (set to 0 to disable).
+    MGPO knobs
+        use_mgpo:       Enable max-entropy prompt weighting (VibeThinker).
+        mgpo_gamma:     Sharpness of the capability-boundary gate (2.0 is good).
+                        Higher = only train on very-boundary prompts.
+
+    Long2Short knobs
+        long2short_lambda:  Normalised brevity bonus weight (0.2 from VibeThinker).
+                            Set to 0 to use the old fixed thinking_length_weight.
+        thinking_length_weight: Legacy fixed penalty per think token.  Ignored
+                            when long2short_lambda > 0.
 
     GRPO core
-        group_size:   number of completions to sample per prompt (G; 8 is standard).
-        kl_coeff:     KL(policy ∥ ref) weight (β; 0.01–0.1).
-        mc_samples:   ELBO MC timestep samples for log-prob estimation (2 = good tradeoff).
-        antithetic:   use antithetic timestep pairs for variance reduction (VRPO).
+        group_size:     Completions per prompt (G).
+        kl_coeff:       KL(policy ‖ ref) weight β.
+        mc_samples:     ELBO MC samples for log-prob (2 is a good tradeoff).
+        antithetic:     Antithetic timestep pairs for variance reduction (VRPO).
     """
     # ── generation ────────────────────────────────────────────────────────────
     block_size: int = 64
@@ -65,12 +76,17 @@ class GRPOConfig:
     think_end_id: Optional[int] = None
     eos_id: Optional[int] = None
     adaptive_stop: bool = True
-    num_diffusion_steps_inference: int = 50
-    sampler: str = "dpmpp"         # fast; switch to "ddim" if dpmpp is unstable early
+    num_diffusion_steps_inference: int = 15
+    sampler: str = "euler"          # flow matching default
 
-    # ── anti-overthinking ─────────────────────────────────────────────────────
-    thinking_length_weight: float = 0.02     # penalty per think token; 0 to disable
-    min_response_reward_bonus: float = 0.05  # tiny bonus for direct (no-think) correct answer
+    # ── MGPO (VibeThinker max-entropy weighting) ──────────────────────────────
+    use_mgpo: bool = True
+    mgpo_gamma: float = 2.0         # higher = tighter gate around p(q)=0.5
+
+    # ── Long2Short (normalised brevity bonus) ─────────────────────────────────
+    long2short_lambda: float = 0.2  # 0 = disable, use thinking_length_weight instead
+    thinking_length_weight: float = 0.02   # legacy; only used when long2short_lambda==0
+    min_response_reward_bonus: float = 0.05  # small bonus for correct direct answers
 
     # ── GRPO core ─────────────────────────────────────────────────────────────
     group_size: int = 8
@@ -84,13 +100,14 @@ class GRPOConfig:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     warmup_steps: int = 50
+    total_steps: int = 2000         # for cosine schedule
     bf16: bool = True
 
     # ── logging / checkpointing ───────────────────────────────────────────────
     log_interval: int = 10
     save_interval: int = 200
     save_dir: str = "./checkpoints/grpo"
-    state_file: str = "./training_state.json"   # for /loop monitor
+    state_file: str = "./training_state.json"
 
 
 # ── core utilities ────────────────────────────────────────────────────────────
@@ -103,14 +120,15 @@ def _compute_elbo_logprob(
     antithetic: bool,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """ELBO-surrogate log-prob for the response positions of *input_ids*. [B]."""
+    """ELBO-surrogate log-prob for response positions of *input_ids*. Returns [B]."""
     B = input_ids.shape[0]
     T = model.num_diffusion_steps
     total_lp = torch.zeros(B, device=input_ids.device)
 
+    if antithetic and mc_samples < 2:
+        antithetic = False  # can't do antithetic pairs with fewer than 2 samples
     draws = mc_samples // 2 if antithetic else mc_samples
     draws = max(1, draws)
-
     for _ in range(draws):
         if antithetic:
             t, t_ant = antithetic_timesteps(B, T, device=input_ids.device, generator=generator)
@@ -119,40 +137,79 @@ def _compute_elbo_logprob(
                                            timesteps=tt, num_mc_samples=1,
                                            generator=generator)
                 total_lp = total_lp + lp
-            n_draws = 2
         else:
             lp = elbo_sequence_logprob(model, input_ids, input_ids, response_mask,
                                        timesteps=None, num_mc_samples=1,
                                        generator=generator)
             total_lp = total_lp + lp
-            n_draws = 1
 
-    return total_lp / (draws * (2 if antithetic else 1))
+    n_total = draws * (2 if antithetic else 1)
+    return total_lp / n_total
 
 
 def _group_advantages(rewards: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Group-normalize rewards → advantages. *rewards* shape: [B, G]."""
+    """Group-normalize rewards → advantages. *rewards*: [B, G] → [B, G]."""
     mu = rewards.mean(dim=1, keepdim=True)
     sigma = rewards.std(dim=1, keepdim=True)
     return (rewards - mu) / (sigma + eps)
 
 
+def _mgpo_weights(rewards: torch.Tensor, gamma: float) -> torch.Tensor:
+    """MGPO prompt weights [B] from group rewards [B, G].
+
+    w(q) = exp(-γ · (p(q) - 0.5)² / 0.25)
+
+    Peaks at p(q)=0.5 (half the group correct — capability boundary).
+    Prompts trivially solved (p≈1) or impossible (p≈0) get near-zero weight.
+    """
+    p_q = (rewards > 0).float().mean(dim=1)        # [B] group accuracy
+    deviation = (p_q - 0.5).pow(2) / 0.25          # normalized distance from 0.5
+    return torch.exp(-gamma * deviation)             # [B]
+
+
+def _long2short_bonus(
+    full_lengths: torch.Tensor,    # [B*G] total sequence lengths
+    raw_rewards: torch.Tensor,     # [B*G] rewards before bonus
+    G: int,
+    lam: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Normalised brevity bonus (VibeThinker Long2Short).
+
+    Within each group of G completions:
+      s_i = 1/L_i  (brevity score; shorter = higher)
+      bonus_i = λ · (s_i - s̄) / (max|s_j - s̄| + ε)
+
+    Only applied to correct completions (raw_reward > 0) — we don't want to
+    reward short wrong answers.
+
+    Returns a bonus tensor [B*G] to add to raw_rewards.
+    """
+    B = full_lengths.shape[0] // G
+    s = 1.0 / full_lengths.float().clamp(min=1)    # [B*G] brevity scores
+    s = s.reshape(B, G)
+    correct = (raw_rewards.reshape(B, G) > 0).float()
+
+    s_bar = s.mean(dim=1, keepdim=True)             # [B, 1]
+    deviation = s - s_bar                           # [B, G]
+    max_dev = deviation.abs().max(dim=1, keepdim=True).values.clamp(min=eps)
+    normalised = deviation / max_dev                # [B, G] in [-1, 1]
+
+    bonus = lam * normalised * correct              # only for correct completions
+    return bonus.reshape(B * G)
+
+
 # ── trainer ──────────────────────────────────────────────────────────────────
 
 class GRPOTrainer:
-    """GRPO trainer for a DIMBA model with block-CoT generation.
+    """GRPO/MGPO trainer for a DIMBA model with block-CoT generation.
 
     Args:
-        model:     The policy DIMBA model (will be trained in-place).
+        model:     Policy DIMBA model (trained in-place).
         reward_fn: A :class:`~dimba.training.rewards.Reward` callable.
-                   For math: ``NumericAnswerReward()``.
-                   For general: ``CompositeReward([(ExactMatchReward(), 0.8),
-                                                   (LengthPenaltyReward(target_length=64), 0.2)])``.
-        tokenizer: Any object with ``.encode(str) -> List[int]`` and
-                   ``.decode(List[int]) -> str``.
-        config:    :class:`GRPOConfig` instance.
-        ref_model: Frozen reference model for KL penalty.  When *None*, a deep
-                   copy of *model* at construction time is used.
+        tokenizer: Object with ``.encode`` / ``.decode``.
+        config:    :class:`GRPOConfig`.
+        ref_model: Frozen reference model for KL penalty (deep copy if None).
     """
 
     def __init__(
@@ -168,16 +225,11 @@ class GRPOTrainer:
         self.tok = tokenizer
         self.cfg = config or GRPOConfig()
 
-        # Frozen reference model (deep copy if not provided)
-        if ref_model is not None:
-            self.ref_model = ref_model
-        else:
-            self.ref_model = copy.deepcopy(model)
+        self.ref_model = ref_model if ref_model is not None else copy.deepcopy(model)
         for p in self.ref_model.parameters():
             p.requires_grad_(False)
         self.ref_model.eval()
 
-        # Optimizer
         _fused = next(model.parameters()).is_cuda
         self.optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -186,6 +238,16 @@ class GRPOTrainer:
             fused=_fused,
         )
 
+        # Cosine LR schedule with linear warmup
+        def _lr_lambda(step: int) -> float:
+            if step < self.cfg.warmup_steps:
+                return step / max(1, self.cfg.warmup_steps)
+            progress = (step - self.cfg.warmup_steps) / max(
+                1, self.cfg.total_steps - self.cfg.warmup_steps
+            )
+            return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
         self.step = 0
         self._state: Dict[str, Any] = {}
 
@@ -204,15 +266,14 @@ class GRPOTrainer:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _generate_group(
-        self,
-        prompt_ids: torch.Tensor,
+        self, prompt_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate G completions per prompt.
 
         Returns:
-            full_ids      [B*G, seq_len]
-            response_ids  [B*G, response_len]
-            think_counts  [B*G]  (number of think blocks generated)
+            full_ids     [B*G, L]
+            response_ids [B*G, response_len]
+            think_counts [B*G]
         """
         B = prompt_ids.shape[0]
         G = self.cfg.group_size
@@ -233,18 +294,15 @@ class GRPOTrainer:
                 num_steps=self.cfg.num_diffusion_steps_inference,
                 sampler=self.cfg.sampler,
             )
-            full_list.append(out["full_ids"])    # [B, seq_len]
-            resp_list.append(out["response"])    # [B, response_len]
+            full_list.append(out["full_ids"])
+            resp_list.append(out["response"])
             count_list.append(
                 torch.full((B,), out["n_think_blocks"], dtype=torch.long, device=device)
             )
 
-        # Pad to same length (sequences may differ by overhead tokens)
         max_len = max(f.shape[1] for f in full_list)
-        padded = [
-            F.pad(f, (0, max_len - f.shape[1])) for f in full_list
-        ]
-        full_ids = torch.stack(padded, dim=1).reshape(B * G, max_len)  # [B*G, L]
+        padded = [F.pad(f, (0, max_len - f.shape[1])) for f in full_list]
+        full_ids = torch.stack(padded, dim=1).reshape(B * G, max_len)
         response_ids = torch.stack(resp_list, dim=1).reshape(B * G, self.cfg.response_len)
         think_counts = torch.stack(count_list, dim=1).reshape(B * G)
         return full_ids, response_ids, think_counts
@@ -253,47 +311,64 @@ class GRPOTrainer:
     def _score_completions(
         self,
         prompt_strs: List[str],
+        full_ids: torch.Tensor,
         response_ids: torch.Tensor,
-        reference_strs: Optional[List[str]],
         think_counts: torch.Tensor,
     ) -> torch.Tensor:
-        """Return reward tensor [B*G]."""
-        B_G = response_ids.shape[0]
+        """Score completions and apply Long2Short brevity bonus. Returns [B*G]."""
         G = self.cfg.group_size
-        B = B_G // G
-        device = response_ids.device
-
         resp_strs = self._decode(response_ids)
-        rewards = []
+        raw_rewards = []
 
         for i, (resp, n_think) in enumerate(zip(resp_strs, think_counts.tolist())):
             prompt_str = prompt_strs[i // G]
-            ref_str = reference_strs[i // G] if reference_strs else None
+            ref_str = getattr(self, "_references", [None] * len(prompt_strs))[i // G]
 
-            # Core task reward
             r = float(self.reward_fn(prompt_str, resp, ref_str))
 
-            # Anti-overthinking: penalize each think token
-            r -= n_think * self.cfg.block_size * self.cfg.thinking_length_weight
+            if self.cfg.long2short_lambda == 0:
+                # Legacy: fixed per-token penalty
+                r -= n_think * self.cfg.block_size * self.cfg.thinking_length_weight
 
-            # Small bonus for correct direct (no-think) answers
             if n_think == 0 and r > 0:
                 r += self.cfg.min_response_reward_bonus
 
-            rewards.append(r)
+            raw_rewards.append(r)
 
-        return torch.tensor(rewards, dtype=torch.float, device=device)
+        rewards = torch.tensor(raw_rewards, dtype=torch.float, device=full_ids.device)
+
+        if self.cfg.long2short_lambda > 0:
+            full_lengths = (full_ids != 0).sum(dim=1).float()  # non-pad tokens
+            bonus = _long2short_bonus(
+                full_lengths, rewards, G,
+                lam=self.cfg.long2short_lambda,
+            )
+            rewards = rewards + bonus
+
+        return rewards
 
     # ------------------------------------------------------------------
     def _build_response_mask(
         self, full_ids: torch.Tensor, response_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Build a mask [B*G, L] marking the response positions in full_ids."""
+        """[B*G, L] mask for response positions.
+
+        With adaptive_stop=True different group members generate different numbers
+        of think blocks, so rows have different actual lengths and are right-padded
+        with zeros to align to max_len.  mask[:, -R:] would mark padding as
+        response tokens for shorter rows.  We instead compute each row's actual
+        length and mark exactly the R tokens before the trailing padding.
+        """
         B_G, L = full_ids.shape
         R = response_ids.shape[1]
         mask = torch.zeros(B_G, L, device=full_ids.device)
-        # Response tokens are always the last R tokens of full_ids
-        mask[:, -R:] = 1.0
+        # actual_len[i] = number of non-zero (non-padding) tokens in row i
+        actual_len = (full_ids != 0).sum(dim=1)  # [B*G]
+        # Vectorised: for each row build a range mask for [start, start+R)
+        row_idx = torch.arange(L, device=full_ids.device).unsqueeze(0)  # [1, L]
+        start = (actual_len - R).clamp(min=0).unsqueeze(1)              # [B*G, 1]
+        end = start + R                                                   # [B*G, 1]
+        mask = ((row_idx >= start) & (row_idx < end)).float()
         return mask
 
     # ------------------------------------------------------------------
@@ -302,80 +377,100 @@ class GRPOTrainer:
         prompt_strs: List[str],
         reference_strs: Optional[List[str]] = None,
     ) -> Dict[str, float]:
-        """One GRPO update from a list of prompt strings.
+        """One GRPO/MGPO update from a list of prompt strings.
 
         Args:
-            prompt_strs: Prompts for this mini-batch (length B).
+            prompt_strs:    Prompts (length B).
             reference_strs: Ground-truth answers for verifiable reward.
 
         Returns:
-            Dict of scalar metrics for logging / monitoring.
+            Dict of scalar metrics.
         """
         cfg = self.cfg
         G = cfg.group_size
         B = len(prompt_strs)
         device = next(self.model.parameters()).device
-        dtype = torch.bfloat16 if cfg.bf16 and device.type == "cuda" else torch.float32
 
-        # Tokenize prompts
+        # Stash references so _score_completions can see them
+        self._references = reference_strs or [None] * B
+
+        # Tokenize prompts → [B, 128]
         prompt_ids = torch.zeros(B, 128, dtype=torch.long, device=device)
         for i, ps in enumerate(prompt_strs):
             enc = self._encode(ps)[:128]
             prompt_ids[i, :len(enc)] = torch.tensor(enc, dtype=torch.long)
 
-        # ── 1. Generate G completions per prompt ─────────────────────────────
+        # ── 1. Generate ────────────────────────────────────────────────────────
         self.model.eval()
         full_ids, response_ids, think_counts = self._generate_group(prompt_ids)
 
-        # ── 2. Score ─────────────────────────────────────────────────────────
+        # ── 2. Score (+ Long2Short bonus) ─────────────────────────────────────
         rewards_flat = self._score_completions(
-            prompt_strs, response_ids, reference_strs, think_counts
+            prompt_strs, full_ids, response_ids, think_counts
         )
-        rewards = rewards_flat.reshape(B, G)    # [B, G]
+        rewards = rewards_flat.reshape(B, G)                  # [B, G]
         advantages = _group_advantages(rewards, eps=cfg.advantage_eps)  # [B, G]
+
+        # ── 3. MGPO: upweight capability-boundary prompts ─────────────────────
+        if cfg.use_mgpo:
+            w = _mgpo_weights(rewards, cfg.mgpo_gamma)        # [B]
+            advantages = advantages * w.unsqueeze(1)           # broadcast to [B, G]
+
         advantages_flat = advantages.reshape(B * G)
 
-        # ── 3. Policy log-probs ───────────────────────────────────────────────
+        # ── 4. Policy / ref log-probs ─────────────────────────────────────────
         self.model.train()
         response_mask = self._build_response_mask(full_ids, response_ids)
+        response_len = response_mask.sum(dim=1).clamp(min=1)  # [B*G] for per-token norm
 
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=cfg.bf16):
-            policy_lp = _compute_elbo_logprob(
-                self.model, full_ids, response_mask,
-                cfg.mc_samples, cfg.antithetic,
-            )
+        policy_lp = _compute_elbo_logprob(
+            self.model, full_ids, response_mask, cfg.mc_samples, cfg.antithetic,
+        )
+        with torch.no_grad():
             ref_lp = _compute_elbo_logprob(
-                self.ref_model, full_ids, response_mask,
-                cfg.mc_samples, cfg.antithetic,
+                self.ref_model, full_ids, response_mask, cfg.mc_samples, cfg.antithetic,
             )
 
-            # ── 4. GRPO loss = policy-gradient term + KL penalty ─────────────
-            pg_loss = -(advantages_flat * policy_lp).mean()
-            kl = (policy_lp - ref_lp).mean()
-            loss = pg_loss + cfg.kl_coeff * kl
+        # Per-token normalisation (VibeThinker: 1/|y_i| in the loss)
+        policy_lp_norm = policy_lp / response_len
+        ref_lp_norm = ref_lp / response_len
 
-        # ── 5. Optimise ───────────────────────────────────────────────────────
+        # ── 5. GRPO loss ───────────────────────────────────────────────────────
+        pg_loss = -(advantages_flat * policy_lp_norm).mean()
+        kl = (policy_lp_norm - ref_lp_norm).mean()
+        loss = pg_loss + cfg.kl_coeff * kl
+
+        # ── 6. Optimise ────────────────────────────────────────────────────────
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
         self.optimizer.step()
+        self.scheduler.step()
         self.step += 1
 
+        # ── 7. Metrics ────────────────────────────────────────────────────────
+        group_acc = (rewards > 0).float().mean(dim=1)         # [B]
         metrics = {
             "step": self.step,
             "loss": loss.item(),
             "pg_loss": pg_loss.item(),
             "kl": kl.item(),
             "mean_reward": rewards.mean().item(),
-            "mean_think_blocks": think_counts.float().mean().item(),
             "reward_std": rewards.std().item(),
+            "mean_think_blocks": think_counts.float().mean().item(),
+            "group_accuracy": group_acc.mean().item(),
+            "lr": self.scheduler.get_last_lr()[0],
         }
+        if cfg.use_mgpo:
+            metrics["mgpo_weight_mean"] = _mgpo_weights(rewards, cfg.mgpo_gamma).mean().item()
 
         if self.step % cfg.log_interval == 0:
             logger.info(
-                "step %d | loss=%.4f | reward=%.3f | think_blocks=%.2f | kl=%.4f",
+                "step %d | loss=%.4f | reward=%.3f±%.3f | think=%.2f | "
+                "kl=%.4f | acc=%.2f | lr=%.2e",
                 self.step, metrics["loss"], metrics["mean_reward"],
-                metrics["mean_think_blocks"], metrics["kl"],
+                metrics["reward_std"], metrics["mean_think_blocks"],
+                metrics["kl"], metrics["group_accuracy"], metrics["lr"],
             )
             self._write_state(metrics)
 
@@ -386,12 +481,7 @@ class GRPOTrainer:
 
     # ------------------------------------------------------------------
     def _write_state(self, metrics: Dict[str, float]) -> None:
-        """Write metrics to *state_file* so the /loop monitor can read them."""
-        state = {
-            **metrics,
-            "stage": "grpo",
-            "timestamp": time.time(),
-        }
+        state = {**metrics, "stage": "grpo", "timestamp": time.time()}
         os.makedirs(os.path.dirname(self.cfg.state_file) or ".", exist_ok=True)
         with open(self.cfg.state_file, "w") as f:
             json.dump(state, f, indent=2)
@@ -402,21 +492,24 @@ class GRPOTrainer:
         torch.save({
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
             "step": self.step,
             "config": asdict(self.cfg),
         }, path)
-        logger.info("saved checkpoint → %s", path)
+        logger.info("saved → %s", path)
         return path
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location="cpu")
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.step = ckpt.get("step", 0)
-        logger.info("loaded checkpoint ← %s (step %d)", path, self.step)
+        logger.info("loaded ← %s (step %d)", path, self.step)
 
 
-# ── factory helper ────────────────────────────────────────────────────────────
+# ── factory helpers ───────────────────────────────────────────────────────────
 
 def build_math_grpo_trainer(
     model: nn.Module,
@@ -424,15 +517,27 @@ def build_math_grpo_trainer(
     config: Optional[GRPOConfig] = None,
     ref_model: Optional[nn.Module] = None,
 ) -> GRPOTrainer:
-    """Convenience: GRPO trainer with a numeric-answer verifiable reward.
-
-    Suitable for Orca-Math / NuminaMath style training.  Composed reward:
-    - 0.9 × NumericAnswerReward  (correct final number)
-    - 0.1 × LengthPenaltyReward  (discourages length blow-ups)
-    """
+    """GRPO trainer with numeric-answer verifiable reward (OrcaMath / NuminaMath)."""
     reward = CompositeReward([
         (NumericAnswerReward(), 0.9),
         (LengthPenaltyReward(target_length=80, tolerance=24, penalty_per_token=0.005), 0.1),
+    ])
+    return GRPOTrainer(model, reward, tokenizer, config, ref_model)
+
+
+def build_code_grpo_trainer(
+    model: nn.Module,
+    tokenizer: Any,
+    config: Optional[GRPOConfig] = None,
+    ref_model: Optional[nn.Module] = None,
+) -> GRPOTrainer:
+    """GRPO trainer for code reasoning (Bespoke-Stratos / OpenThoughts code split).
+
+    Uses exact-match reward — the reference is the expected output.
+    """
+    reward = CompositeReward([
+        (ExactMatchReward(), 0.9),
+        (LengthPenaltyReward(target_length=96, tolerance=32, penalty_per_token=0.005), 0.1),
     ])
     return GRPOTrainer(model, reward, tokenizer, config, ref_model)
 
@@ -443,10 +548,7 @@ def build_general_grpo_trainer(
     config: Optional[GRPOConfig] = None,
     ref_model: Optional[nn.Module] = None,
 ) -> GRPOTrainer:
-    """Convenience: GRPO trainer with exact-match + length reward.
-
-    Suitable for SmolTalk / general instruction-following.
-    """
+    """GRPO trainer with exact-match + length reward (SmolTalk / general)."""
     reward = CompositeReward([
         (ExactMatchReward(), 0.85),
         (LengthPenaltyReward(target_length=64, tolerance=20, penalty_per_token=0.005), 0.15),

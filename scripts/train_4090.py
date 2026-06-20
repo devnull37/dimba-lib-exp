@@ -5,8 +5,14 @@ Phases
 ------
   1. distill   Cross-architecture distillation from a HF teacher (SmolLM-135M default).
                Runs Stage 1 (matrix align) → Stage 2 (hidden align) → Stage 3 (diffusion ft).
-  2. sft        Supervised fine-tune on block-CoT reasoning data (SmolTalk + Orca-Math).
-  3. grpo       GRPO policy optimisation with verifiable rewards + anti-overthinking.
+  2. sft       Two-stage supervised fine-tune on block-CoT reasoning data:
+               Stage 1 — full mix: SmolTalk + Orca-Math + all Frontier CoT (~284 K rows)
+               Stage 2 — hard subset: Frontier CoT + Orca-Math only (no direct-answer data),
+                         forcing the model to refine on examples that require actual reasoning.
+  3. grpo      GRPO/MGPO policy optimisation with verifiable rewards.
+               Sequential domain training: math RL → code RL.
+               MGPO (VibeThinker): upweights capability-boundary prompts.
+               Long2Short: normalized brevity bonus for correct-but-shorter completions.
 
 Quick start (runs all three phases end-to-end):
     python scripts/train_4090.py
@@ -19,7 +25,17 @@ Run a single phase:
 Resume from a checkpoint:
     python scripts/train_4090.py --phase grpo --checkpoint checkpoints/grpo/grpo_step200.pt --resume
 
+GRPO domain options:
+    --grpo-data math   OrcaMath only (default)
+    --grpo-data code   Bespoke-Stratos code split only
+    --grpo-data seq    Sequential: math RL (1 K steps) → code RL (1 K steps)
+    --grpo-data both   Math + SmolTalk mixed
+
 Flow matching is ON by default (15 Euler steps ≈ 2× faster inference than 30 DPM++ steps).
+
+HuggingFace auto-upload (private repo, created automatically):
+    python scripts/train_4090.py --hf-token hf_xxx --hf-repo yourusername/dimba-135m
+    Uploads after each phase: distill/final.pt → sft/final.pt → grpo/final.pt
 
 The script writes ./training_state.json after every log_interval steps so that a
 Claude /loop monitor (scripts/monitor.py) can read progress and adjust config.
@@ -29,6 +45,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -37,7 +54,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 # ── add project root to path ──────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -46,10 +63,14 @@ from dimba.models.diffusion import DIMBA
 from dimba.distillation.trainer import DistillationTrainer, DistillationConfig
 from dimba.distillation.surgery import build_student_from_teacher
 from dimba.distillation.teacher import TeacherWrapper
-from dimba.training.grpo import GRPOConfig, GRPOTrainer, build_math_grpo_trainer
-from dimba.training.rewards import CompositeReward, NumericAnswerReward, LengthPenaltyReward
+from dimba.training.grpo import (
+    GRPOConfig, build_math_grpo_trainer, build_code_grpo_trainer,
+    build_general_grpo_trainer,
+)
 from dimba.data.cot_dataset import SmolTalkDataset, OrcaMathDataset, BlockCoTDataset
-from dimba.data.frontier_cot import FrontierCoTMix
+from dimba.data.frontier_cot import (
+    FrontierCoTMix, BespokeStratosDataset, OpenThoughtsDataset,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +80,7 @@ logging.basicConfig(
 logger = logging.getLogger("train_4090")
 
 # ── hardware flags (set before any CUDA calls) ────────────────────────────────
-# tf32 gives free ~10% matmul speedup on Ampere/Ada with no quality loss.
+# TF32: free ~10% matmul speedup on Ampere/Ada; does NOT affect bf16 forward passes.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -78,13 +99,13 @@ STUDENT_CFG = dict(
     d_state=64,
     d_conv=4,
     expand=2,
-    conditioning_type="adaln",  # AdaLN-Zero (DiT-style, better than FiLM)
-    use_flow_matching=True,     # rectified flow — ~2-3× faster inference
-    flow_logit_normal=True,     # logit-normal timestep sampling (SD3/FLUX schedule)
+    conditioning_type="adaln",   # AdaLN-Zero (DiT-style, better than FiLM)
+    use_flow_matching=True,      # rectified flow — ~2-3× faster inference
+    flow_logit_normal=True,      # logit-normal timestep sampling (SD3/FLUX schedule)
     use_weight_tying=True,
     use_simple_mamba=False,
-    block_ffn=True,             # inherit teacher FFN (Mode A)
-    ffn_type="swiglu",          # SmolLM uses SwiGLU
+    block_ffn=True,              # inherit teacher FFN (Mode A)
+    ffn_type="swiglu",           # SmolLM uses SwiGLU
 )
 
 DISTILL_CFG = dict(
@@ -107,18 +128,18 @@ DISTILL_CFG = dict(
         {"name": "stage1", "steps": 500,  "lr": 1e-3},
         # Stage 2: align student hidden states → teacher residual stream (clean pass)
         {"name": "stage2", "steps": 500,  "lr": 5e-4},
-        # Stage 3: diffusion objective (flow matching) + optional logit-KD
-        # More steps than before: flow matching needs a short warmup before loss
-        # drops because the velocity target is a different scale than DDPM MSE.
+        # Stage 3: diffusion objective (flow matching) + optional logit-KD.
+        # More steps than DDPM: flow matching velocity targets are a different scale
+        # than DDPM MSE so the loss needs a short warmup before it drops.
         {"name": "stage3", "steps": 3000, "lr": 2e-4,
          "ce_loss_weight": 1.0, "min_snr_gamma": 5.0},
     ],
 )
 
-# SFT hyperparams — 48 GB lets us double the batch size vs 24 GB
+# SFT stage 1 — full data mix
 SFT_CFG = dict(
     batch_size=64,          # 48 GB → 64 (was 32 on 24 GB)
-    grad_accum=2,           # effective batch = 128 (same as before)
+    grad_accum=2,           # effective batch = 128
     lr=2e-5,
     warmup_steps=100,
     num_epochs=2,
@@ -130,17 +151,30 @@ SFT_CFG = dict(
     max_grad_norm=1.0,
     save_interval=500,
     log_interval=20,
-    num_workers=8,          # more CPU workers for fast NVMe on Vast
+    num_workers=8,
     prefetch_factor=2,
 )
 
-# GRPO hyperparams (anti-overthinking tuned for 135M + flow matching)
+# SFT stage 2 — hard subset (reasoning-only data, lower LR)
+SFT_STAGE2_CFG = dict(
+    **SFT_CFG,
+    lr=5e-6,           # lower LR for refinement pass
+    num_epochs=1,
+    warmup_steps=50,
+    save_interval=200,
+)
+
+# GRPO hyperparams — MGPO + Long2Short (VibeThinker) + flow matching
 GRPO_CFG = GRPOConfig(
     block_size=64,
-    max_think_blocks=2,          # hard cap — prevents overthinking
+    max_think_blocks=2,           # hard cap — prevents overthinking
     response_len=128,
     adaptive_stop=True,
-    thinking_length_weight=0.02, # 0.02 × 64 × n_blocks subtracted from reward
+    # MGPO: upweight capability-boundary prompts (VibeThinker)
+    use_mgpo=True,
+    mgpo_gamma=2.0,               # peaks at group accuracy = 0.5
+    # Long2Short: normalized brevity bonus (replaces fixed thinking_length_weight)
+    long2short_lambda=0.2,        # 0 = disable, use thinking_length_weight instead
     min_response_reward_bonus=0.05,
     group_size=8,
     kl_coeff=0.04,
@@ -150,6 +184,7 @@ GRPO_CFG = GRPOConfig(
     weight_decay=0.01,
     max_grad_norm=1.0,
     warmup_steps=50,
+    total_steps=2000,             # for cosine schedule
     bf16=True,
     log_interval=10,
     save_interval=200,
@@ -167,6 +202,40 @@ def _write_state(state: dict, path: str = "./training_state.json") -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump({**state, "timestamp": time.time()}, f, indent=2)
+
+
+def _upload_checkpoint(
+    local_path: str,
+    hf_token: Optional[str],
+    hf_repo: Optional[str],
+    repo_filename: Optional[str] = None,
+) -> None:
+    """Upload a checkpoint file to a private HuggingFace repo.
+
+    Creates the repo if it doesn't exist (always private).
+    Silently skips if hf_token or hf_repo are not set.
+    """
+    if not hf_token or not hf_repo:
+        return
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        logger.warning("huggingface_hub not installed — skipping upload. pip install huggingface_hub")
+        return
+    try:
+        api = HfApi(token=hf_token)
+        api.create_repo(hf_repo, private=True, exist_ok=True, repo_type="model")
+        dest = repo_filename or os.path.basename(local_path)
+        logger.info("uploading %s → hf://%s/%s …", local_path, hf_repo, dest)
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=dest,
+            repo_id=hf_repo,
+            repo_type="model",
+        )
+        logger.info("upload done → https://huggingface.co/%s", hf_repo)
+    except Exception as exc:
+        logger.warning("HuggingFace upload failed (non-fatal): %s", exc)
 
 
 def _load_tokenizer(teacher_model: str):
@@ -220,12 +289,140 @@ def _log_vram(device: torch.device, tag: str = "") -> None:
     logger.info("VRAM %s: %.1f GB allocated / %.1f GB reserved", tag, used, reserved)
 
 
+def _make_block_cot_dataset(
+    base: Dataset,
+    tokenizer,
+    cfg: dict,
+    think_start_id: Optional[int],
+    think_end_id: Optional[int],
+) -> BlockCoTDataset:
+    def _tok_fn(text: str):
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    return BlockCoTDataset(
+        base,
+        tokenizer=_tok_fn,
+        max_prompt_len=128,
+        block_size=cfg["block_size"],
+        num_think_blocks=cfg["num_think_blocks"],
+        response_len=cfg["response_len"],
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        pad_id=tokenizer.pad_token_id or 0,
+    )
+
+
+def _make_loader(ds: Dataset, cfg: dict, shuffle: bool = True) -> DataLoader:
+    return DataLoader(
+        ds,
+        batch_size=cfg["batch_size"],
+        shuffle=shuffle,
+        num_workers=cfg["num_workers"],
+        pin_memory=True,
+        prefetch_factor=cfg["prefetch_factor"],
+        persistent_workers=True,
+    )
+
+
+def _sft_loop(
+    model: nn.Module,
+    loader: DataLoader,
+    cfg: dict,
+    device: torch.device,
+    save_dir: str,
+    label: str,
+    start_step: int = 0,
+) -> int:
+    """Run one SFT stage; returns the global step count at end."""
+    accum = cfg["grad_accum"]
+    warmup = cfg["warmup_steps"]
+    # LR schedule operates in optimizer steps, not micro-batch steps.
+    total_optimizer_steps = (cfg["num_epochs"] * len(loader)) // accum
+
+    _fused = device.type == "cuda"
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
+        fused=_fused,
+    )
+
+    def _lr_lambda(opt_step: int) -> float:
+        if opt_step < warmup:
+            return opt_step / max(1, warmup)
+        progress = (opt_step - warmup) / max(1, total_optimizer_steps - warmup)
+        return max(0.1, 0.5 * (1 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    global_step = start_step
+    opt_step = 0
+    model.train()
+
+    for epoch in range(cfg["num_epochs"]):
+        logger.info("%s epoch %d/%d", label, epoch + 1, cfg["num_epochs"])
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            response_mask = batch["response_mask"].to(device)
+
+            # Sample random diffusion timesteps — DIMBA.forward requires t.
+            t = torch.randint(
+                0, model.num_diffusion_steps, (input_ids.shape[0],), device=device
+            )
+            # Model is bf16 natively — no autocast or GradScaler needed.
+            x_pred, _, _ = model(input_ids, t)
+            # Pass live embedding weight so weight-tying stays correct after resize.
+            logits = model.output_head(x_pred, embedding_weight=model.token_embed.get_weight())
+            loss_per_token = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                input_ids.reshape(-1),
+                reduction="none",
+            )
+            loss = (loss_per_token * response_mask.reshape(-1)).sum() \
+                   / response_mask.sum().clamp(min=1)
+            (loss / accum).backward()
+
+            if (global_step + 1) % accum == 0:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
+                optimizer.step()
+                optimizer.zero_grad()
+                opt_step += 1
+                scheduler.step()
+
+            global_step += 1
+
+            if global_step % cfg["log_interval"] == 0:
+                lr_now = scheduler.get_last_lr()[0]
+                logger.info("%s step %d | loss=%.4f | lr=%.2e",
+                            label, global_step, loss.item() * accum, lr_now)
+                _write_state({"stage": label, "step": global_step,
+                              "loss": loss.item() * accum, "lr": lr_now})
+
+            if global_step % cfg["save_interval"] == 0:
+                ckpt_path = os.path.join(save_dir, f"sft_step{global_step}.pt")
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "config": getattr(model, "config", STUDENT_CFG),
+                    "step": global_step,
+                    "phase": label,
+                }, ckpt_path)
+                logger.info("saved → %s", ckpt_path)
+
+        # Flush any remaining accumulated gradients at epoch end.
+        if global_step % accum != 0:
+            nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+
+    return global_step
+
+
 # ── phase 1: distillation ─────────────────────────────────────────────────────
 
 def run_distill(
     device: torch.device,
     save_dir: str = "./checkpoints/distill",
     resume: Optional[str] = None,
+    hf_token: Optional[str] = None,
+    hf_repo: Optional[str] = None,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
     logger.info("=== PHASE 1: DISTILLATION ===")
@@ -268,10 +465,11 @@ def run_distill(
         "phase": "distill",
     }, final_path)
     logger.info("distillation done → %s", final_path)
+    _upload_checkpoint(final_path, hf_token, hf_repo, "distill/final.pt")
     return final_path
 
 
-# ── phase 2: SFT ─────────────────────────────────────────────────────────────
+# ── phase 2: SFT (two-stage) ─────────────────────────────────────────────────
 
 def run_sft(
     checkpoint: str,
@@ -279,138 +477,181 @@ def run_sft(
     save_dir: str = "./checkpoints/sft",
     resume: Optional[str] = None,
     use_frontier: bool = True,
+    hf_token: Optional[str] = None,
+    hf_repo: Optional[str] = None,
 ) -> str:
-    os.makedirs(save_dir, exist_ok=True)
-    logger.info("=== PHASE 2: SFT (block-CoT) ===")
+    """Two-stage SFT.
 
-    cfg = SFT_CFG
+    Stage 1 — full mix (SmolTalk + OrcaMath + all Frontier CoT, ~284 K rows).
+              2 epochs at lr=2e-5.  Teaches the model the block-CoT format and
+              exposes it to the broad distribution of instruction + reasoning data.
+
+    Stage 2 — hard subset (OrcaMath + Frontier CoT only, no SmolTalk).
+              1 epoch at lr=5e-6.  Refines on examples that require real chain-of-
+              thought reasoning; replicates VibeThinker's two-stage curriculum
+              without needing an oracle model to label difficulty.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    logger.info("=== PHASE 2: SFT (two-stage block-CoT) ===")
+
     model = _build_or_load_model(checkpoint, device)
     tokenizer = _load_tokenizer(TEACHER_MODEL)
 
-    think_start_id = tokenizer.convert_tokens_to_ids("<think>") if "<think>" in tokenizer.get_vocab() else None
-    think_end_id = tokenizer.convert_tokens_to_ids("</think>") if "</think>" in tokenizer.get_vocab() else None
+    think_start_id = (tokenizer.convert_tokens_to_ids("<think>")
+                      if "<think>" in tokenizer.get_vocab() else None)
+    think_end_id = (tokenizer.convert_tokens_to_ids("</think>")
+                    if "</think>" in tokenizer.get_vocab() else None)
 
     from torch.utils.data import ConcatDataset
 
-    logger.info("loading SmolTalk …")
+    # ── Stage 1: full mix ─────────────────────────────────────────────────────
+    logger.info("SFT Stage 1: loading full data mix …")
+    logger.info("  loading SmolTalk …")
     smol = SmolTalkDataset(split="train", subset="smol-magpie-ultra")
-    logger.info("loading Orca-Math …")
+    logger.info("  loading Orca-Math …")
     orca = OrcaMathDataset(split="train")
     parts = [smol, orca]
     if use_frontier:
-        logger.info("loading frontier CoT mix (Fable-5 × 2, GLM-5.1, Opus-4.7) …")
-        frontier = FrontierCoTMix()   # ~103 K rows: 885 + 468 + 100 K + 2 170
-        logger.info("frontier CoT mix: %d examples", len(frontier))
+        logger.info("  loading frontier CoT mix (~284 K rows across 7 sources) …")
+        frontier = FrontierCoTMix()
+        logger.info("  frontier CoT mix: %d examples", len(frontier))
         parts.append(frontier)
 
-    # Mix: SmolTalk + Orca-Math (+ Frontier CoT when enabled)
-    combined = ConcatDataset(parts)
+    stage1_data = ConcatDataset(parts)
+    logger.info("Stage 1 dataset: %d total examples", len(stage1_data))
 
-    def _tok_fn(text: str):
-        return tokenizer.encode(text, add_special_tokens=False)
+    _log_vram(device, "SFT-stage1 start")
+    ds1 = _make_block_cot_dataset(stage1_data, tokenizer, SFT_CFG, think_start_id, think_end_id)
+    loader1 = _make_loader(ds1, SFT_CFG)
+    global_step = _sft_loop(model, loader1, SFT_CFG, device, save_dir, "sft_s1")
 
-    ds = BlockCoTDataset(
-        combined,
-        tokenizer=_tok_fn,
-        max_prompt_len=128,
-        block_size=cfg["block_size"],
-        num_think_blocks=cfg["num_think_blocks"],
-        response_len=cfg["response_len"],
-        think_start_id=think_start_id,
-        think_end_id=think_end_id,
-        pad_id=tokenizer.pad_token_id or 0,
-    )
-    loader = DataLoader(
-        ds,
-        batch_size=cfg["batch_size"],
-        shuffle=True,
-        num_workers=cfg["num_workers"],
-        pin_memory=True,
-        prefetch_factor=cfg["prefetch_factor"],
-        persistent_workers=True,
-    )
+    # ── Stage 2: hard subset (reasoning-only data) ────────────────────────────
+    logger.info("SFT Stage 2: hard subset (Orca-Math + Frontier CoT) …")
+    hard_parts = [orca]
+    if use_frontier:
+        hard_parts.append(frontier)
+    stage2_data = ConcatDataset(hard_parts)
+    logger.info("Stage 2 dataset: %d examples (dropped SmolTalk direct-answer examples)", len(stage2_data))
 
-    _fused = device.type == "cuda"
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
-        fused=_fused,
-    )
-    total_steps = cfg["num_epochs"] * len(loader)
-    warmup = cfg["warmup_steps"]
-
-    def _lr_lambda(step: int) -> float:
-        if step < warmup:
-            return step / max(1, warmup)
-        progress = (step - warmup) / max(1, total_steps - warmup)
-        return max(0.1, 0.5 * (1 + math.cos(math.pi * progress)))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-
-    start_step = 0
-    if resume and os.path.isfile(resume):
-        ckpt = torch.load(resume, map_location="cpu")
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_step = ckpt.get("step", 0)
-
-    global_step = start_step
-    accum = cfg["grad_accum"]
-    model.train()
-    _log_vram(device, "SFT start")
-
-    for epoch in range(cfg["num_epochs"]):
-        for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            response_mask = batch["response_mask"].to(device)
-
-            # Model is bf16; no autocast or GradScaler needed
-            x_pred, _, _ = model(input_ids)
-            logits = model.output_head(x_pred)             # [B, L, vocab]
-            loss_per_token = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                input_ids.reshape(-1),
-                reduction="none",
-            )
-            loss = (loss_per_token * response_mask.reshape(-1)).sum() \
-                   / response_mask.sum().clamp(min=1)
-            (loss / accum).backward()
-
-            if (global_step + 1) % accum == 0:
-                nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
-                optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step()
-
-            global_step += 1
-
-            if global_step % cfg["log_interval"] == 0:
-                lr_now = scheduler.get_last_lr()[0]
-                logger.info("SFT step %d | loss=%.4f | lr=%.2e",
-                            global_step, loss.item() * accum, lr_now)
-                _write_state({"stage": "sft", "step": global_step,
-                              "loss": loss.item() * accum, "lr": lr_now})
-
-            if global_step % cfg["save_interval"] == 0:
-                ckpt_path = os.path.join(save_dir, f"sft_step{global_step}.pt")
-                torch.save({
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": getattr(model, "config", STUDENT_CFG),
-                    "step": global_step,
-                    "phase": "sft",
-                }, ckpt_path)
-                logger.info("saved → %s", ckpt_path)
+    ds2 = _make_block_cot_dataset(stage2_data, tokenizer, SFT_STAGE2_CFG, think_start_id, think_end_id)
+    loader2 = _make_loader(ds2, SFT_STAGE2_CFG)
+    _log_vram(device, "SFT-stage2 start")
+    global_step = _sft_loop(model, loader2, SFT_STAGE2_CFG, device, save_dir, "sft_s2",
+                             start_step=global_step)
 
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({
         "model_state_dict": model.state_dict(),
         "config": getattr(model, "config", STUDENT_CFG),
         "phase": "sft",
+        "total_steps": global_step,
     }, final_path)
-    logger.info("SFT done → %s", final_path)
+    logger.info("SFT done → %s  (total steps: %d)", final_path, global_step)
+    _upload_checkpoint(final_path, hf_token, hf_repo, "sft/final.pt")
     return final_path
 
 
 # ── phase 3: GRPO ─────────────────────────────────────────────────────────────
+
+def _load_grpo_data(data: str, num_steps: int):
+    """Load prompt/reference lists for the given GRPO domain.
+
+    Returns a list of (prompts, references, label) tuples, one per domain pass.
+    For data='seq', returns two passes: math then code.
+    """
+    passes = []
+
+    if data in ("math", "orca", "both", "seq"):
+        prompts, refs = [], []
+        orca_ds = OrcaMathDataset(split="train", max_examples=20000)
+        for i in range(len(orca_ds)):
+            item = orca_ds[i]
+            prompts.append(item["prompt"])
+            refs.append(item["response"])
+        passes.append((prompts, refs, "math"))
+
+    if data in ("smoltalk", "both"):
+        prompts, refs = [], []
+        smol_ds = SmolTalkDataset(split="train", max_examples=10000)
+        for i in range(len(smol_ds)):
+            item = smol_ds[i]
+            prompts.append(item["prompt"])
+            refs.append(item["response"])
+        passes.append((prompts, refs, "general"))
+
+    if data in ("code", "seq"):
+        # Bespoke-Stratos has ~5 K code + 10 K math; use the full set (code-heavy
+        # problems are identified by the model's group accuracy hitting the boundary,
+        # so MGPO will naturally upweight those even in the mixed dataset).
+        prompts, refs = [], []
+        stratos = BespokeStratosDataset(split="train")
+        for i in range(len(stratos)):
+            item = stratos[i]
+            if item["reasoning"] or item["response"]:
+                prompts.append(item["prompt"])
+                refs.append(item["response"])
+        passes.append((prompts, refs, "code"))
+
+    if not passes:
+        raise ValueError(f"Unknown --grpo-data option: {data!r}")
+
+    return passes
+
+
+def _run_grpo_pass(
+    model: nn.Module,
+    tokenizer,
+    think_start_id: int,
+    think_end_id: int,
+    prompts: list,
+    references: list,
+    label: str,
+    num_steps: int,
+    device: torch.device,
+    save_dir: str,
+    resume: Optional[str],
+) -> str:
+    """One GRPO domain pass.  Returns path to final checkpoint."""
+    from dataclasses import replace as _dc_replace
+    grpo_cfg = _dc_replace(
+        GRPO_CFG,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        eos_id=tokenizer.eos_token_id,
+        total_steps=num_steps,
+        save_dir=save_dir,
+        state_file="./training_state.json",
+    )
+
+    if label == "code":
+        trainer = build_code_grpo_trainer(model, tokenizer, grpo_cfg)
+    elif label == "general":
+        trainer = build_general_grpo_trainer(model, tokenizer, grpo_cfg)
+    else:
+        trainer = build_math_grpo_trainer(model, tokenizer, grpo_cfg)
+
+    if resume and os.path.isfile(resume):
+        trainer.load_checkpoint(resume)
+
+    logger.info("GRPO pass: %s | %d prompts | %d steps", label, len(prompts), num_steps)
+    _log_vram(device, f"GRPO-{label} start")
+
+    for step_idx in range(num_steps):
+        idx = step_idx % len(prompts)
+        metrics = trainer.train_step([prompts[idx]], [references[idx]])
+
+        if step_idx % 50 == 0:
+            logger.info(
+                "GRPO[%s] step %d/%d | reward=%.3f | think=%.2f | "
+                "kl=%.4f | acc=%.2f | lr=%.2e",
+                label, step_idx, num_steps,
+                metrics["mean_reward"], metrics["mean_think_blocks"],
+                metrics["kl"], metrics["group_accuracy"], metrics["lr"],
+            )
+
+    pass_path = os.path.join(save_dir, f"grpo_{label}_final.pt")
+    return trainer.save_checkpoint(pass_path)
+
 
 def run_grpo(
     checkpoint: str,
@@ -418,10 +659,19 @@ def run_grpo(
     save_dir: str = "./checkpoints/grpo",
     resume: Optional[str] = None,
     num_steps: int = 2000,
-    data: str = "orca",
+    data: str = "math",
+    hf_token: Optional[str] = None,
+    hf_repo: Optional[str] = None,
 ) -> str:
+    """GRPO/MGPO policy optimisation.
+
+    data='seq': runs math RL (num_steps//2) then code RL (num_steps//2) sequentially.
+    All other values: single-domain pass.
+    """
     os.makedirs(save_dir, exist_ok=True)
-    logger.info("=== PHASE 3: GRPO (anti-overthinking, flow sampler) ===")
+    logger.info("=== PHASE 3: GRPO (MGPO + Long2Short + flow sampler) ===")
+    logger.info("MGPO gamma=%.1f | Long2Short λ=%.2f | group_size=%d",
+                GRPO_CFG.mgpo_gamma, GRPO_CFG.long2short_lambda, GRPO_CFG.group_size)
 
     model = _build_or_load_model(checkpoint, device)
     tokenizer = _load_tokenizer(TEACHER_MODEL)
@@ -431,53 +681,36 @@ def run_grpo(
         special_tokens["additional_special_tokens"] = ["<think>", "</think>"]
         tokenizer.add_special_tokens(special_tokens)
         model.token_embed.resize(tokenizer.vocab_size)
+        # Sync the output head's weight-tying buffer with the new embedding table.
+        if hasattr(model.output_head, "embedding_weight"):
+            model.output_head.embedding_weight = model.token_embed.get_weight()
 
     think_start_id = tokenizer.convert_tokens_to_ids("<think>")
     think_end_id = tokenizer.convert_tokens_to_ids("</think>")
 
-    grpo_cfg = GRPO_CFG
-    grpo_cfg.think_start_id = think_start_id
-    grpo_cfg.think_end_id = think_end_id
-    grpo_cfg.eos_id = tokenizer.eos_token_id
-    grpo_cfg.save_dir = save_dir
-    grpo_cfg.state_file = "./training_state.json"
+    passes = _load_grpo_data(data, num_steps)
 
-    trainer = build_math_grpo_trainer(model, tokenizer, grpo_cfg)
+    # For sequential (math → code): split steps evenly across passes.
+    steps_per_pass = num_steps // len(passes)
+    last_ckpt = None
 
-    if resume and os.path.isfile(resume):
-        trainer.load_checkpoint(resume)
+    for i, (prompts, refs, label) in enumerate(passes):
+        pass_dir = os.path.join(save_dir, label)
+        os.makedirs(pass_dir, exist_ok=True)
+        # Only pass the original --resume into the first domain pass.
+        pass_resume = resume if i == 0 else last_ckpt
+        last_ckpt = _run_grpo_pass(
+            model, tokenizer, think_start_id, think_end_id,
+            prompts, refs, label, steps_per_pass,
+            device, pass_dir, pass_resume,
+        )
+        logger.info("GRPO domain pass '%s' done → %s", label, last_ckpt)
 
-    logger.info("loading GRPO prompts (%s) …", data)
-    prompts, references = [], []
-    if data in ("orca", "both"):
-        orca_ds = OrcaMathDataset(split="train", max_examples=20000)
-        for i in range(len(orca_ds)):
-            item = orca_ds[i]
-            prompts.append(item["prompt"])
-            references.append(item["response"])
-    if data in ("smoltalk", "both"):
-        smol_ds = SmolTalkDataset(split="train", max_examples=10000)
-        for i in range(len(smol_ds)):
-            item = smol_ds[i]
-            prompts.append(item["prompt"])
-            references.append(item["response"])
-
-    logger.info("%d GRPO prompts loaded", len(prompts))
-
-    _log_vram(device, "GRPO start")
-    for step_idx in range(num_steps):
-        idx = step_idx % len(prompts)
-        metrics = trainer.train_step([prompts[idx]], [references[idx]])
-
-        if step_idx % 50 == 0:
-            logger.info(
-                "GRPO step %d/%d | reward=%.3f | think_blks=%.2f | loss=%.4f",
-                step_idx, num_steps,
-                metrics["mean_reward"], metrics["mean_think_blocks"], metrics["loss"],
-            )
-
-    final_path = trainer.save_checkpoint(os.path.join(save_dir, "final.pt"))
+    # Copy the very last checkpoint to a canonical final.pt
+    final_path = os.path.join(save_dir, "final.pt")
+    shutil.copy2(last_ckpt, final_path)
     logger.info("GRPO done → %s", final_path)
+    _upload_checkpoint(final_path, hf_token, hf_repo, "grpo/final.pt")
     return final_path
 
 
@@ -495,15 +728,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda",
                    help="Device string (default: cuda)")
     p.add_argument("--grpo-steps", type=int, default=2000,
-                   help="Number of GRPO update steps")
-    p.add_argument("--grpo-data", choices=["orca", "smoltalk", "both"], default="orca",
-                   help="Dataset for GRPO rollouts")
+                   help="Total GRPO update steps (split evenly across domain passes for --grpo-data seq)")
+    p.add_argument("--grpo-data",
+                   choices=["math", "orca", "code", "seq", "smoltalk", "both"],
+                   default="math",
+                   help=(
+                       "Data for GRPO rollouts: "
+                       "'math'/'orca' = OrcaMath only; "
+                       "'code' = Bespoke-Stratos; "
+                       "'seq' = sequential math→code; "
+                       "'both' = math + SmolTalk mixed"
+                   ))
     p.add_argument("--teacher", default=TEACHER_MODEL,
                    help=f"HuggingFace teacher model (default: {TEACHER_MODEL})")
     p.add_argument("--no-flow", action="store_true",
                    help="Disable flow matching (fall back to DDPM cosine schedule)")
     p.add_argument("--no-frontier", action="store_true",
-                   help="Skip frontier CoT datasets (use only SmolTalk + Orca-Math)")
+                   help="Skip frontier CoT datasets in SFT (use only SmolTalk + Orca-Math)")
+    p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"),
+                   help="HuggingFace API token for auto-upload (or set HF_TOKEN env var)")
+    p.add_argument("--hf-repo", default=None,
+                   help="HuggingFace repo to upload checkpoints to, e.g. 'yourusername/dimba-135m'")
     return p.parse_args()
 
 
@@ -519,7 +764,6 @@ def main() -> None:
 
     if args.no_flow:
         STUDENT_CFG["use_flow_matching"] = False
-        DISTILL_CFG.setdefault("stages", [])  # stages unchanged
         GRPO_CFG.num_diffusion_steps_inference = 30
         GRPO_CFG.sampler = "dpmpp"
         logger.info("flow matching disabled (--no-flow)")
@@ -528,20 +772,28 @@ def main() -> None:
     TEACHER_MODEL = args.teacher
     DISTILL_CFG["teacher_model"] = args.teacher
 
+    # Normalise alias: --grpo-data orca is the same as math
+    grpo_data = args.grpo_data if args.grpo_data != "orca" else "math"
+
     ckpt = args.checkpoint
 
+    hf_kw = dict(hf_token=args.hf_token, hf_repo=args.hf_repo)
+    if args.hf_repo:
+        logger.info("HuggingFace upload enabled → %s", args.hf_repo)
+
     if args.phase in ("distill", "all"):
-        ckpt = run_distill(device, resume=ckpt if args.resume else None)
+        ckpt = run_distill(device, resume=ckpt if args.resume else None, **hf_kw)
 
     if args.phase in ("sft", "all"):
         ckpt = run_sft(ckpt, device, resume=ckpt if args.resume else None,
-                       use_frontier=not args.no_frontier)
+                       use_frontier=not args.no_frontier, **hf_kw)
 
     if args.phase in ("grpo", "all"):
         ckpt = run_grpo(ckpt, device,
                         resume=ckpt if args.resume else None,
                         num_steps=args.grpo_steps,
-                        data=args.grpo_data)
+                        data=grpo_data,
+                        **hf_kw)
 
     logger.info("all done. final model: %s", ckpt)
 

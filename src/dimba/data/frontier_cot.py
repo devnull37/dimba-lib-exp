@@ -259,11 +259,15 @@ class GlaiveReasoningDataset(Dataset):
     def __init__(self, split: str = "train",
                  max_examples: Optional[int] = 50_000) -> None:
         from datasets import load_dataset
-        ds = load_dataset("glaiveai/reasoning-v1-20m", split=split,
-                          trust_remote_code=True, streaming=False)
-        if max_examples is not None:
-            ds = ds.select(range(min(max_examples, len(ds))))
-        self._data = ds
+        # Stream to avoid downloading all 22M rows before selecting.
+        ds_stream = load_dataset("glaiveai/reasoning-v1-20m", split=split,
+                                 trust_remote_code=True, streaming=True)
+        rows = []
+        for i, row in enumerate(ds_stream):
+            if max_examples is not None and i >= max_examples:
+                break
+            rows.append(row)
+        self._data = rows
 
     def __len__(self) -> int:
         return len(self._data)
@@ -315,21 +319,41 @@ def FrontierCoTMix(
     Returns:
         A ``ConcatDataset`` ready to wrap in ``BlockCoTDataset``.
     """
-    parts: list[Dataset] = []
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    def _try_load(name: str, factory):
+        try:
+            ds = factory()
+            _log.info("  %-30s %d rows", name, len(ds))
+            return ds
+        except Exception as exc:
+            _log.warning("FrontierCoTMix: skipping %s — %s", name, exc)
+            return None
+
+    candidates = []
     if include_fable_kelexine:
-        parts.append(KelexineFableTracesDataset())
+        candidates.append(("kelexine/fable-5-sft-traces", KelexineFableTracesDataset))
     if include_fable_fusioncube:
-        parts.append(FusionCubeFableCoTDataset())
+        candidates.append(("TheFusionCube/Fable-5-CoT-Traces", FusionCubeFableCoTDataset))
     if include_opus:
-        parts.append(OpusCoTDataset())
+        candidates.append(("ansulev/Opus-4.7-Reasoning-CoT-4800x", OpusCoTDataset))
     if include_glm:
-        parts.append(GLMReasoningDataset(max_examples=glm_max))
+        candidates.append(("Jackrong/GLM-5.1-Reasoning-1M-Cleaned",
+                           lambda: GLMReasoningDataset(max_examples=glm_max)))
     if include_stratos:
-        parts.append(BespokeStratosDataset())
+        candidates.append(("bespokelabs/Bespoke-Stratos-17k", BespokeStratosDataset))
     if include_openthoughts:
-        parts.append(OpenThoughtsDataset(max_examples=openthoughts_max))
+        candidates.append(("open-thoughts/OpenThoughts-114k",
+                           lambda: OpenThoughtsDataset(max_examples=openthoughts_max)))
     if include_glaive:
-        parts.append(GlaiveReasoningDataset(max_examples=glaive_max))
+        candidates.append(("glaiveai/reasoning-v1-20m",
+                           lambda: GlaiveReasoningDataset(max_examples=glaive_max)))
+
+    parts: list = [_try_load(name, f) for name, f in candidates]
+    parts = [p for p in parts if p is not None]
     if not parts:
-        raise ValueError("At least one source must be enabled in FrontierCoTMix.")
+        raise ValueError("All FrontierCoTMix sources failed to load — check your network/HF auth.")
+    _log.info("FrontierCoTMix: %d sources, %d total rows",
+              len(parts), sum(len(p) for p in parts))
     return ConcatDataset(parts)

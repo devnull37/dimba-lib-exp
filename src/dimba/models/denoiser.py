@@ -37,7 +37,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
+        # Cast to fp32 for variance: bf16 max is ~65504, so x²>256 overflows to inf.
+        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).sqrt().to(x.dtype)
         return (x / rms) * self.weight
 
 # Resolve the best available Mamba implementation once, at import time.

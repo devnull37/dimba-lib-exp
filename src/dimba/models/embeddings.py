@@ -47,6 +47,33 @@ class TokenEmbedding(nn.Module):
         """Get embedding matrix for weight tying."""
         return self.embedding.weight
 
+    def resize(self, new_vocab_size: int) -> None:
+        """Grow (or no-op) the embedding table to *new_vocab_size*.
+
+        Existing token vectors are preserved; new rows are zero-initialised
+        so they don't inject noise into the model immediately after resize.
+        Only grows — shrinking raises ValueError to prevent accidental data loss.
+        """
+        old_size = self.vocab_size
+        if new_vocab_size == old_size:
+            return
+        if new_vocab_size < old_size:
+            raise ValueError(
+                f"resize: new_vocab_size {new_vocab_size} < current {old_size}; "
+                "shrinking is not supported."
+            )
+        device = self.embedding.weight.device
+        dtype = self.embedding.weight.dtype
+        old_weight = self.embedding.weight.data
+        padding_idx = self.embedding.padding_idx
+
+        new_embedding = nn.Embedding(new_vocab_size, self.embed_dim,
+                                     padding_idx=padding_idx).to(device=device, dtype=dtype)
+        nn.init.zeros_(new_embedding.weight)
+        new_embedding.weight.data[:old_size] = old_weight
+        self.embedding = new_embedding
+        self.vocab_size = new_vocab_size
+
 
 class TimestepEmbedding(nn.Module):
     """Sinusoidal timestep embeddings with MLP projection.
