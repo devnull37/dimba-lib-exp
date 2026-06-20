@@ -41,6 +41,7 @@ The script writes ./training_state.json after every log_interval steps so that a
 Claude /loop monitor (scripts/monitor.py) can read progress and adjust config.
 """
 import argparse
+import gc
 import json
 import logging
 import math
@@ -80,6 +81,13 @@ logging.basicConfig(
 logger = logging.getLogger("train_4090")
 
 # ── hardware flags (set before any CUDA calls) ────────────────────────────────
+# expandable_segments cuts CUDA fragmentation — important for the memory-heavy
+# pure-PyTorch SSD scan (TorchMamba2). TOKENIZERS_PARALLELISM=false silences the
+# fork-mode warning from fast tokenizers running inside DataLoader workers.
+# setdefault so an explicitly-set environment still wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 # TF32: free ~10% matmul speedup on Ampere/Ada; does NOT affect bf16 forward passes.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -144,7 +152,12 @@ DISTILL_CFG = dict(
 PRETRAIN_DATASET = "HuggingFaceFW/fineweb"
 PRETRAIN_SUBSET  = "sample-10BT"
 PRETRAIN_SEQ_LEN = 512
-PRETRAIN_BATCH   = 32   # smaller than SFT — teacher still loaded in VRAM for Stage 1/2
+PRETRAIN_BATCH   = 32   # Stage-3 batch on the fast CUDA Mamba2 kernel
+# The pure-PyTorch SSD scan (TorchMamba2) materialises a [B, L, L, nheads] decay matrix
+# per layer, so it needs a much smaller batch than the fused CUDA kernel. When Stage 3
+# runs on TorchMamba2 (CUDA kernel unavailable / transfer failed) we use this batch and
+# enable gradient checkpointing; the graceful-OOM handler halves it further if needed.
+PRETRAIN_BATCH_TORCH = 8
 
 # Stage 1+2 alignment use SHORT sequences. Stage-1 materializes the mixing matrix
 # [B, nheads, L, L] for every layer, which is O(B*nheads*L^2*num_layers): at L=512
@@ -459,65 +472,150 @@ def _sft_loop(
 
 # ── phase 1: distillation ─────────────────────────────────────────────────────
 
-class _FineWebTokenized(Dataset):
-    """Tokenize cached FineWeb text rows to a fixed seq_len on the fly.
+class _PackedChunks(Dataset):
+    """Fixed-length chunks of a packed token stream — every position is real content.
 
-    Defined at module scope (not inside a closure) so it pickles cleanly under the
-    DataLoader 'spawn' start method as well as 'fork'.  The same row cache is shared
-    by the short-seq alignment loader and the full-length Stage-3 loader.
+    Packing (concatenate docs, split into seq_len blocks) avoids padding entirely, so
+    Stage-3 co-adaptation never trains the diffusion loss on pad/eos filler. Holds a
+    pre-tokenized int64 tensor, so it pickles cleanly for fork/spawn DataLoader workers.
+    One token stream is sliced at two seq_lens (align L=256, Stage-3 L=512).
     """
 
-    def __init__(self, rows: list, tokenizer, seq_len: int) -> None:
-        self._rows = rows
-        self._tok = tokenizer
-        self._seq_len = seq_len
+    def __init__(self, stream: torch.Tensor, seq_len: int) -> None:
+        n = (stream.numel() // seq_len) * seq_len
+        if n == 0:
+            raise ValueError(f"token stream ({stream.numel()} toks) shorter than seq_len={seq_len}")
+        self._data = stream[:n].view(-1, seq_len).contiguous()
 
     def __len__(self) -> int:
-        return len(self._rows)
+        return self._data.shape[0]
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        enc = self._tok.encode(self._rows[idx % len(self._rows)],
-                               add_special_tokens=False)
-        pad_id = self._tok.pad_token_id if self._tok.pad_token_id is not None else 0
-        if len(enc) >= self._seq_len:
-            ids = enc[: self._seq_len]
-        else:
-            ids = enc + [pad_id] * (self._seq_len - len(enc))
-        return torch.tensor(ids, dtype=torch.long)
+        return self._data[idx]
 
 
-def _build_fineweb_rows(n_cache: int = 50_000) -> list:
-    """Stream FineWeb 'sample-10BT' and cache the first *n_cache* raw text rows.
+def _build_fineweb_stream(tokenizer, n_cache: int = 50_000) -> torch.Tensor:
+    """Stream FineWeb 'sample-10BT', tokenize the first *n_cache* docs, pack into one stream.
 
-    Streaming means the 10 BT dataset is never materialised to disk; only the text
-    of the first n_cache docs is kept in memory, shared across all distill loaders.
+    Streaming means the 10 BT dataset is never materialised to disk. Documents are
+    separated by the eos token. Returns a flat ``[T]`` int64 tensor reused (sliced) by
+    both the alignment and Stage-3 loaders, so FineWeb downloads + tokenizes only once.
     """
     from datasets import load_dataset
 
     logger.info("building FineWeb pretrain cache (%d docs) …", n_cache)
     ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
                       split="train", streaming=True, trust_remote_code=True)
-    rows: list = []
+    eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    ids: list = []
     for i, row in enumerate(ds):
         if i >= n_cache:
             break
-        rows.append(row["text"])
-    logger.info("pretrain cache ready: %d docs", len(rows))
-    return rows
+        ids.extend(tokenizer.encode(row["text"], add_special_tokens=False))
+        ids.append(eos)
+    stream = torch.tensor(ids, dtype=torch.long)
+    logger.info("pretrain cache ready: %d docs → %.1f M packed tokens",
+                min(n_cache, i + 1), stream.numel() / 1e6)
+    return stream
 
 
-def _make_fineweb_loader(rows: list, tokenizer, seq_len: int,
+def _make_fineweb_loader(stream: torch.Tensor, seq_len: int,
                          batch_size: int, num_workers: int = 4) -> DataLoader:
-    """DataLoader over the cached FineWeb rows at a given seq_len / batch_size.
+    """DataLoader of packed seq_len chunks over the shared FineWeb token stream.
 
-    Reusing one row cache for both the alignment loader (Stage 1+2, short seq) and
-    the co-adaptation loader (Stage 3, full seq) means FineWeb downloads only once.
     The loader cycles; the trainer stops at the configured step count.
     """
-    ds = _FineWebTokenized(rows, tokenizer, seq_len)
+    ds = _PackedChunks(stream, seq_len)
     return DataLoader(ds, batch_size=batch_size, shuffle=True,
                       num_workers=num_workers, pin_memory=True,
                       persistent_workers=(num_workers > 0))
+
+
+def _live_mixer_is_torch(model) -> bool:
+    """True if the model's mixers are the pure-PyTorch TorchMamba2 (vs CUDA Mamba2).
+
+    Detects the ACTUAL backend in use — covers both an explicit force_torch_mixer build
+    and the case where mamba_ssm.Mamba2 can't be constructed and ``_make_mixer`` silently
+    fell back to TorchMamba2.
+    """
+    base = getattr(model, "_orig_mod", model)
+    try:
+        return type(base.denoiser.blocks[0].mamba_fwd).__name__ == "TorchMamba2"
+    except Exception:  # noqa: BLE001 — never let a probe crash training
+        return False
+
+
+def _save_config_with_backend(model) -> dict:
+    """``model.config`` plus ``force_torch_mixer=True`` iff the live backend is TorchMamba2.
+
+    ``DIMBA._config`` deliberately omits force_torch_mixer so a CUDA checkpoint reloads on
+    the fast kernel. But if this model is actually running on TorchMamba2 (CUDA kernel
+    unavailable), the next phase MUST rebuild on the same backend to load the weights —
+    so we pin the flag based on the real backend, not on which build path was requested.
+    """
+    base = getattr(model, "_orig_mod", model)
+    cfg = dict(base.config)
+    if _live_mixer_is_torch(model):
+        cfg["force_torch_mixer"] = True
+    return cfg
+
+
+def _enable_torch_memory_savings(model) -> bool:
+    """Turn on gradient checkpointing iff the model runs on TorchMamba2.
+
+    The pure-PyTorch SSD scan is memory-heavy, so checkpointing (recompute blocks in the
+    backward pass) is needed to fit. Returns True iff the torch backend is in use, so the
+    caller can also shrink the batch. No-op on the fast CUDA kernel.
+    """
+    if not _live_mixer_is_torch(model):
+        return False
+    getattr(model, "_orig_mod", model).denoiser.use_gradient_checkpointing = True
+    return True
+
+
+def _shrink_batch_for_torch(cfg: dict, max_bs: int = 16) -> dict:
+    """Cap batch_size at max_bs, scaling grad_accum up to preserve the effective batch.
+
+    Used for the memory-heavy TorchMamba2 path. Returns a copy; the original is unchanged.
+    """
+    bs = cfg.get("batch_size", max_bs)
+    if bs <= max_bs:
+        return dict(cfg)
+    out = dict(cfg)
+    factor = (bs + max_bs - 1) // max_bs
+    out["batch_size"] = max_bs
+    out["grad_accum"] = cfg.get("grad_accum", 1) * factor
+    return out
+
+
+def _run_stage3_resilient(trainer, stage_cfg, stream, seq_len, batch, device,
+                          min_batch: int = 1) -> int:
+    """Run a distillation stage, halving the batch and retrying on CUDA OOM.
+
+    This is the graceful "reallocate instead of crash" path: an OOM frees the loader,
+    empties the cache, and re-runs the stage at half the batch (down to ``min_batch``).
+    Stage 3 builds a fresh optimiser each attempt, so a retry is a clean restart — and
+    OOM almost always fires on the first step, so little work is lost. Returns the batch
+    size that ultimately succeeded.
+    """
+    while True:
+        loader = _make_fineweb_loader(stream, seq_len, batch, num_workers=2)
+        try:
+            logger.info("Stage 3: co-adaptation at batch=%d, L=%d", batch, seq_len)
+            trainer.run_stage(stage_cfg, loader)
+            return batch
+        except torch.cuda.OutOfMemoryError:
+            del loader
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if batch <= min_batch:
+                logger.error("CUDA OOM even at batch=%d — cannot proceed.", batch)
+                raise
+            new_batch = max(min_batch, batch // 2)
+            logger.warning("CUDA OOM at batch=%d → freed memory, retrying Stage 3 at batch=%d.",
+                           batch, new_batch)
+            batch = new_batch
 
 
 def run_distill(
@@ -572,9 +670,8 @@ def run_distill(
     _log_vram(device, "post-torch-model-load")
 
     tokenizer = _load_tokenizer(TEACHER_MODEL)
-    rows = _build_fineweb_rows(n_cache=50_000)
-    align_loader = _make_fineweb_loader(rows, tokenizer, ALIGN_SEQ_LEN, ALIGN_BATCH, num_workers=2)
-    pretrain_loader = _make_fineweb_loader(rows, tokenizer, PRETRAIN_SEQ_LEN, PRETRAIN_BATCH, num_workers=4)
+    stream = _build_fineweb_stream(tokenizer, n_cache=50_000)
+    align_loader = _make_fineweb_loader(stream, ALIGN_SEQ_LEN, ALIGN_BATCH, num_workers=2)
 
     # ── Stages 1 + 2: alignment on TorchMamba2 (matrices materializable) ────────
     align_trainer = DistillationTrainer(model=torch_model, teacher=teacher, config=cfg)
@@ -588,50 +685,73 @@ def run_distill(
                        "not be materialized (see warning above).")
     else:
         logger.info("Stage 1+2 alignment complete (matrices materialized).")
-    del align_loader  # release its worker processes
+    # Free the alignment trainer (holds torch_model + 30 head-aligners/projectors) and
+    # its loader workers before the heavy Stage 3.
+    del align_loader, align_trainer
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    # ── Transfer TorchMamba2 weights → CUDA Mamba2 for the fast Stage 3 ──────────
-    # TorchMamba2 and mamba_ssm.Mamba2 share an identical 8-key param tree at the
-    # default config, so a strict load is the load-bearing compatibility probe:
-    # on success Stage 3 runs on the fast kernel; on ANY mismatch we keep the torch
-    # model (slower but correct) and mark the checkpoint so SFT/GRPO rebuild on it.
+    # ── Try to transfer TorchMamba2 weights → CUDA Mamba2 for a faster Stage 3 ──
+    # TorchMamba2 and mamba_ssm.Mamba2 share an identical 8-key param tree, so a strict
+    # load is the load-bearing compatibility probe. On success Stage 3 runs on the fast
+    # kernel; on ANY mismatch — or if the CUDA kernel can't even be constructed and the
+    # build silently fell back to TorchMamba2 — we keep the torch model (slower, correct).
     stage3_model = torch_model
-    fell_back_to_torch = False
     if device.type == "cuda":
         try:
-            cuda_model = DIMBA(**torch_model.config)  # no force_torch_mixer → CUDA kernel
+            cuda_model = DIMBA(**torch_model.config)  # no force_torch_mixer → CUDA kernel if available
             cuda_model = cuda_model.to(device).to(torch.bfloat16)
             cuda_model.load_state_dict(torch_model.state_dict(), strict=True)
             stage3_model = cuda_model
             del torch_model
-            torch.cuda.empty_cache()
-            logger.info("backend transfer OK: TorchMamba2 → CUDA Mamba2 (strict load passed); "
-                        "Stage 3 runs on the fast kernel.")
+            gc.collect(); torch.cuda.empty_cache()
+            logger.info("backend transfer OK (strict load passed).")
         except Exception as exc:  # noqa: BLE001 — any mismatch must degrade, not crash
-            fell_back_to_torch = True
             stage3_model = torch_model
-            logger.warning("backend transfer FAILED (%s: %s). Keeping TorchMamba2 for Stage 3 "
-                           "(slower, correct). Checkpoint will set force_torch_mixer=True so "
-                           "SFT/GRPO rebuild on the same backend.", type(exc).__name__, exc)
-    _log_vram(device, "post-transfer")
+            logger.warning("backend transfer FAILED (%s: %s). Keeping TorchMamba2 for Stage 3.",
+                           type(exc).__name__, str(exc)[:200])
+
+    # Detect the ACTUAL backend Stage 3 runs on (covers transfer failure AND a silent
+    # construction fallback to TorchMamba2 even for the nominally-"cuda" model).
+    on_torch = _live_mixer_is_torch(stage3_model)
+    logger.info("Stage 3 backend: %s",
+                "TorchMamba2 (pure PyTorch — slower, memory-heavy)" if on_torch
+                else "CUDA Mamba2 kernel (fast)")
+
+    # The teacher is unused in Stage 3 (kd_weight=0) — free its VRAM. The wrapper stays
+    # alive so its metadata (num_layers, …) still answers the trainer constructor.
+    teacher.unload()
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # TorchMamba2's SSD scan materialises a [B, L, L, nheads] decay matrix per layer, so
+    # it needs a small batch + gradient checkpointing (recompute blocks in backward).
+    if on_torch:
+        stage3_model.denoiser.use_gradient_checkpointing = True
+        stage3_batch = PRETRAIN_BATCH_TORCH
+    else:
+        stage3_batch = PRETRAIN_BATCH
+    _log_vram(device, "pre-stage3")
 
     # ── Stage 3: co-adaptation pretraining (FFN frozen, teacher unused) ─────────
-    # kd_weight=0.0 in DISTILL_CFG means teacher.forward() is never called here.
+    # Graceful OOM handling: halve the batch and retry instead of crashing.
     stage3_trainer = DistillationTrainer(model=stage3_model, teacher=teacher, config=cfg)
     if "stage3" in stages_by_name:
-        stage3_trainer.run_stage(stages_by_name["stage3"], pretrain_loader)
+        eff_batch = _run_stage3_resilient(
+            stage3_trainer, stages_by_name["stage3"], stream,
+            PRETRAIN_SEQ_LEN, stage3_batch, device,
+        )
+        toks = int(stages_by_name["stage3"]["steps"]) * eff_batch * PRETRAIN_SEQ_LEN
+        logger.info("Stage 3 done at batch=%d → ~%.0f M tokens co-adaptation.",
+                    eff_batch, toks / 1e6)
 
-    # ── Save — config records the backend the checkpoint must be rebuilt on ─────
-    save_config = dict(stage3_model.config)
-    if fell_back_to_torch:
-        # CUDA strict-load failed on this box → weights only load on TorchMamba2.
-        # Persist the flag so _build_or_load_model rebuilds SFT/GRPO on the same backend.
-        save_config["force_torch_mixer"] = True
-
+    # ── Save — config pins the backend the checkpoint must be rebuilt on ────────
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({
         "model_state_dict": getattr(stage3_model, "_orig_mod", stage3_model).state_dict(),
-        "config": save_config,
+        "config": _save_config_with_backend(stage3_model),
         "phase": "distill",
     }, final_path)
     logger.info("distillation done → %s", final_path)
@@ -685,8 +805,20 @@ def run_sft(
     think_start_id = tokenizer.convert_tokens_to_ids("<think>")
     think_end_id = tokenizer.convert_tokens_to_ids("</think>")
 
-    # Compile after all structural mutations are done.
-    if device.type == "cuda":
+    # If the model is on the memory-heavy TorchMamba2 backend, enable gradient
+    # checkpointing and shrink the batch (grad_accum compensates to keep the effective
+    # batch). On the fast CUDA kernel this is a no-op.
+    on_torch = _enable_torch_memory_savings(model)
+    sft_cfg = _shrink_batch_for_torch(SFT_CFG) if on_torch else SFT_CFG
+    sft_stage2_cfg = _shrink_batch_for_torch(SFT_STAGE2_CFG) if on_torch else SFT_STAGE2_CFG
+    if on_torch:
+        logger.info("TorchMamba2 backend: gradient checkpointing ON; SFT batch %d→%d, "
+                    "grad_accum→%d (effective batch unchanged).",
+                    SFT_CFG["batch_size"], sft_cfg["batch_size"], sft_cfg["grad_accum"])
+
+    # Compile after all structural mutations — but not on the torch path (the python
+    # SSD scan compiles poorly and can clash with checkpointing).
+    if device.type == "cuda" and not on_torch:
         model = torch.compile(model, mode="reduce-overhead")
 
     from torch.utils.data import ConcatDataset
@@ -708,9 +840,9 @@ def run_sft(
     logger.info("Stage 1 dataset: %d total examples", len(stage1_data))
 
     _log_vram(device, "SFT-stage1 start")
-    ds1 = _make_block_cot_dataset(stage1_data, tokenizer, SFT_CFG, think_start_id, think_end_id)
-    loader1 = _make_loader(ds1, SFT_CFG)
-    global_step = _sft_loop(model, loader1, SFT_CFG, device, save_dir, "sft_s1")
+    ds1 = _make_block_cot_dataset(stage1_data, tokenizer, sft_cfg, think_start_id, think_end_id)
+    loader1 = _make_loader(ds1, sft_cfg)
+    global_step = _sft_loop(model, loader1, sft_cfg, device, save_dir, "sft_s1")
 
     # ── Stage 2: hard subset (reasoning-only data) ────────────────────────────
     logger.info("SFT Stage 2: hard subset (Orca-Math + Frontier CoT) …")
@@ -720,16 +852,16 @@ def run_sft(
     stage2_data = ConcatDataset(hard_parts)
     logger.info("Stage 2 dataset: %d examples (dropped SmolTalk direct-answer examples)", len(stage2_data))
 
-    ds2 = _make_block_cot_dataset(stage2_data, tokenizer, SFT_STAGE2_CFG, think_start_id, think_end_id)
-    loader2 = _make_loader(ds2, SFT_STAGE2_CFG)
+    ds2 = _make_block_cot_dataset(stage2_data, tokenizer, sft_stage2_cfg, think_start_id, think_end_id)
+    loader2 = _make_loader(ds2, sft_stage2_cfg)
     _log_vram(device, "SFT-stage2 start")
-    global_step = _sft_loop(model, loader2, SFT_STAGE2_CFG, device, save_dir, "sft_s2",
+    global_step = _sft_loop(model, loader2, sft_stage2_cfg, device, save_dir, "sft_s2",
                              start_step=global_step)
 
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({
         "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
-        "config": getattr(model, "config", STUDENT_CFG),
+        "config": _save_config_with_backend(model),
         "phase": "sft",
         "total_steps": global_step,
     }, final_path)
@@ -875,8 +1007,15 @@ def run_grpo(
     think_start_id = tokenizer.convert_tokens_to_ids("<think>")
     think_end_id = tokenizer.convert_tokens_to_ids("</think>")
 
-    # Compile after all structural mutations (token_embed resize) are done.
-    if device.type == "cuda":
+    # On the memory-heavy TorchMamba2 backend, enable gradient checkpointing for the
+    # policy/ref log-prob forward passes (generation runs under no_grad already).
+    on_torch = _enable_torch_memory_savings(model)
+    if on_torch:
+        logger.info("TorchMamba2 backend: gradient checkpointing ON for GRPO.")
+
+    # Compile after all structural mutations — but not on the torch path (the python
+    # SSD scan compiles poorly and can clash with checkpointing).
+    if device.type == "cuda" and not on_torch:
         model = torch.compile(model, mode="reduce-overhead")
 
     passes = _load_grpo_data(data)

@@ -135,8 +135,9 @@ class TorchMamba2(nn.Module):
         # Run the parameterized projections (in_proj, conv1d) in the module's weight
         # dtype, so a bf16-cast model does not hit a bf16-weight × fp32-input mismatch.
         # The precision-sensitive state-space math below is upcast to fp32 (MPS fp16 is
-        # flaky and A_log.exp needs the range).
-        w_dtype = self.in_proj.weight.dtype
+        # flaky and A_log.exp needs the range). Derive the dtype from the module's own
+        # params (all submodules share it under a module-wide .to(dtype) cast).
+        w_dtype = next(self.parameters()).dtype
         u = u.to(w_dtype)
 
         zxbcdt = self.in_proj(u)

@@ -608,13 +608,22 @@ class GRPOTrainer:
         os.makedirs(self.cfg.save_dir, exist_ok=True)
         path = path or os.path.join(self.cfg.save_dir, f"grpo_step{self.step}.pt")
         _base_model = getattr(self.model, "_orig_mod", self.model)
+        # Pin the backend: DIMBA.config omits force_torch_mixer so a CUDA checkpoint
+        # reloads on the fast kernel, but if this model runs on the pure-PyTorch
+        # TorchMamba2 backend the next loader must rebuild on it to load the weights.
+        cfg_dict = dict(getattr(_base_model, "config", None) or {})
+        try:
+            if type(_base_model.denoiser.blocks[0].mamba_fwd).__name__ == "TorchMamba2":
+                cfg_dict["force_torch_mixer"] = True
+        except Exception:  # noqa: BLE001 — never let a probe break checkpointing
+            pass
         torch.save({
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": _base_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "step": self.step,
             "grpo_config": asdict(self.cfg),
-            "config": getattr(_base_model, "config", None),  # real DIMBA model config
+            "config": cfg_dict or None,  # real DIMBA model config (+ backend pin)
         }, path)
         logger.info("saved → %s", path)
         return path

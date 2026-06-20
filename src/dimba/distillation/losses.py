@@ -202,10 +202,17 @@ def stage2_hidden_loss(
 
     for si, ti in pairs:
         so: Tensor = block_outputs[si]  # [B, L, d_student]
-        proj: Tensor = projectors[si](so)  # [B, L, d_teacher]
+        proj: Tensor = projectors[si](so).float()  # [B, L, d_teacher]
         # teacher hidden_states[0] = token embeddings; [ti+1] = output of layer ti.
-        target: Tensor = teacher_out.hidden_states[ti + 1]  # [B, L, d_teacher]
-        loss_acc = loss_acc + F.mse_loss(proj.float(), target.float())
+        target: Tensor = teacher_out.hidden_states[ti + 1].float()  # [B, L, d_teacher]
+        # Scale-invariant alignment: unit-RMS-normalize both sides over the feature dim
+        # before MSE. Transformer residual streams have "massive activation" outlier dims
+        # (values in the hundreds/thousands); raw MSE is dominated by them and thrashes at
+        # ~1e4. Normalizing compares the hidden-state DIRECTION/shape and keeps the loss
+        # in a stable O(1) range so the projector actually learns the mapping.
+        proj = proj * torch.rsqrt(proj.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        target = target * torch.rsqrt(target.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        loss_acc = loss_acc + F.mse_loss(proj, target)
 
     loss_avg = loss_acc / len(pairs)
     parts: Dict[str, Tensor] = {"stage2": loss_avg}

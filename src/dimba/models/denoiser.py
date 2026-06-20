@@ -473,8 +473,12 @@ class Mamba2Denoiser(nn.Module):
         # clear message rather than an opaque CUDA OOM.
         if return_matrices and x.shape[1] > 0:
             B, L, _ = x.shape
-            # Use a conservative nheads estimate; the real count is mixer-specific.
-            _nheads_est = max(1, self.d_model // 64)
+            # Use the real per-mixer head count when available (d_model//64 under-counts
+            # for expand>1, e.g. 9 vs the true 18 at d_model=576), and double it for the
+            # bidirectional fwd+bwd materialisation so the budget isn't ~4x optimistic.
+            _nheads_est = getattr(self.blocks[0].mamba_fwd, "nheads", max(1, self.d_model // 64))
+            if self.bidirectional:
+                _nheads_est *= 2
             _budget = B * _nheads_est * L * L * self.num_layers
             # Warn at >256 M elements (~1 GB fp32); hard-fail at >2 B elements (~8 GB).
             if _budget > 2_000_000_000:
