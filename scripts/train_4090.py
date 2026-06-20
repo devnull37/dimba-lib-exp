@@ -900,8 +900,21 @@ def _run_grpo_pass(
     device: torch.device,
     save_dir: str,
     resume: Optional[str],
+    resume_weights_only: bool = False,
 ) -> str:
-    """One GRPO domain pass.  Returns path to final checkpoint."""
+    """One GRPO domain pass.  Returns path to final checkpoint.
+
+    resume_weights_only=True (the sequential cross-domain handoff, e.g. math→code)
+    restores only the shared model's weights and gives this pass a FRESH LR schedule +
+    step counter — otherwise the new domain inherits the previous pass's exhausted
+    cosine scheduler and trains the whole pass pinned at the LR floor.
+    """
+    if not prompts:
+        raise ValueError(
+            f"GRPO domain {label!r} produced 0 prompts — check the dataset schema "
+            f"(e.g. the Bespoke-Stratos 'conversations' column may have drifted). "
+            f"Failing fast instead of dividing by zero mid-pass."
+        )
     from dataclasses import replace as _dc_replace
     grpo_cfg = _dc_replace(
         GRPO_CFG,
@@ -921,7 +934,7 @@ def _run_grpo_pass(
         trainer = build_math_grpo_trainer(model, tokenizer, grpo_cfg)
 
     if resume and os.path.isfile(resume):
-        trainer.load_checkpoint(resume)
+        trainer.load_checkpoint(resume, weights_only=resume_weights_only)
 
     logger.info("GRPO pass: %s | %d prompts | %d steps", label, len(prompts), num_steps)
     _log_vram(device, f"GRPO-{label} start")
@@ -998,12 +1011,16 @@ def run_grpo(
     for i, (prompts, refs, label) in enumerate(passes):
         pass_dir = os.path.join(save_dir, label)
         os.makedirs(pass_dir, exist_ok=True)
-        # Only pass the original --resume into the first domain pass.
+        # Only pass the original --resume into the first domain pass. For later passes
+        # the shared model already carries the trained weights, so we restore weights
+        # only and give each new domain a FRESH LR schedule (resume_weights_only=True);
+        # restoring the prior pass's exhausted cosine scheduler would pin it at the LR floor.
         pass_resume = resume if i == 0 else last_ckpt
         last_ckpt = _run_grpo_pass(
             model, tokenizer, think_start_id, think_end_id,
             prompts, refs, label, steps_per_pass,
             device, pass_dir, pass_resume,
+            resume_weights_only=(i > 0),
         )
         logger.info("GRPO domain pass '%s' done → %s", label, last_ckpt)
 

@@ -628,7 +628,17 @@ class GRPOTrainer:
         logger.info("saved → %s", path)
         return path
 
-    def load_checkpoint(self, path: str) -> None:
+    def load_checkpoint(self, path: str, weights_only: bool = False) -> None:
+        """Load a checkpoint into this trainer.
+
+        Args:
+            weights_only: When True, restore ONLY the model weights and leave this
+                trainer's fresh optimizer / scheduler / step counter untouched. Used for
+                the sequential cross-domain handoff (math→code): the new domain is a
+                brand-new LR cosine cycle, so reloading the previous pass's *exhausted*
+                scheduler/step would pin the whole pass at the LR floor. When False
+                (a genuine --resume), the full training state is restored to continue.
+        """
         ckpt = torch.load(path, map_location="cpu")
         msd = ckpt["model_state_dict"]
         # Tolerate torch.compile prefix differences between the saving and loading model.
@@ -639,6 +649,9 @@ class GRPOTrainer:
             consume_prefix_in_state_dict_if_present(msd, "_orig_mod.")
             target = getattr(self.model, "_orig_mod", self.model)
             target.load_state_dict(msd)
+        if weights_only:
+            logger.info("loaded weights <- %s (fresh optimizer/scheduler for new pass)", path)
+            return
         # Optimizer and scheduler state are only present in GRPO-saved checkpoints;
         # SFT/distill checkpoints are model-only and do not carry these keys.
         if "optimizer_state_dict" in ckpt:
