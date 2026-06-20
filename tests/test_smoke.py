@@ -175,7 +175,19 @@ def test_loss_decreases_over_optimizer_steps() -> None:
     is trained to minimize -- a vacuous and brittle check. The latent objective
     below has ~unit scale and real gradient signal.
     """
-    model = _build_tiny_model(seed=42)
+    # Explicitly use "film" conditioning so the blocks produce non-identity outputs
+    # from step 0 — AdaLN-Zero gates start at 0 (identity) and need more warm-up
+    # steps than this 5-step test provides.
+    torch.manual_seed(42)
+    model = DIMBA(
+        vocab_size=VOCAB_SIZE,
+        d_model=D_MODEL,
+        d_prompt=D_MODEL,
+        num_diffusion_steps=NUM_DIFFUSION_STEPS,
+        num_denoiser_layers=NUM_DENOISER_LAYERS,
+        use_simple_mamba=True,
+        conditioning_type="film",
+    )
     model.train()
 
     torch.manual_seed(123)

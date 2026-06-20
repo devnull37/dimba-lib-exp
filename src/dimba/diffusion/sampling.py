@@ -350,6 +350,130 @@ def sample_timesteps(batch_size: int, num_steps: int, device: torch.device) -> t
     return torch.randint(0, num_steps, (batch_size,), device=device)
 
 
+# ── Flow Matching ODE sampler ─────────────────────────────────────────────────
+
+@torch.no_grad()
+def sample_from_model_flow(
+    model: torch.nn.Module,
+    prompt_ids: Optional[torch.Tensor],
+    seq_len: int,
+    num_steps: int = 20,
+    sampler: str = "euler",
+    temperature: float = 1.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    guidance_scale: float = 1.0,
+    device: Optional[torch.device] = None,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Generate ``seq_len`` tokens using flow matching ODE integration.
+
+    Integrates ``dx/dt = v_theta(x_t, t, cond)`` from t=1 (pure noise) to t=0
+    (clean data) using Euler or Heun steps.  Requires the model to have been
+    trained with ``use_flow_matching=True``.
+
+    Args:
+        model: A DIMBA instance with ``use_flow_matching=True``.
+        prompt_ids: Prompt token IDs ``[B, P]`` or None.
+        seq_len: Number of response tokens to generate.
+        num_steps: ODE integration steps (8–20 is usually sufficient).
+        sampler: ``"euler"`` (1st-order, fast) or ``"heun"`` (2nd-order, better
+            quality at the same step count, ~2× compute per step).
+        guidance_scale: CFG weight (1.0 = off).
+        temperature, top_k, top_p: Final token sampling controls.
+        device: Override device.
+
+    Returns:
+        Generated token IDs ``[B, seq_len]``.
+    """
+    if sampler not in ("euler", "heun"):
+        raise ValueError(f"sampler must be 'euler' or 'heun', got {sampler!r}")
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
+
+    d_latent = model.d_latent
+    use_cfg = abs(guidance_scale - 1.0) > 1e-6 and prompt_ids is not None
+
+    if prompt_ids is not None:
+        prompt_ids = prompt_ids.to(device)
+        batch_size = prompt_ids.shape[0]
+        prompt_latent = model.encode_latent(model.token_embed(prompt_ids))
+        prompt_len = prompt_latent.shape[1]
+    else:
+        batch_size = 1
+        prompt_latent = None
+        prompt_len = 0
+
+    cond = model.conditioning_from_prompt(prompt_ids, batch_size, device)
+    uncond = (
+        model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
+        if use_cfg else None
+    )
+
+    # Start from pure noise at t=1
+    response = torch.randn(batch_size, seq_len, d_latent, device=device)
+    x_t = torch.cat([prompt_latent, response], dim=1) if prompt_latent is not None else response
+
+    # Uniform time grid from t=1 → t=0
+    ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+
+    def _velocity(xt, t_val):
+        t_batch = torch.full((batch_size,), t_val, device=device)
+        # model's denoise_to_x0_latent returns x0 prediction; velocity = (xt - x0) / t
+        x0_hat = model.denoise_flow(xt, t_batch, cond)
+        if use_cfg:
+            x0_uncond = model.denoise_flow(xt, t_batch, uncond)
+            x0_hat = x0_uncond + guidance_scale * (x0_hat - x0_uncond)
+        # v = (x_t - x0) / t  (rearranged from x_t = (1-t)*x0 + t*noise)
+        v = (xt - x0_hat) / max(t_val, 1e-5)
+        return v, x0_hat
+
+    x_self_cond = None
+
+    for i in range(num_steps):
+        t_cur = float(ts[i])
+        t_nxt = float(ts[i + 1])
+        dt = t_nxt - t_cur  # negative (integrating backward)
+
+        v_cur, x0_hat = _velocity(x_t, t_cur)
+        x_self_cond = x0_hat
+
+        if sampler == "heun" and i < num_steps - 1:
+            # Predictor step
+            x_mid = x_t + v_cur * dt
+            if prompt_latent is not None:
+                x_mid[:, :prompt_len, :] = prompt_latent
+            v_nxt, _ = _velocity(x_mid, t_nxt)
+            # Corrector: average the two velocities
+            x_t = x_t + 0.5 * (v_cur + v_nxt) * dt
+        else:
+            x_t = x_t + v_cur * dt
+
+        # Keep prompt prefix clean
+        if prompt_latent is not None:
+            x_t[:, :prompt_len, :] = prompt_latent
+
+        if verbose and i % max(1, num_steps // 5) == 0:
+            logger.info("flow step %d/%d (t=%.3f→%.3f)", i + 1, num_steps, t_cur, t_nxt)
+
+    # Decode response region
+    response_latent = x_t[:, prompt_len:, :]
+    x_dec = model.decode_latent(response_latent)
+    logits = model.output_head(x_dec) / max(temperature, 1e-6)
+
+    if top_k is not None or top_p is not None:
+        logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+
+    probs = F.softmax(logits, dim=-1)
+    probs = torch.nan_to_num(probs, nan=0.0)
+    prob_sum = probs.sum(dim=-1, keepdim=True)
+    probs = torch.where(prob_sum > 1e-6, probs / prob_sum,
+                        torch.ones_like(probs) / probs.shape[-1])
+    generated = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1)
+    return generated.view(batch_size, seq_len)
+
+
 class DDIMSampler:
     """Thin OO wrapper around :func:`sample_from_model` for DDIM-style sampling."""
 

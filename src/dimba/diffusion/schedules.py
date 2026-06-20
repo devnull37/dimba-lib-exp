@@ -214,3 +214,83 @@ class CosineNoiseSchedule(nn.Module):
     def get_alphas_cumprod(self) -> torch.Tensor:
         """Get cumulative alpha coefficients."""
         return self.alphas_cumprod
+
+
+class FlowMatchingSchedule(nn.Module):
+    """Rectified flow matching schedule (Liu et al. 2022; Lipman et al. 2022).
+
+    Forward process: ``x_t = (1-t)*x_0 + t*eps``  — linear interpolation between
+    clean data (t=0) and noise (t=1).  The model predicts the *velocity*
+    ``v = eps - x_0`` (the constant direction from data to noise).
+
+    Inference is a simple ODE: integrate ``dx/dt = v_theta(x_t, t)`` from t=1
+    back to t=0 using Euler or Heun steps — 8–20 steps is sufficient vs
+    50–1000 for DDPM (trajectories are straight lines, not curved).
+
+    Timestep sampling uses a logit-normal distribution (SD3 / FLUX default):
+    ``t = sigmoid(N(mean, std))``, which concentrates training effort on
+    t ≈ 0.5 where the most content decisions are made.
+
+    References
+        Rectified Flow:               arXiv:2209.03003  (Liu et al.)
+        Flow Matching:                arXiv:2210.02747  (Lipman et al.)
+        Stable Diffusion 3 schedule:  arXiv:2403.03206  (Esser et al.)
+    """
+
+    def __init__(
+        self,
+        logit_normal_sampling: bool = True,
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.logit_normal_sampling = logit_normal_sampling
+        self.logit_mean = logit_mean
+        self.logit_std = logit_std
+
+    def sample_timesteps(self, batch: int, device: torch.device) -> torch.Tensor:
+        """Sample continuous ``t ∈ (0, 1)`` per example. Returns ``[B]`` float tensor."""
+        if self.logit_normal_sampling:
+            u = torch.sigmoid(
+                torch.randn(batch, device=device) * self.logit_std + self.logit_mean
+            )
+        else:
+            u = torch.rand(batch, device=device)
+        return u.clamp(1e-5, 1.0 - 1e-5)
+
+    def forward_process(
+        self,
+        x_0: torch.Tensor,
+        noise: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Linear interpolation: ``x_t = (1-t)*x_0 + t*noise``.
+
+        Args:
+            x_0: Clean signal ``[B, L, D]``.
+            noise: Standard Gaussian noise, same shape.
+            t: Timesteps ``[B]`` in ``(0, 1)``.
+
+        Returns:
+            Interpolated ``x_t``, same shape as ``x_0``.
+        """
+        t_ = _reshape_to(t, x_0)
+        return (1.0 - t_) * x_0 + t_ * noise
+
+    def velocity_target(self, x_0: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """Ground-truth velocity ``v = noise - x_0``.
+
+        The model should predict this from ``(x_t, t, cond)``.
+        """
+        return noise - x_0
+
+    def x0_from_xt_and_velocity(
+        self, x_t: torch.Tensor, v: torch.Tensor, t: torch.Tensor
+    ) -> torch.Tensor:
+        """Recover ``x_0`` from the velocity prediction: ``x_0 = x_t - t*v``."""
+        t_ = _reshape_to(t, x_t)
+        return x_t - t_ * v
+
+    def sample_noise(self, x_0: torch.Tensor) -> torch.Tensor:
+        """Standard Gaussian noise shaped like ``x_0``."""
+        return torch.randn_like(x_0)

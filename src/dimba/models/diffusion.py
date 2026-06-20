@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Dict, Union
 
-from ..diffusion.schedules import CosineNoiseSchedule
+from ..diffusion.schedules import CosineNoiseSchedule, FlowMatchingSchedule
 from .embeddings import TokenEmbedding, TimestepEmbedding, PromptEncoder, LatentProjector
 from .denoiser import Mamba2Denoiser, DenoisingHead
 from .vae import TokenVAE, TokenVAEWithDeterministicFallback
@@ -65,7 +65,7 @@ class DIMBA(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-        conditioning_type: str = "film",
+        conditioning_type: str = "adaln",
         dropout: float = 0.1,
         use_weight_tying: bool = False,
         padding_idx: Optional[int] = None,
@@ -97,6 +97,8 @@ class DIMBA(nn.Module):
         ffn_mult: int = 4,
         ffn_type: str = "mlp",
         ffn_hidden: Optional[int] = None,
+        use_flow_matching: bool = False,
+        flow_logit_normal: bool = True,
     ):
         super().__init__()
 
@@ -212,6 +214,11 @@ class DIMBA(nn.Module):
             num_steps=num_diffusion_steps, zero_terminal_snr=zero_terminal_snr,
             noise_dist=noise_dist, noise_df=noise_df,
         )
+        self.use_flow_matching = use_flow_matching
+        if use_flow_matching:
+            self.flow_schedule = FlowMatchingSchedule(
+                logit_normal_sampling=flow_logit_normal,
+            )
 
         # Mamba denoiser (bidirectional by default)
         self.denoiser = Mamba2Denoiser(
@@ -299,6 +306,8 @@ class DIMBA(nn.Module):
             ffn_mult=ffn_mult,
             ffn_type=ffn_type,
             ffn_hidden=ffn_hidden,
+            use_flow_matching=use_flow_matching,
+            flow_logit_normal=flow_logit_normal,
         )
 
     @property
@@ -491,7 +500,15 @@ class DIMBA(nn.Module):
                 )
 
         # Forward diffusion; keep prompt positions clean when a prompt_mask is given.
-        x_t, noise = self.noise_schedule.add_noise(z_0, t, noise)
+        if self.use_flow_matching:
+            # Flow matching: linear interpolation x_t = (1-t)*z_0 + t*noise
+            # t here is a discrete index; convert to continuous for the schedule.
+            t_cont = t.float() / (self.num_diffusion_steps - 1)
+            if noise is None:
+                noise = self.flow_schedule.sample_noise(z_0)
+            x_t = self.flow_schedule.forward_process(z_0, noise, t_cont)
+        else:
+            x_t, noise = self.noise_schedule.add_noise(z_0, t, noise)
         diffuse_mask = None
         if prompt_mask is not None:
             keep = prompt_mask.unsqueeze(-1)  # [B, L, 1] bool
@@ -525,6 +542,34 @@ class DIMBA(nn.Module):
             latent_info["vae_kl_loss"] = vae_kl_loss
 
         return x_pred, noise, latent_info
+
+    def denoise_flow(
+        self,
+        x_t: torch.Tensor,
+        t_continuous: torch.Tensor,
+        cond: torch.Tensor,
+        x_self_cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict clean latent ``x_0`` for flow matching inference.
+
+        Args:
+            x_t: Noisy latent ``[B, L, d_latent]``.
+            t_continuous: Continuous timesteps ``[B]`` in ``(0, 1]``.
+            cond: Conditioning ``[B, 1, cond_dim]`` from :meth:`conditioning_from_prompt`.
+
+        Returns:
+            Predicted clean latent ``x_0_hat`` of the same shape as ``x_t``.
+        """
+        if not self.use_flow_matching:
+            raise RuntimeError(
+                "denoise_flow called on a model without use_flow_matching=True."
+            )
+        # Map continuous t ∈ (0,1] to discrete timestep index for the timestep embedding.
+        batch_size = x_t.shape[0]
+        t_idx = (t_continuous.clamp(0.0, 1.0) * (self.num_diffusion_steps - 1)).round().long()
+        raw = self._denoiser_raw(x_t, t_idx, cond, x_self_cond)
+        # Raw prediction is always x0 for flow matching (velocity is derived outside).
+        return raw
 
     def denoise_step(
         self,

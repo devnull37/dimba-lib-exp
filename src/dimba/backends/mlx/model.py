@@ -59,13 +59,25 @@ def _flip_seq(x):
 
 def _layer_norm(x, w, b, eps=1e-5):
     """Manual LayerNorm: mirrors ``mx.fast.layer_norm`` but always available."""
-    # Try the fast path first; fall back to manual if unavailable.
     try:
         return mx.fast.layer_norm(x, w, b, eps)
     except Exception:
         mean = mx.mean(x, axis=-1, keepdims=True)
         var = mx.mean((x - mean) ** 2, axis=-1, keepdims=True)
         return w * (x - mean) / mx.sqrt(var + eps) + b
+
+
+def _rms_norm(x, w, eps=1e-6):
+    """RMSNorm: no mean subtraction, no bias (mirrors PyTorch RMSNorm in denoiser)."""
+    rms = mx.sqrt(mx.mean(x ** 2, axis=-1, keepdims=True) + eps)
+    return (x / rms) * w
+
+
+def _norm(x, w, b, eps=1e-5):
+    """Dispatch to RMSNorm (b is None) or LayerNorm (b is an array)."""
+    if b is None:
+        return _rms_norm(x, w, eps)
+    return _layer_norm(x, w, b, eps)
 
 
 class MLXDIMBA:
@@ -203,7 +215,9 @@ class MLXDIMBA:
 
             b = f"denoiser.blocks.{i}."
             p["ln_w"].append(_to_mx(g(b + "norm.weight")))
-            p["ln_b"].append(_to_mx(g(b + "norm.bias")))
+            # RMSNorm has no bias; store None so forward uses _rms_norm
+            bias_key = b + "norm.bias"
+            p["ln_b"].append(_to_mx(sd[bias_key]) if bias_key in sd else None)
             fwd = {k[len(b + "mamba_fwd."):]: v for k, v in sd.items() if k.startswith(b + "mamba_fwd.")}
             bwd = {k[len(b + "mamba_bwd."):]: v for k, v in sd.items() if k.startswith(b + "mamba_bwd.")}
             load_torch_mamba2_state_dict(self.mixers_fwd[i], fwd)
@@ -280,7 +294,7 @@ class MLXDIMBA:
                 gamma = _linear(combined, p["film_g_w"][i], p["film_g_b"][i])
                 beta  = _linear(combined, p["film_b_w"][i], p["film_b_b"][i])
                 conditioned = gamma * x + beta
-                h = _layer_norm(conditioned, p["ln_w"][i], p["ln_b"][i])
+                h = _norm(conditioned, p["ln_w"][i], p["ln_b"][i])
                 y = self.mixers_fwd[i](h)
                 y = y + _flip_seq(self.mixers_bwd[i](_flip_seq(h)))
                 x = conditioned + y
@@ -292,7 +306,7 @@ class MLXDIMBA:
                 scale = mod[..., :d]
                 shift = mod[..., d:2*d]
                 gate  = mod[..., 2*d:]
-                h = _layer_norm(x, p["ln_w"][i], p["ln_b"][i])
+                h = _norm(x, p["ln_w"][i], p["ln_b"][i])
                 h = h * (1.0 + scale) + shift
                 y = self.mixers_fwd[i](h)
                 y = y + _flip_seq(self.mixers_bwd[i](_flip_seq(h)))

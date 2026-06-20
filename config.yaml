@@ -9,7 +9,8 @@ model:
   d_state: 16               # SSM state size
   d_conv: 4                 # Convolution kernel size
   expand: 2                 # Expansion factor for Mamba
-  conditioning_type: "film" # 'film' or 'additive'
+  conditioning_type: "adaln" # 'adaln' (default, DiT-style AdaLN-Zero) | 'film' | 'additive'
+  use_flow_matching: false   # true -> rectified flow schedule + Euler/Heun ODE sampler
   dropout: 0.1
   use_weight_tying: false   # Tie embedding and output weights
   use_simple_mamba: false   # Set to true to force SimpleMamba2 (CPU), false for mamba-ssm (GPU)

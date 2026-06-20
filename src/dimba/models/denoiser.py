@@ -22,6 +22,24 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 from typing import Literal, Optional
 
+
+class RMSNorm(nn.Module):
+    """Root-mean-square layer normalisation (Zhang & Sennrich, 2019).
+
+    Faster than LayerNorm: no mean subtraction, no bias.  Used by Llama,
+    Qwen, Gemma, and most modern LLMs.  Drop-in replacement for
+    ``nn.LayerNorm`` on the last dimension.
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
+        return (x / rms) * self.weight
+
 # Resolve the best available Mamba implementation once, at import time.
 _MAMBA_CLS = None
 _MAMBA_KIND = "simple"
@@ -168,7 +186,7 @@ class Mamba2Block(nn.Module):
         self.d_model = d_model
         self.bidirectional = bidirectional
         self.bidir_merge = bidir_merge
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
 
         self.mamba_fwd = _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba)
         self.mamba_bwd = (
@@ -194,7 +212,7 @@ class Mamba2Block(nn.Module):
         self.norm2 = None
         self.ffn = None
         if block_ffn:
-            self.norm2 = nn.LayerNorm(d_model)
+            self.norm2 = RMSNorm(d_model)
             self.ffn = _BlockFFN(d_model, mult=ffn_mult, ffn_type=ffn_type, hidden=ffn_hidden)
 
     def _mix(self, h: torch.Tensor) -> torch.Tensor:
@@ -221,13 +239,25 @@ class Mamba2Block(nn.Module):
         scale: torch.Tensor,
         shift: torch.Tensor,
         gate: torch.Tensor,
+        scale2: Optional[torch.Tensor] = None,
+        shift2: Optional[torch.Tensor] = None,
+        gate2: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """AdaLN-Zero variant: norm -> (1+scale)*h+shift -> mix -> x + gate*y, then FFN."""
+        """AdaLN-Zero: norm→modulate→mix→residual, then optionally modulated FFN.
+
+        When ``scale2/shift2/gate2`` are provided (DiT full-block, 6-param path)
+        the FFN sub-layer is also adaptively conditioned.  When they are None the
+        FFN falls back to a plain pre-norm residual (3-param path).
+        """
         h = self.norm(x)
         h = h * (1 + scale) + shift
         x = x + gate * self._mix(h)
         if self.ffn is not None:
-            x = x + self.ffn(self.norm2(x))
+            if scale2 is not None:
+                h2 = self.norm2(x) * (1 + scale2) + shift2
+                x = x + gate2 * self.ffn(h2)
+            else:
+                x = x + self.ffn(self.norm2(x))
         return x
 
     def materialize_matrices(self, h_normed: torch.Tensor):
@@ -286,7 +316,7 @@ class Mamba2Denoiser(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-        conditioning_type: Literal["film", "additive", "adaln"] = "film",
+        conditioning_type: Literal["film", "additive", "adaln"] = "adaln",
         cond_dim: int = 512,
         time_embed_dim: int = 512,
         dropout: float = 0.1,
@@ -335,7 +365,8 @@ class Mamba2Denoiser(nn.Module):
             )
         elif conditioning_type == "adaln":
             self.conditioning = nn.ModuleList(
-                [AdaLNZeroConditioning(cond_dim, d_model) for _ in range(num_layers)]
+                [AdaLNZeroConditioning(cond_dim, d_model, has_ffn=block_ffn)
+                 for _ in range(num_layers)]
             )
         else:
             raise ValueError(f"Unknown conditioning type: {conditioning_type}")
@@ -421,7 +452,8 @@ class Mamba2Denoiser(nn.Module):
         what that block computes for this input.
         """
         if self.conditioning_type == "adaln":
-            scale, shift, _gate = cond_layer(combined_cond)
+            params = cond_layer(combined_cond)
+            scale, shift = params[0], params[1]
             h = block.norm(x)
             return h * (1 + scale) + shift
         return block.norm(cond_layer(x, combined_cond))
@@ -429,8 +461,11 @@ class Mamba2Denoiser(nn.Module):
     def _block_forward(self, block, cond_layer, x, combined_cond):
         """Condition + mix + dropout for a single denoiser block."""
         if self.conditioning_type == "adaln":
-            scale, shift, gate = cond_layer(combined_cond)
-            out = block.forward_adaln(x, scale, shift, gate)
+            params = cond_layer(combined_cond)
+            if len(params) == 6:
+                out = block.forward_adaln(x, *params)
+            else:
+                out = block.forward_adaln(x, *params)
         else:
             out = block(cond_layer(x, combined_cond))
         if self.dropout is not None:

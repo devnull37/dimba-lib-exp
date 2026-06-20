@@ -298,38 +298,48 @@ class AdaLNZeroConditioning(nn.Module):
     """DiT-style adaptive LayerNorm-Zero modulation (Peebles & Xie, 2023).
 
     From a conditioning vector (pooled prompt + timestep) produces per-block
-    ``(scale, shift, gate)``. The output projection is **zero-initialized** so at
-    init ``scale=shift=gate=0`` and the consuming block is an exact identity
-    (``out = x + 0 * mixer(...)``) -- the denoiser starts as a no-op and learns to
-    use conditioning gradually, which trains far more stably than FiLM for deep
-    diffusion backbones.
+    ``(scale, shift, gate)`` for the SSM mixer, and optionally a second triplet
+    ``(scale2, shift2, gate2)`` for the FFN sub-layer when ``has_ffn=True``.
+    The output projection is **zero-initialized** so at init all modulation
+    outputs are 0 and the consuming block is an exact identity
+    (``out = x + 0 * mixer(...)``).  This trains far more stably than FiLM for
+    deep diffusion backbones.
 
-    The consuming block applies::
+    When ``has_ffn=False`` the consuming block applies::
 
         h = norm(x); h = h * (1 + scale) + shift
         y = mixer(h); out = x + gate * y
 
+    When ``has_ffn=True`` (DiT full-block, 6 params) additionally::
+
+        h2 = norm2(out); h2 = h2 * (1 + scale2) + shift2
+        out = out + gate2 * ffn(h2)
+
     Args:
         cond_dim: Dimension of the conditioning vector.
         target_dim: Dimension of the features being modulated.
+        has_ffn: Produce a second (scale2, shift2, gate2) triplet for the FFN.
     """
 
-    def __init__(self, cond_dim: int, target_dim: int):
+    def __init__(self, cond_dim: int, target_dim: int, has_ffn: bool = False):
         super().__init__()
         self.cond_dim = cond_dim
         self.target_dim = target_dim
+        self.has_ffn = has_ffn
+        n_params = 6 if has_ffn else 3
         # SiLU(cond) -> Linear, matching DiT's adaLN_modulation. Zero-init the linear.
-        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 3 * target_dim))
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, n_params * target_dim))
         nn.init.zeros_(self.modulation[1].weight)
         nn.init.zeros_(self.modulation[1].bias)
 
     def forward(self, cond: torch.Tensor):
-        """Return ``(scale, shift, gate)`` from conditioning ``[B, L, cond_dim]``.
+        """Return modulation parameters from conditioning ``[B, L, cond_dim]``.
 
-        Each output is ``[B, L, target_dim]`` (broadcasts over L when cond is ``[B, 1, .]``).
+        Returns ``(scale, shift, gate)`` when ``has_ffn=False``, or
+        ``(scale, shift, gate, scale2, shift2, gate2)`` when ``has_ffn=True``.
+        Each tensor has shape ``[B, L, target_dim]``.
         """
-        scale, shift, gate = self.modulation(cond).chunk(3, dim=-1)
-        return scale, shift, gate
+        return self.modulation(cond).chunk(6 if self.has_ffn else 3, dim=-1)
 
 
 class AdditiveConditioning(nn.Module):
