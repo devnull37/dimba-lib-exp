@@ -1,27 +1,30 @@
 """Frontier-model CoT trace loaders.
 
-All four classes return ``{"prompt": str, "reasoning": str, "response": str}``
-so they drop directly into :class:`~dimba.data.cot_dataset.BlockCoTDataset`.
+All classes return ``{"prompt": str, "reasoning": str, "response": str}``
+and drop directly into :class:`~dimba.data.cot_dataset.BlockCoTDataset`.
 
 Dataset summary
 ---------------
-+------------------------------------------+--------+-----------------------------------+
-| Dataset                                  | Rows   | CoT format                        |
-+------------------------------------------+--------+-----------------------------------+
-| kelexine/fable-5-sft-traces              |  ~885* | ``thinking`` field + ``response`` |
-| Jackrong/GLM-5.1-Reasoning-1M-Cleaned   | 746 K  | inline ``<think>...</think>``     |
-| TheFusionCube/Fable-5-CoT-Traces        |   468  | inline (no guaranteed tags)       |
-| ansulev/Opus-4.7-Reasoning-CoT-4800x    |  2410  | inline ``<think>...</think>``     |
-+------------------------------------------+--------+-----------------------------------+
-* after filtering to task_type == "reasoning" (81% of the dataset is agentic/tool-use)
+Source                                    Rows     Model              Domain
+----------------------------------------  -------  -----------------  ----------------------
+kelexine/fable-5-sft-traces               ~885*    Claude Fable-5     general reasoning
+TheFusionCube/Fable-5-CoT-Traces           468     Claude Fable-5     general
+ansulev/Opus-4.7-Reasoning-CoT-4800x      2 410   Claude Opus-4.7    math/science
+Jackrong/GLM-5.1-Reasoning-1M-Cleaned   100 000†  GLM-5.1            math/STEM
+bespokelabs/Bespoke-Stratos-17k          16 710   DeepSeek-R1        math+code+science ★
+open-thoughts/OpenThoughts-114k         114 000   DeepSeek-R1        math+code+science ★
+glaiveai/reasoning-v1-20m               50 000†  R1-Distill-70B     general (non-math) ★
 
-``FrontierCoTMix`` returns a ready-to-use ``torch.utils.data.ConcatDataset`` of all
-four sources with sensible default subsampling.
+★ = new additions recommended after research sweep
+† = subsampled; full datasets are 746K / 22M respectively
+
+``FrontierCoTMix()`` returns a ``ConcatDataset`` of all sources (~285K rows by
+default) ready for wrapping in ``BlockCoTDataset``.
 """
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import ConcatDataset, Dataset
@@ -32,10 +35,10 @@ _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
 
 def _extract_think_response(text: str) -> tuple[str, str]:
-    """Split inline ``<think>...</think>thinking</think>response`` into parts.
+    """Split ``<think>...</think>response`` into ``(reasoning, response)``.
 
-    Returns ``(reasoning, response)``.  If no think block is found, returns
-    ``("", text)`` so the example is treated as a direct-answer sample.
+    Falls back to ``("", text)`` when no think block is found — the example
+    is then treated as a direct-answer sample by ``BlockCoTDataset``.
     """
     m = _THINK_RE.search(text)
     if m:
@@ -45,26 +48,35 @@ def _extract_think_response(text: str) -> tuple[str, str]:
     return "", text.strip()
 
 
-# ── dataset classes ───────────────────────────────────────────────────────────
+def _parse_conversations(conversations: List[Dict]) -> tuple[str, str]:
+    """Extract (prompt, full_assistant_response) from a conversations list.
+
+    Handles both ``{"from": "human/gpt"}`` (ShareGPT style) and
+    ``{"role": "user/assistant"}`` (OpenAI style).
+    """
+    prompt, assistant = "", ""
+    for turn in conversations:
+        role = turn.get("from", turn.get("role", "")).lower()
+        value = turn.get("value", turn.get("content", "")).strip()
+        if role in ("human", "user"):
+            prompt = value
+        elif role in ("gpt", "assistant"):
+            assistant = value
+    return prompt, assistant
+
+
+# ── original four sources ─────────────────────────────────────────────────────
 
 class KelexineFableTracesDataset(Dataset):
     """``kelexine/fable-5-sft-traces`` — Fable-5 SFT traces (reasoning subset).
 
-    The dataset is 81% agentic (tool-use) and 19% reasoning.  We filter to
-    ``task_type == "reasoning"`` only; the ``thinking`` field is already split
-    from the response so no regex extraction is needed.
-
-    Args:
-        split: HuggingFace split (only "train" exists).
-        max_examples: Optional cap for fast debugging.
+    Filters to ``task_type == "reasoning"`` (~885 rows from 4665 total).
+    The ``thinking`` field is already split from ``response``.
     """
 
-    def __init__(self, split: str = "train", max_examples: Optional[int] = None) -> None:
-        try:
-            from datasets import load_dataset
-        except ImportError as e:
-            raise ImportError("pip install datasets") from e
-
+    def __init__(self, split: str = "train",
+                 max_examples: Optional[int] = None) -> None:
+        from datasets import load_dataset
         ds = load_dataset("kelexine/fable-5-sft-traces", split=split,
                           trust_remote_code=True)
         ds = ds.filter(lambda r: r.get("task_type") == "reasoning")
@@ -77,7 +89,6 @@ class KelexineFableTracesDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, str]:
         row = self._data[idx]
-        # Prompt from the last human turn in messages
         prompt = ""
         for msg in row.get("messages", []):
             if msg.get("role") == "user":
@@ -90,25 +101,16 @@ class KelexineFableTracesDataset(Dataset):
 
 
 class FusionCubeFableCoTDataset(Dataset):
-    """``TheFusionCube/Fable-5-CoT-Traces`` — Fable-5 CoT traces.
+    """``TheFusionCube/Fable-5-CoT-Traces`` — 468 Fable-5 CoT traces.
 
-    468 rows.  CoT may be inline in the ``response`` field with or without
-    ``<think>`` tags.  We attempt extraction; fall back to empty reasoning.
-
-    Args:
-        split: HuggingFace split ("train" is the only one).
-        max_examples: Optional cap.
+    Drops truncated examples; extracts ``<think>`` inline when present.
     """
 
-    def __init__(self, split: str = "train", max_examples: Optional[int] = None) -> None:
-        try:
-            from datasets import load_dataset
-        except ImportError as e:
-            raise ImportError("pip install datasets") from e
-
+    def __init__(self, split: str = "train",
+                 max_examples: Optional[int] = None) -> None:
+        from datasets import load_dataset
         ds = load_dataset("TheFusionCube/Fable-5-CoT-Traces", split=split,
                           trust_remote_code=True)
-        # Drop truncated examples (incomplete CoT)
         ds = ds.filter(lambda r: not r.get("truncated", False))
         if max_examples is not None:
             ds = ds.select(range(min(max_examples, len(ds))))
@@ -130,22 +132,13 @@ class FusionCubeFableCoTDataset(Dataset):
 class GLMReasoningDataset(Dataset):
     """``Jackrong/GLM-5.1-Reasoning-1M-Cleaned`` — 746 K GLM-4 reasoning traces.
 
-    Each row has ``input`` (prompt) and ``output`` with inline
-    ``<think>...</think>`` then the answer.  Default cap is 100 K to avoid
-    this single source dominating the SFT mix.
-
-    Args:
-        split: "train" (only split).
-        max_examples: Default 100_000.  Pass ``None`` for the full 746 K.
+    Default cap 100 K to avoid this source dominating the mix.
+    ``<think>...</think>`` is inline in the ``output`` field.
     """
 
     def __init__(self, split: str = "train",
                  max_examples: Optional[int] = 100_000) -> None:
-        try:
-            from datasets import load_dataset
-        except ImportError as e:
-            raise ImportError("pip install datasets") from e
-
+        from datasets import load_dataset
         ds = load_dataset("Jackrong/GLM-5.1-Reasoning-1M-Cleaned", split=split,
                           trust_remote_code=True)
         if max_examples is not None:
@@ -157,30 +150,23 @@ class GLMReasoningDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, str]:
         row = self._data[idx]
-        prompt = row.get("input", "").strip()
-        output = row.get("output", "")
-        reasoning, response = _extract_think_response(output)
-        return {"prompt": prompt, "reasoning": reasoning, "response": response}
+        reasoning, response = _extract_think_response(row.get("output", ""))
+        return {
+            "prompt": row.get("input", "").strip(),
+            "reasoning": reasoning,
+            "response": response,
+        }
 
 
 class OpusCoTDataset(Dataset):
     """``ansulev/Opus-4.7-Reasoning-CoT-4800x`` — 2 410 Opus-4.7 CoT traces.
 
-    Each row has ``messages`` list: ``[{role: user, content: prompt},
-    {role: assistant, content: <think>...</think>answer}]``.
-
-    Args:
-        split: "train" / "validation" / "test".
-        max_examples: Optional cap.
+    ``messages[1].content`` contains ``<think>...</think>answer``.
     """
 
     def __init__(self, split: str = "train",
                  max_examples: Optional[int] = None) -> None:
-        try:
-            from datasets import load_dataset
-        except ImportError as e:
-            raise ImportError("pip install datasets") from e
-
+        from datasets import load_dataset
         ds = load_dataset("ansulev/Opus-4.7-Reasoning-CoT-4800x", split=split,
                           trust_remote_code=True)
         if max_examples is not None:
@@ -192,54 +178,158 @@ class OpusCoTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, str]:
         row = self._data[idx]
-        messages = row.get("messages", [])
-        prompt, full_response = "", ""
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                prompt = content.strip()
-            elif role == "assistant":
-                full_response = content.strip()
-        reasoning, response = _extract_think_response(full_response)
+        prompt, full = _parse_conversations(row.get("messages", []))
+        reasoning, response = _extract_think_response(full)
         return {"prompt": prompt, "reasoning": reasoning, "response": response}
+
+
+# ── new additions (code + math focus) ────────────────────────────────────────
+
+class BespokeStratosDataset(Dataset):
+    """``bespokelabs/Bespoke-Stratos-17k`` — 16 710 DeepSeek-R1 traces.
+
+    10 K math + 5 K code + 1 K science.  Rejection-sampled for correctness —
+    highest signal-to-noise of the small frontier datasets.  ShareGPT
+    ``conversations`` format; ``<think>`` is inline in the assistant turn.
+    """
+
+    def __init__(self, split: str = "train",
+                 max_examples: Optional[int] = None) -> None:
+        from datasets import load_dataset
+        ds = load_dataset("bespokelabs/Bespoke-Stratos-17k", split=split,
+                          trust_remote_code=True)
+        if max_examples is not None:
+            ds = ds.select(range(min(max_examples, len(ds))))
+        self._data = ds
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __getitem__(self, idx: int) -> Dict[str, str]:
+        row = self._data[idx]
+        prompt, full = _parse_conversations(row.get("conversations", []))
+        reasoning, response = _extract_think_response(full)
+        return {"prompt": prompt, "reasoning": reasoning, "response": response}
+
+
+class OpenThoughtsDataset(Dataset):
+    """``open-thoughts/OpenThoughts-114k`` — 114 K DeepSeek-R1 traces.
+
+    Math (89 K) + code (20 K) + science (4 K) + puzzles (1 K).  Verified
+    correct answers.  ShareGPT ``conversations`` format with ``<think>`` inline.
+    The dataset also exposes a ``metadata`` subset with ``deepseek_reasoning``
+    as a clean field; we use the standard split here for simplicity.
+
+    Args:
+        max_examples: Default None (all 114 K).  Set to e.g. 50_000 if VRAM
+            or time is a constraint.
+    """
+
+    def __init__(self, split: str = "train",
+                 max_examples: Optional[int] = None) -> None:
+        from datasets import load_dataset
+        ds = load_dataset("open-thoughts/OpenThoughts-114k", split=split,
+                          trust_remote_code=True)
+        if max_examples is not None:
+            ds = ds.select(range(min(max_examples, len(ds))))
+        self._data = ds
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __getitem__(self, idx: int) -> Dict[str, str]:
+        row = self._data[idx]
+        prompt, full = _parse_conversations(row.get("conversations", []))
+        reasoning, response = _extract_think_response(full)
+        return {"prompt": prompt, "reasoning": reasoning, "response": response}
+
+
+class GlaiveReasoningDataset(Dataset):
+    """``glaiveai/reasoning-v1-20m`` — 22 M R1-Distill-70B traces (sampled).
+
+    The only large-scale **general-domain** dataset with clean ``<think>``
+    traces — covers science, philosophy, law, history, engineering.  Default
+    cap 50 K to balance the math-heavy sources without blowing up SFT time.
+    ``prompt`` / ``response`` columns; ``<think>`` is inline in ``response``.
+
+    Args:
+        max_examples: Default 50_000.  Pass None for the full 22 M (slow).
+    """
+
+    def __init__(self, split: str = "train",
+                 max_examples: Optional[int] = 50_000) -> None:
+        from datasets import load_dataset
+        ds = load_dataset("glaiveai/reasoning-v1-20m", split=split,
+                          trust_remote_code=True, streaming=False)
+        if max_examples is not None:
+            ds = ds.select(range(min(max_examples, len(ds))))
+        self._data = ds
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __getitem__(self, idx: int) -> Dict[str, str]:
+        row = self._data[idx]
+        reasoning, response = _extract_think_response(row.get("response", ""))
+        return {
+            "prompt": row.get("prompt", "").strip(),
+            "reasoning": reasoning,
+            "response": response,
+        }
 
 
 # ── convenience mix ───────────────────────────────────────────────────────────
 
 def FrontierCoTMix(
     glm_max: int = 100_000,
+    glaive_max: int = 50_000,
+    openthoughts_max: Optional[int] = None,
     include_fable_kelexine: bool = True,
     include_fable_fusioncube: bool = True,
     include_glm: bool = True,
     include_opus: bool = True,
+    include_stratos: bool = True,
+    include_openthoughts: bool = True,
+    include_glaive: bool = True,
 ) -> ConcatDataset:
-    """Return a ``ConcatDataset`` of all four frontier CoT sources.
+    """Return a ``ConcatDataset`` of frontier CoT sources.
 
-    Default mix (rows):
-      Fable-5 (kelexine, reasoning-only)     ~885
-      Fable-5 CoT traces (FusionCube)        ~468
-      GLM-5.1 (subsampled)                100 000
-      Opus-4.7 CoT                          2 170
-                                         --------
-                                         ~103 500
+    Default mix                          Rows     Model / domain
+    -----------------------------------  -------  --------------------------
+    Fable-5 kelexine (reasoning only)      ~885   Claude Fable-5 / general
+    Fable-5 FusionCube                      468   Claude Fable-5 / general
+    Opus-4.7 CoT                          2 170   Claude Opus / math+sci
+    GLM-5.1 (capped)                    100 000   GLM / math+STEM
+    Bespoke-Stratos-17k                  16 710   DeepSeek-R1 / math+code+sci
+    OpenThoughts-114k                   114 000   DeepSeek-R1 / math+code+sci
+    Glaive reasoning (capped)            50 000   R1-Distill-70B / general
+                                        -------
+    Total                              ~284 000
 
     Args:
-        glm_max: Row cap for the large GLM dataset (default 100 K).
+        glm_max: Row cap for GLM-5.1 (default 100 K).
+        glaive_max: Row cap for Glaive (default 50 K).
+        openthoughts_max: Row cap for OpenThoughts (default None = all 114 K).
         include_*: Toggle individual sources for ablations.
 
     Returns:
         A ``ConcatDataset`` ready to wrap in ``BlockCoTDataset``.
     """
-    parts = []
+    parts: list[Dataset] = []
     if include_fable_kelexine:
         parts.append(KelexineFableTracesDataset())
     if include_fable_fusioncube:
         parts.append(FusionCubeFableCoTDataset())
-    if include_glm:
-        parts.append(GLMReasoningDataset(max_examples=glm_max))
     if include_opus:
         parts.append(OpusCoTDataset())
+    if include_glm:
+        parts.append(GLMReasoningDataset(max_examples=glm_max))
+    if include_stratos:
+        parts.append(BespokeStratosDataset())
+    if include_openthoughts:
+        parts.append(OpenThoughtsDataset(max_examples=openthoughts_max))
+    if include_glaive:
+        parts.append(GlaiveReasoningDataset(max_examples=glaive_max))
     if not parts:
         raise ValueError("At least one source must be enabled in FrontierCoTMix.")
     return ConcatDataset(parts)
