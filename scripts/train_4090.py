@@ -166,13 +166,7 @@ SFT_CFG = dict(
 )
 
 # SFT stage 2 — hard subset (reasoning-only data, lower LR)
-SFT_STAGE2_CFG = dict(
-    **SFT_CFG,
-    lr=5e-6,           # lower LR for refinement pass
-    num_epochs=1,
-    warmup_steps=50,
-    save_interval=200,
-)
+SFT_STAGE2_CFG = {**SFT_CFG, 'lr': 5e-6, 'num_epochs': 1, 'warmup_steps': 50, 'save_interval': 200}
 
 # GRPO hyperparams — MGPO + Long2Short (VibeThinker) + flow matching
 GRPO_CFG = GRPOConfig(
@@ -265,29 +259,26 @@ def _build_or_load_model(
         ckpt = torch.load(checkpoint, map_location="cpu")
         cfg = ckpt.get("config", STUDENT_CFG)
         model = DIMBA(**cfg)
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
     else:
         logger.info("building fresh student model (Mode A: inherit teacher weights)")
         teacher = TeacherWrapper(TEACHER_MODEL, device=str(device))
-        model = build_student_from_teacher(
+        model, _layer_map = build_student_from_teacher(
             teacher,
-            extra_student_kwargs=dict(
-                num_diffusion_steps=1000,
-                d_state=64,
-                d_conv=4,
-                expand=2,
-                conditioning_type="adaln",
-                use_flow_matching=True,
-                flow_logit_normal=True,
-                use_simple_mamba=False,
-            ),
+            num_diffusion_steps=1000,
+            d_state=64,
+            d_conv=4,
+            expand=2,
+            conditioning_type="adaln",
+            use_flow_matching=True,
+            flow_logit_normal=True,
+            use_simple_mamba=False,
         )
         teacher.unload()
 
     model = model.to(device)
     if device.type == "cuda":
         model = model.to(torch.bfloat16)  # bf16 storage; no GradScaler needed
-        model = torch.compile(model, mode="reduce-overhead")
     return model
 
 
@@ -347,7 +338,8 @@ def _sft_loop(
     accum = cfg["grad_accum"]
     warmup = cfg["warmup_steps"]
     # LR schedule operates in optimizer steps, not micro-batch steps.
-    total_optimizer_steps = (cfg["num_epochs"] * len(loader)) // accum
+    # Use ceil to account for partial-group flushes at epoch end.
+    total_optimizer_steps = math.ceil(len(loader) / accum) * cfg["num_epochs"]
 
     _fused = device.type == "cuda"
     optimizer = torch.optim.AdamW(
@@ -368,6 +360,7 @@ def _sft_loop(
 
     for epoch in range(cfg["num_epochs"]):
         logger.info("%s epoch %d/%d", label, epoch + 1, cfg["num_epochs"])
+        micro_step = 0
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
             response_mask = batch["response_mask"].to(device)
@@ -389,7 +382,8 @@ def _sft_loop(
                    / response_mask.sum().clamp(min=1)
             (loss / accum).backward()
 
-            if (global_step + 1) % accum == 0:
+            micro_step += 1
+            if micro_step % accum == 0:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
                 optimizer.step()
                 optimizer.zero_grad()
@@ -401,14 +395,14 @@ def _sft_loop(
             if global_step % cfg["log_interval"] == 0:
                 lr_now = scheduler.get_last_lr()[0]
                 logger.info("%s step %d | loss=%.4f | lr=%.2e",
-                            label, global_step, loss.item() * accum, lr_now)
+                            label, global_step, loss.item(), lr_now)
                 _write_state({"stage": label, "step": global_step,
-                              "loss": loss.item() * accum, "lr": lr_now})
+                              "loss": loss.item(), "lr": lr_now})
 
             if global_step % cfg["save_interval"] == 0:
                 ckpt_path = os.path.join(save_dir, f"sft_step{global_step}.pt")
                 torch.save({
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
                     "config": getattr(model, "config", STUDENT_CFG),
                     "step": global_step,
                     "phase": label,
@@ -416,10 +410,11 @@ def _sft_loop(
                 logger.info("saved → %s", ckpt_path)
 
         # Flush any remaining accumulated gradients at epoch end.
-        if global_step % accum != 0:
+        if micro_step % accum != 0:
             nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
             optimizer.step()
             optimizer.zero_grad()
+            opt_step += 1
             scheduler.step()
 
     return global_step
@@ -480,13 +475,11 @@ def run_distill(
     cfg = DistillationConfig.from_dict({**DISTILL_CFG, "device": str(device)})
 
     teacher = TeacherWrapper(TEACHER_MODEL, device=str(device))
-    model = build_student_from_teacher(
+    model, _layer_map = build_student_from_teacher(
         teacher,
-        extra_student_kwargs=dict(
-            use_flow_matching=True,
-            flow_logit_normal=True,
-            conditioning_type="adaln",
-        ),
+        use_flow_matching=True,
+        flow_logit_normal=True,
+        conditioning_type="adaln",
     )
 
     if resume and os.path.isfile(resume):
@@ -508,12 +501,12 @@ def run_distill(
     # Stage 3 has kd_weight=0.0 in DISTILL_CFG, so teacher.forward() is never
     # called during co-adaptation (see DistillationTrainer._stage3_step).
     # SmolLM-135M in bf16 is ~270 MB — keeping it in VRAM through Stage 3 is fine.
-    trainer = DistillationTrainer(student=model, teacher=teacher, config=cfg)
+    trainer = DistillationTrainer(model=model, teacher=teacher, config=cfg)
     trainer.run(pretrain_loader)
 
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
         "config": model.config,
         "phase": "distill",
     }, final_path)
@@ -555,6 +548,10 @@ def run_sft(
     think_end_id = (tokenizer.convert_tokens_to_ids("</think>")
                     if "</think>" in tokenizer.get_vocab() else None)
 
+    # Compile after all structural mutations are done.
+    if device.type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
+
     from torch.utils.data import ConcatDataset
 
     # ── Stage 1: full mix ─────────────────────────────────────────────────────
@@ -594,7 +591,7 @@ def run_sft(
 
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
         "config": getattr(model, "config", STUDENT_CFG),
         "phase": "sft",
         "total_steps": global_step,
@@ -733,13 +730,17 @@ def run_grpo(
     if "<think>" not in tokenizer.get_vocab():
         special_tokens["additional_special_tokens"] = ["<think>", "</think>"]
         tokenizer.add_special_tokens(special_tokens)
-        model.token_embed.resize(tokenizer.vocab_size)
+        model.token_embed.resize(len(tokenizer))
         # Sync the output head's weight-tying buffer with the new embedding table.
         if hasattr(model.output_head, "embedding_weight"):
             model.output_head.embedding_weight = model.token_embed.get_weight()
 
     think_start_id = tokenizer.convert_tokens_to_ids("<think>")
     think_end_id = tokenizer.convert_tokens_to_ids("</think>")
+
+    # Compile after all structural mutations (token_embed resize) are done.
+    if device.type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
 
     passes = _load_grpo_data(data, num_steps)
 

@@ -148,9 +148,14 @@ def _compute_elbo_logprob(
 
 
 def _group_advantages(rewards: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Group-normalize rewards → advantages. *rewards*: [B, G] → [B, G]."""
+    """Group-normalize rewards → advantages. *rewards*: [B, G] → [B, G].
+
+    Uses population std (correction=0) to avoid NaN when G=1 (Bessel-corrected
+    std of a single element is undefined).  When G=1 or all rewards are equal,
+    sigma=0 and advantages become 0 (via eps), which is harmless.
+    """
     mu = rewards.mean(dim=1, keepdim=True)
-    sigma = rewards.std(dim=1, keepdim=True)
+    sigma = rewards.std(dim=1, keepdim=True, correction=0)
     return (rewards - mu) / (sigma + eps)
 
 
@@ -267,19 +272,20 @@ class GRPOTrainer:
     @torch.no_grad()
     def _generate_group(
         self, prompt_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate G completions per prompt.
 
         Returns:
             full_ids     [B*G, L]
             response_ids [B*G, response_len]
             think_counts [B*G]
+            true_lens    [B*G]  pre-pad length of each row (independent of token values)
         """
         B = prompt_ids.shape[0]
         G = self.cfg.group_size
         device = prompt_ids.device
 
-        full_list, resp_list, count_list = [], [], []
+        full_list, resp_list, count_list, true_lens_list = [], [], [], []
         for _ in range(G):
             out = block_sample_from_model(
                 self.model,
@@ -294,18 +300,33 @@ class GRPOTrainer:
                 num_steps=self.cfg.num_diffusion_steps_inference,
                 sampler=self.cfg.sampler,
             )
-            full_list.append(out["full_ids"])
-            resp_list.append(out["response"])
-            count_list.append(
-                torch.full((B,), out["n_think_blocks"], dtype=torch.long, device=device)
+            f = out["full_ids"]
+            # Record the true pre-pad column count for every row in this call.
+            # f.shape[1] is the exact sequence length before padding, independent
+            # of any token id values (including id 0) inside the sequence.
+            true_lens_list.append(
+                torch.full((B,), f.shape[1], dtype=torch.long, device=device)
             )
+            full_list.append(f)
+            resp_list.append(out["response"])
+            # n_think_blocks is now a per-row tensor [B] from block_cot (per-prompt
+            # stop tracking).  Convert to the right device; fall back to broadcasting
+            # a scalar only if block_cot hasn't been updated yet.
+            n_think = out["n_think_blocks"]
+            if isinstance(n_think, torch.Tensor):
+                count_list.append(n_think.to(device=device, dtype=torch.long))
+            else:
+                count_list.append(
+                    torch.full((B,), n_think, dtype=torch.long, device=device)
+                )
 
         max_len = max(f.shape[1] for f in full_list)
         padded = [F.pad(f, (0, max_len - f.shape[1])) for f in full_list]
         full_ids = torch.stack(padded, dim=1).reshape(B * G, max_len)
         response_ids = torch.stack(resp_list, dim=1).reshape(B * G, self.cfg.response_len)
         think_counts = torch.stack(count_list, dim=1).reshape(B * G)
-        return full_ids, response_ids, think_counts
+        true_lens = torch.stack(true_lens_list, dim=1).reshape(B * G)
+        return full_ids, response_ids, think_counts, true_lens
 
     # ------------------------------------------------------------------
     def _score_completions(
@@ -314,11 +335,17 @@ class GRPOTrainer:
         full_ids: torch.Tensor,
         response_ids: torch.Tensor,
         think_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        """Score completions and apply Long2Short brevity bonus. Returns [B*G]."""
+        true_lens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Score completions and apply Long2Short brevity bonus.
+
+        Returns:
+            raw_rewards    [B*G]  correctness reward before Long2Short shaping.
+            bonused_rewards [B*G] rewards after Long2Short shaping (used for advantages).
+        """
         G = self.cfg.group_size
         resp_strs = self._decode(response_ids)
-        raw_rewards = []
+        raw_list = []
 
         for i, (resp, n_think) in enumerate(zip(resp_strs, think_counts.tolist())):
             prompt_str = prompt_strs[i // G]
@@ -333,37 +360,46 @@ class GRPOTrainer:
             if n_think == 0 and r > 0:
                 r += self.cfg.min_response_reward_bonus
 
-            raw_rewards.append(r)
+            raw_list.append(r)
 
-        rewards = torch.tensor(raw_rewards, dtype=torch.float, device=full_ids.device)
+        raw_rewards = torch.tensor(raw_list, dtype=torch.float, device=full_ids.device)
 
         if self.cfg.long2short_lambda > 0:
-            full_lengths = (full_ids != 0).sum(dim=1).float()  # non-pad tokens
+            # Use true_lens (pre-pad sequence lengths) for the brevity score so
+            # that token-id-0 occurrences inside the sequence don't distort L_i.
+            full_lengths = true_lens.float()
             bonus = _long2short_bonus(
-                full_lengths, rewards, G,
+                full_lengths, raw_rewards, G,
                 lam=self.cfg.long2short_lambda,
             )
-            rewards = rewards + bonus
+            bonused_rewards = raw_rewards + bonus
+        else:
+            bonused_rewards = raw_rewards
 
-        return rewards
+        return raw_rewards, bonused_rewards
 
     # ------------------------------------------------------------------
     def _build_response_mask(
-        self, full_ids: torch.Tensor, response_ids: torch.Tensor
+        self,
+        full_ids: torch.Tensor,
+        response_ids: torch.Tensor,
+        true_lens: torch.Tensor,
     ) -> torch.Tensor:
         """[B*G, L] mask for response positions.
 
         With adaptive_stop=True different group members generate different numbers
         of think blocks, so rows have different actual lengths and are right-padded
         with zeros to align to max_len.  mask[:, -R:] would mark padding as
-        response tokens for shorter rows.  We instead compute each row's actual
-        length and mark exactly the R tokens before the trailing padding.
+        response tokens for shorter rows.  We instead use the true pre-pad length
+        recorded during generation (independent of token id values) and mark
+        exactly the R tokens before the trailing padding.
         """
         B_G, L = full_ids.shape
         R = response_ids.shape[1]
-        mask = torch.zeros(B_G, L, device=full_ids.device)
-        # actual_len[i] = number of non-zero (non-padding) tokens in row i
-        actual_len = (full_ids != 0).sum(dim=1)  # [B*G]
+        # true_lens[i] is the exact pre-pad column count for row i, passed in
+        # from _generate_group.  This is correct regardless of token id values
+        # (including id 0 inside prompt / think / response blocks).
+        actual_len = true_lens  # [B*G]
         # Vectorised: for each row build a range mask for [start, start+R)
         row_idx = torch.arange(L, device=full_ids.device).unsqueeze(0)  # [1, L]
         start = (actual_len - R).clamp(min=0).unsqueeze(1)              # [B*G, 1]
@@ -402,25 +438,29 @@ class GRPOTrainer:
 
         # ── 1. Generate ────────────────────────────────────────────────────────
         self.model.eval()
-        full_ids, response_ids, think_counts = self._generate_group(prompt_ids)
+        full_ids, response_ids, think_counts, true_lens = self._generate_group(prompt_ids)
 
         # ── 2. Score (+ Long2Short bonus) ─────────────────────────────────────
-        rewards_flat = self._score_completions(
-            prompt_strs, full_ids, response_ids, think_counts
+        # raw_rewards: correctness signal before Long2Short shaping
+        # bonused_rewards: shaped rewards used for advantage computation
+        raw_rewards_flat, bonused_rewards_flat = self._score_completions(
+            prompt_strs, full_ids, response_ids, think_counts, true_lens
         )
-        rewards = rewards_flat.reshape(B, G)                  # [B, G]
-        advantages = _group_advantages(rewards, eps=cfg.advantage_eps)  # [B, G]
+        raw_rewards = raw_rewards_flat.reshape(B, G)          # [B, G] correctness only
+        bonused_rewards = bonused_rewards_flat.reshape(B, G)  # [B, G] for advantages
+        advantages = _group_advantages(bonused_rewards, eps=cfg.advantage_eps)  # [B, G]
 
         # ── 3. MGPO: upweight capability-boundary prompts ─────────────────────
+        # Use raw correctness rewards so the brevity bonus doesn't corrupt p(q).
         if cfg.use_mgpo:
-            w = _mgpo_weights(rewards, cfg.mgpo_gamma)        # [B]
+            w = _mgpo_weights(raw_rewards, cfg.mgpo_gamma)    # [B]
             advantages = advantages * w.unsqueeze(1)           # broadcast to [B, G]
 
         advantages_flat = advantages.reshape(B * G)
 
         # ── 4. Policy / ref log-probs ─────────────────────────────────────────
         self.model.train()
-        response_mask = self._build_response_mask(full_ids, response_ids)
+        response_mask = self._build_response_mask(full_ids, response_ids, true_lens)
         response_len = response_mask.sum(dim=1).clamp(min=1)  # [B*G] for per-token norm
 
         policy_lp = _compute_elbo_logprob(
@@ -437,7 +477,11 @@ class GRPOTrainer:
 
         # ── 5. GRPO loss ───────────────────────────────────────────────────────
         pg_loss = -(advantages_flat * policy_lp_norm).mean()
-        kl = (policy_lp_norm - ref_lp_norm).mean()
+        # k3 KL estimator: E[exp(log r) - log r - 1] where r = ref/policy.
+        # Always >= 0, unbiased, avoids the anti-regularization caused by the
+        # raw log-prob difference which can be negative and reduce the loss.
+        logr = ref_lp_norm - policy_lp_norm  # log(ref/policy); ref under no_grad
+        kl = (logr.exp() - logr - 1).mean()  # k3 estimator: always >= 0
         loss = pg_loss + cfg.kl_coeff * kl
 
         # ── 6. Optimise ────────────────────────────────────────────────────────
@@ -449,20 +493,24 @@ class GRPOTrainer:
         self.step += 1
 
         # ── 7. Metrics ────────────────────────────────────────────────────────
-        group_acc = (rewards > 0).float().mean(dim=1)         # [B]
+        # group_acc uses raw correctness rewards (not the Long2Short-shaped ones)
+        # so it reflects true solve rate, not brevity-adjusted reward.
+        group_acc = (raw_rewards > 0).float().mean(dim=1)     # [B]
         metrics = {
             "step": self.step,
             "loss": loss.item(),
             "pg_loss": pg_loss.item(),
             "kl": kl.item(),
-            "mean_reward": rewards.mean().item(),
-            "reward_std": rewards.std().item(),
+            "mean_reward": bonused_rewards.mean().item(),      # what the policy optimizes
+            "reward_std": bonused_rewards.std().item(),
             "mean_think_blocks": think_counts.float().mean().item(),
             "group_accuracy": group_acc.mean().item(),
             "lr": self.scheduler.get_last_lr()[0],
         }
         if cfg.use_mgpo:
-            metrics["mgpo_weight_mean"] = _mgpo_weights(rewards, cfg.mgpo_gamma).mean().item()
+            # Use raw_rewards to keep mgpo_weight consistent with the weight used
+            # for advantages (computed from raw_rewards above).
+            metrics["mgpo_weight_mean"] = _mgpo_weights(raw_rewards, cfg.mgpo_gamma).mean().item()
 
         if self.step % cfg.log_interval == 0:
             logger.info(

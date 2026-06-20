@@ -206,6 +206,11 @@ class DistillationTrainer:
         self.head_aligners: nn.ModuleList = nn.ModuleList(head_aligner_list)
         self.projectors: nn.ModuleList = nn.ModuleList(projector_list)
 
+        # Move auxiliary modules to the same device as the student model.
+        _student_device = next(model.parameters()).device
+        self.head_aligners.to(_student_device)
+        self.projectors.to(_student_device)
+
         logger.info(
             "DistillationTrainer: %d student blocks, d_latent=%d, d_teacher=%d, "
             "t_heads=%d.",
@@ -348,7 +353,7 @@ class DistillationTrainer:
 
         # ---- Determine whether stage 1 needs mixing matrices ----
         needs_matrices = stage_name == "stage1"
-        use_simple = getattr(self.model, "use_simple_mamba", False)
+        use_simple = bool(self.model.config.get("use_simple_mamba", False))
         if needs_matrices and use_simple:
             warnings.warn(
                 "DistillationTrainer: stage1 requires return_matrices=True but "
@@ -365,6 +370,10 @@ class DistillationTrainer:
         min_snr_gamma: float = float(stage.get("min_snr_gamma", 5.0))
 
         teacher_type: str = self.config.teacher_type
+        # Normalise vocabulary: 'masked' (TeacherWrapper/DistillationConfig term for
+        # encoder-only models) maps to 'bidirectional' (stage1_matrix_loss term).
+        if teacher_type == "masked":
+            teacher_type = "bidirectional"
 
         # ---- Training loop ----
         self.model.train()
