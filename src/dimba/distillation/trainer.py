@@ -479,15 +479,18 @@ class DistillationTrainer:
                 return_matrices=True,
                 drop_cond=True,
             )
-        except (NotImplementedError, RuntimeError) as exc:
-            # RuntimeError covers the OOM-guard raised when B*L is too large to
-            # materialise mixing matrices (2.3 GB+ at B=32, L=512, 30 layers).
-            # Warn once per stage, then fall back to zero loss so training continues.
+        except (NotImplementedError, RuntimeError, AttributeError, TypeError) as exc:
+            # Degrade Stage 1 to a no-op (rather than crash the whole run) on any of:
+            #   • NotImplementedError — mixer exposes no matrix path
+            #   • RuntimeError        — OOM guard at large B*L (2.3 GB+ at B=32, L=512)
+            #   • AttributeError/TypeError — the param-based materialization for the CUDA
+            #     mamba_ssm.Mamba2 kernel hit an unexpected attribute name / signature on
+            #     this mamba_ssm version (the math is verified, but the API could drift).
+            # Stages 2 + 3 are unaffected, so the run still proceeds on the fast kernel.
             if not getattr(self, "_stage1_warned", False):
                 logger.warning(
-                    "stage1 matrix loss unavailable (%s: %s); "
-                    "stage1 will be a no-op. Consider shorter sequences or "
-                    "removing stage1 from DISTILL_CFG.",
+                    "stage1 matrix loss unavailable (%s: %s); stage1 will be a no-op. "
+                    "Stages 2/3 are unaffected.",
                     type(exc).__name__, exc,
                 )
                 self._stage1_warned = True
