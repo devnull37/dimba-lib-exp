@@ -49,6 +49,7 @@ from dimba.distillation.teacher import TeacherWrapper
 from dimba.training.grpo import GRPOConfig, GRPOTrainer, build_math_grpo_trainer
 from dimba.training.rewards import CompositeReward, NumericAnswerReward, LengthPenaltyReward
 from dimba.data.cot_dataset import SmolTalkDataset, OrcaMathDataset, BlockCoTDataset
+from dimba.data.frontier_cot import FrontierCoTMix
 
 logging.basicConfig(
     level=logging.INFO,
@@ -277,6 +278,7 @@ def run_sft(
     device: torch.device,
     save_dir: str = "./checkpoints/sft",
     resume: Optional[str] = None,
+    use_frontier: bool = True,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
     logger.info("=== PHASE 2: SFT (block-CoT) ===")
@@ -288,13 +290,21 @@ def run_sft(
     think_start_id = tokenizer.convert_tokens_to_ids("<think>") if "<think>" in tokenizer.get_vocab() else None
     think_end_id = tokenizer.convert_tokens_to_ids("</think>") if "</think>" in tokenizer.get_vocab() else None
 
+    from torch.utils.data import ConcatDataset
+
     logger.info("loading SmolTalk …")
     smol = SmolTalkDataset(split="train", subset="smol-magpie-ultra")
     logger.info("loading Orca-Math …")
     orca = OrcaMathDataset(split="train")
+    parts = [smol, orca]
+    if use_frontier:
+        logger.info("loading frontier CoT mix (Fable-5 × 2, GLM-5.1, Opus-4.7) …")
+        frontier = FrontierCoTMix()   # ~103 K rows: 885 + 468 + 100 K + 2 170
+        logger.info("frontier CoT mix: %d examples", len(frontier))
+        parts.append(frontier)
 
-    from torch.utils.data import ConcatDataset
-    combined = ConcatDataset([smol, orca])
+    # Mix: SmolTalk + Orca-Math (+ Frontier CoT when enabled)
+    combined = ConcatDataset(parts)
 
     def _tok_fn(text: str):
         return tokenizer.encode(text, add_special_tokens=False)
@@ -492,6 +502,8 @@ def parse_args() -> argparse.Namespace:
                    help=f"HuggingFace teacher model (default: {TEACHER_MODEL})")
     p.add_argument("--no-flow", action="store_true",
                    help="Disable flow matching (fall back to DDPM cosine schedule)")
+    p.add_argument("--no-frontier", action="store_true",
+                   help="Skip frontier CoT datasets (use only SmolTalk + Orca-Math)")
     return p.parse_args()
 
 
@@ -522,7 +534,8 @@ def main() -> None:
         ckpt = run_distill(device, resume=ckpt if args.resume else None)
 
     if args.phase in ("sft", "all"):
-        ckpt = run_sft(ckpt, device, resume=ckpt if args.resume else None)
+        ckpt = run_sft(ckpt, device, resume=ckpt if args.resume else None,
+                       use_frontier=not args.no_frontier)
 
     if args.phase in ("grpo", "all"):
         ckpt = run_grpo(ckpt, device,
