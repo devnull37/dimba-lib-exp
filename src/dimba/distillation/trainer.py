@@ -438,7 +438,11 @@ class DistillationTrainer:
 
             step += 1
 
-            if step % max(1, n_steps // 10) == 0 or step == n_steps:
+            # Log at least every 50 steps so long stages (e.g. stage3 with 30k steps)
+            # show progress promptly instead of staying silent for thousands of steps
+            # (n_steps//10 alone would be every 3000 steps for stage3).
+            log_every = max(1, min(n_steps // 10, 50))
+            if step % log_every == 0 or step == n_steps:
                 logger.info(
                     "DistillationTrainer [%s] step %d/%d — loss=%.6f",
                     stage_name,
