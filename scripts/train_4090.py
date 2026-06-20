@@ -627,8 +627,8 @@ def run_distill(
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
     logger.info("=== PHASE 1: DISTILLATION (MOHAWK-style) ===")
-    logger.info("Stage 1+2: matrix/hidden alignment on TorchMamba2 (short seq, teacher active)")
-    logger.info("Stage 3:   co-adaptation pretraining on CUDA kernel (~1B tokens, FFN frozen)")
+    logger.info("Stage 1+2: matrix/hidden alignment (short seq, teacher active)")
+    logger.info("Stage 3:   co-adaptation pretraining (~FFN frozen, teacher unused)")
 
     cfg = DistillationConfig.from_dict({**DISTILL_CFG, "device": str(device)})
     stages_by_name = {s["name"]: s for s in DISTILL_CFG["stages"]}
@@ -636,14 +636,14 @@ def run_distill(
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     teacher = TeacherWrapper(TEACHER_MODEL, device=str(device), dtype=compute_dtype)
 
-    # ── Build the student on the matrix-capable TorchMamba2 backend ─────────────
-    # force_torch_mixer=True selects TorchMamba2 even though mamba_ssm (CUDA) is
-    # installed: it is the only backend exposing materialize_mixing_matrix (needed
-    # for the Stage-1 matrix alignment) and is state_dict-compatible with the CUDA
-    # Mamba2 kernel, so the trained weights transfer to CUDA for the heavy Stage 3.
-    torch_model, _layer_map = build_student_from_teacher(
+    # ── Build the student on the BEST available backend ─────────────────────────
+    # No force_torch_mixer: with mamba_ssm installed this uses the fast CUDA Mamba2
+    # kernel; only a CPU/no-mamba box falls back to pure-PyTorch TorchMamba2. The
+    # Stage-1 mixing matrices are computed from whichever mixer's live parameters
+    # (denoiser._ssd_mixing_matrix_from_params handles the CUDA kernel, which has no
+    # materialize method), so no cross-backend weight transfer is needed.
+    model, _layer_map = build_student_from_teacher(
         teacher,
-        force_torch_mixer=True,
         num_diffusion_steps=1000,
         d_state=64,
         d_conv=4,
@@ -661,86 +661,57 @@ def run_distill(
 
     if resume and os.path.isfile(resume):
         ckpt = torch.load(resume, map_location="cpu")
-        torch_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
         logger.info("resumed distillation from %s", resume)
 
-    torch_model = torch_model.to(device)
+    model = model.to(device)
     if device.type == "cuda":
-        torch_model = torch_model.to(torch.bfloat16)
-    _log_vram(device, "post-torch-model-load")
+        model = model.to(torch.bfloat16)
+
+    on_torch = _live_mixer_is_torch(model)
+    logger.info("distill backend: %s", "TorchMamba2 (pure PyTorch — CPU/fallback)"
+                if on_torch else "CUDA Mamba2 kernel (fast binary)")
+    # Only the memory-heavy pure-PyTorch fallback needs checkpointing + a small batch;
+    # the CUDA binary kernel handles the full batch efficiently.
+    if on_torch:
+        model.denoiser.use_gradient_checkpointing = True
+    _log_vram(device, "post-model-load")
 
     tokenizer = _load_tokenizer(TEACHER_MODEL)
     stream = _build_fineweb_stream(tokenizer, n_cache=50_000)
     align_loader = _make_fineweb_loader(stream, ALIGN_SEQ_LEN, ALIGN_BATCH, num_workers=2)
 
-    # ── Stages 1 + 2: alignment on TorchMamba2 (matrices materializable) ────────
-    align_trainer = DistillationTrainer(model=torch_model, teacher=teacher, config=cfg)
+    # ── Stages 1 + 2: alignment (Stage-1 matrices from the live mixer params) ───
+    trainer = DistillationTrainer(model=model, teacher=teacher, config=cfg)
     for sname in ("stage1", "stage2"):
         if sname in stages_by_name:
             logger.info("alignment %s on short-seq loader (L=%d, B=%d)",
                         sname, ALIGN_SEQ_LEN, ALIGN_BATCH)
-            align_trainer.run_stage(stages_by_name[sname], align_loader)
-    if getattr(align_trainer, "_stage1_warned", False):
+            trainer.run_stage(stages_by_name[sname], align_loader)
+    if getattr(trainer, "_stage1_warned", False):
         logger.warning("Stage 1 matrix alignment fell back to a NO-OP — matrices could "
                        "not be materialized (see warning above).")
     else:
         logger.info("Stage 1+2 alignment complete (matrices materialized).")
-    # Free the alignment trainer (holds torch_model + 30 head-aligners/projectors) and
-    # its loader workers before the heavy Stage 3.
-    del align_loader, align_trainer
+    del align_loader
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # ── Try to transfer TorchMamba2 weights → CUDA Mamba2 for a faster Stage 3 ──
-    # TorchMamba2 and mamba_ssm.Mamba2 share an identical 8-key param tree, so a strict
-    # load is the load-bearing compatibility probe. On success Stage 3 runs on the fast
-    # kernel; on ANY mismatch — or if the CUDA kernel can't even be constructed and the
-    # build silently fell back to TorchMamba2 — we keep the torch model (slower, correct).
-    stage3_model = torch_model
-    if device.type == "cuda":
-        try:
-            cuda_model = DIMBA(**torch_model.config)  # no force_torch_mixer → CUDA kernel if available
-            cuda_model = cuda_model.to(device).to(torch.bfloat16)
-            cuda_model.load_state_dict(torch_model.state_dict(), strict=True)
-            stage3_model = cuda_model
-            del torch_model
-            gc.collect(); torch.cuda.empty_cache()
-            logger.info("backend transfer OK (strict load passed).")
-        except Exception as exc:  # noqa: BLE001 — any mismatch must degrade, not crash
-            stage3_model = torch_model
-            logger.warning("backend transfer FAILED (%s: %s). Keeping TorchMamba2 for Stage 3.",
-                           type(exc).__name__, str(exc)[:200])
-
-    # Detect the ACTUAL backend Stage 3 runs on (covers transfer failure AND a silent
-    # construction fallback to TorchMamba2 even for the nominally-"cuda" model).
-    on_torch = _live_mixer_is_torch(stage3_model)
-    logger.info("Stage 3 backend: %s",
-                "TorchMamba2 (pure PyTorch — slower, memory-heavy)" if on_torch
-                else "CUDA Mamba2 kernel (fast)")
-
     # The teacher is unused in Stage 3 (kd_weight=0) — free its VRAM. The wrapper stays
-    # alive so its metadata (num_layers, …) still answers the trainer constructor.
+    # alive so its metadata (num_layers, …) still answers any trainer query.
     teacher.unload()
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
-
-    # TorchMamba2's SSD scan materialises a [B, L, L, nheads] decay matrix per layer, so
-    # it needs a small batch + gradient checkpointing (recompute blocks in backward).
-    if on_torch:
-        stage3_model.denoiser.use_gradient_checkpointing = True
-        stage3_batch = PRETRAIN_BATCH_TORCH
-    else:
-        stage3_batch = PRETRAIN_BATCH
     _log_vram(device, "pre-stage3")
 
     # ── Stage 3: co-adaptation pretraining (FFN frozen, teacher unused) ─────────
     # Graceful OOM handling: halve the batch and retry instead of crashing.
-    stage3_trainer = DistillationTrainer(model=stage3_model, teacher=teacher, config=cfg)
+    stage3_batch = PRETRAIN_BATCH_TORCH if on_torch else PRETRAIN_BATCH
     if "stage3" in stages_by_name:
         eff_batch = _run_stage3_resilient(
-            stage3_trainer, stages_by_name["stage3"], stream,
+            trainer, stages_by_name["stage3"], stream,
             PRETRAIN_SEQ_LEN, stage3_batch, device,
         )
         toks = int(stages_by_name["stage3"]["steps"]) * eff_batch * PRETRAIN_SEQ_LEN
@@ -750,8 +721,8 @@ def run_distill(
     # ── Save — config pins the backend the checkpoint must be rebuilt on ────────
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({
-        "model_state_dict": getattr(stage3_model, "_orig_mod", stage3_model).state_dict(),
-        "config": _save_config_with_backend(stage3_model),
+        "model_state_dict": getattr(model, "_orig_mod", model).state_dict(),
+        "config": _save_config_with_backend(model),
         "phase": "distill",
     }, final_path)
     logger.info("distillation done → %s", final_path)

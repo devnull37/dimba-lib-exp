@@ -14,6 +14,7 @@ Two correctness-relevant changes vs. the original implementation:
    Vim recipe, arXiv:2401.09417). This is enabled by default.
 """
 
+import logging
 import math
 import warnings
 import torch
@@ -21,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class RMSNorm(nn.Module):
@@ -112,15 +115,66 @@ def _make_mixer(
         return _MAMBA_CLS(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
     except (TypeError, ValueError, AssertionError, RuntimeError) as exc:  # pragma: no cover - CUDA only
         if not _FALLBACK_WARNED:
-            warnings.warn(
-                f"Could not construct {_MAMBA_KIND} mixer ({exc}); falling back to "
-                f"pure-PyTorch TorchMamba2.",
-                RuntimeWarning,
+            # Log LOUDLY (not just warnings.warn) so the exact reason the fast CUDA kernel
+            # was rejected lands in the training log — this is the difference between a
+            # fast run and the slow/memory-heavy pure-PyTorch path.
+            logger.warning(
+                "mamba_ssm %s CUDA kernel could not be constructed (%s: %s) — falling back "
+                "to pure-PyTorch TorchMamba2 (slower, memory-heavy). Build args: "
+                "d_model=%d d_state=%d d_conv=%d expand=%d headdim=%d → nheads=%d.",
+                _MAMBA_KIND, type(exc).__name__, exc,
+                d_model, d_state, d_conv, expand, headdim, (expand * d_model) // headdim,
             )
             _FALLBACK_WARNED = True
         from .torch_mamba2 import TorchMamba2
 
         return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
+
+
+def _ssd_mixing_matrix_from_params(mixer: nn.Module, u: torch.Tensor) -> torch.Tensor:
+    """Materialize the ``[B, nheads, L, L]`` SSD token-mixing matrix from a Mamba-2
+    mixer's live parameters.
+
+    The CUDA ``mamba_ssm.Mamba2`` kernel does not expose ``materialize_mixing_matrix``,
+    but its parameters (``in_proj``, ``conv1d``, ``A_log``, ``dt_bias``, ``D``) and the
+    ``[z, xBC, dt]`` projection layout are identical to :class:`TorchMamba2` (which was a
+    line-for-line port). So we replicate that method's math here, reading the kernel's
+    own parameters — the matrix stays differentiable w.r.t. them, so MOHAWK Stage-1
+    alignment trains the real mixer even when the fast CUDA kernel is in use.
+
+    Mirrors ``TorchMamba2.materialize_mixing_matrix``; returns fp32, lower-triangular.
+    """
+    B, L, _ = u.shape
+    nheads = int(mixer.nheads)
+    headdim = int(mixer.headdim)
+    ngroups = int(getattr(mixer, "ngroups", 1))
+    d_state = int(mixer.d_state)
+    d_inner = nheads * headdim
+    conv_dim = d_inner + 2 * ngroups * d_state
+
+    w_dtype = mixer.in_proj.weight.dtype
+    zxbcdt = mixer.in_proj(u.to(w_dtype))
+    _z, xBC, dt = torch.split(zxbcdt, [d_inner, conv_dim, nheads], dim=-1)
+
+    # Causal depthwise conv + SiLU (matches causal_conv1d_fn with activation="silu").
+    xBC = mixer.conv1d(xBC.transpose(1, 2))[..., :L].transpose(1, 2)
+    xBC = F.silu(xBC)
+    _x, Bm, Cm = torch.split(xBC, [d_inner, ngroups * d_state, ngroups * d_state], dim=-1)
+
+    # Precision-sensitive state-space math in fp32.
+    dt = F.softplus(dt.float() + mixer.dt_bias.float())          # [B, L, nheads]
+    A = -torch.exp(mixer.A_log.float())                          # [nheads]
+    Bm = Bm.float().view(B, L, ngroups, d_state).repeat_interleave(nheads // ngroups, dim=2)
+    Cm = Cm.float().view(B, L, ngroups, d_state).repeat_interleave(nheads // ngroups, dim=2)
+
+    a_cum = torch.cumsum(A.view(1, 1, nheads) * dt, dim=1)       # [B, L, h]
+    logdecay = a_cum.unsqueeze(2) - a_cum.unsqueeze(1)           # [B, t, s, h]
+    mask = torch.tril(torch.ones(L, L, device=u.device, dtype=torch.bool))
+    logdecay = logdecay.masked_fill(~mask.view(1, L, L, 1), float("-inf"))
+    decay = torch.exp(logdecay)
+    cb = torch.einsum("bthn,bshn->btsh", Cm, Bm)                 # [B, t, s, h] (C_t·B_s)
+    M = cb * decay
+    return M.permute(0, 3, 1, 2).contiguous()                   # [B, h, t, s]
 
 
 class _BlockFFN(nn.Module):
@@ -300,21 +354,18 @@ class Mamba2Block(nn.Module):
         ``None`` when the block is unidirectional. These are the MOHAWK Stage-1 student
         matrices, directly comparable to a causal teacher's ``tril(A)`` / ``triu(A)``.
         """
-        if not hasattr(self.mamba_fwd, "materialize_mixing_matrix"):
-            raise NotImplementedError(
-                f"Matrix-orientation distillation requires a mixer exposing "
-                f"materialize_mixing_matrix. Got {type(self.mamba_fwd).__name__}. "
-                f"This needs the pure-PyTorch TorchMamba2 backend, which is only "
-                f"selected when use_simple_mamba=False AND mamba_ssm is absent "
-                f"(HAS_MAMBA_SSM={HAS_MAMBA_SSM}). On a CUDA box with mamba_ssm "
-                f"installed, build with a force-torch-mixer flag to enable alignment."
-            )
-        m_fwd = self.mamba_fwd.materialize_mixing_matrix(h_normed)
+        def _mat(mixer, x):
+            # TorchMamba2 exposes the method directly; the CUDA mamba_ssm.Mamba2 kernel
+            # does not, so we compute the same SSD matrix from its live parameters
+            # (identical layout — gradients still flow to the kernel's params).
+            if hasattr(mixer, "materialize_mixing_matrix"):
+                return mixer.materialize_mixing_matrix(x)
+            return _ssd_mixing_matrix_from_params(mixer, x)
+
+        m_fwd = _mat(self.mamba_fwd, h_normed)
         m_bwd = None
         if self.bidirectional and self.mamba_bwd is not None:
-            m_bwd_flipped = self.mamba_bwd.materialize_mixing_matrix(
-                torch.flip(h_normed, dims=[1])
-            )
+            m_bwd_flipped = _mat(self.mamba_bwd, torch.flip(h_normed, dims=[1]))
             # The backward mixer ran on the flipped sequence; flip both sequence axes
             # of its matrix back to the original position basis (-> upper-triangular).
             m_bwd = torch.flip(m_bwd_flipped, dims=[2, 3])
