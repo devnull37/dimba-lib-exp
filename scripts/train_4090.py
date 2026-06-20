@@ -205,8 +205,8 @@ def _build_or_load_model(
         teacher.unload()
 
     model = model.to(device)
-    if torch.cuda.is_available():
-        # reduce-overhead removes Python overhead per step (~15% extra speedup on Ada)
+    if device.type == "cuda":
+        model = model.to(torch.bfloat16)  # bf16 storage; no GradScaler needed
         model = torch.compile(model, mode="reduce-overhead")
     return model
 
@@ -248,6 +248,8 @@ def run_distill(
         logger.info("resumed distillation from %s", resume)
 
     model = model.to(device)
+    if device.type == "cuda":
+        model = model.to(torch.bfloat16)
     _log_vram(device, "post-model-load")
 
     trainer = DistillationTrainer(
@@ -318,8 +320,11 @@ def run_sft(
         persistent_workers=True,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
-                                  weight_decay=cfg["weight_decay"])
+    _fused = device.type == "cuda"
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
+        fused=_fused,
+    )
     total_steps = cfg["num_epochs"] * len(loader)
     warmup = cfg["warmup_steps"]
 
@@ -337,7 +342,6 @@ def run_sft(
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_step = ckpt.get("step", 0)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
     global_step = start_step
     accum = cfg["grad_accum"]
     model.train()
@@ -348,26 +352,21 @@ def run_sft(
             input_ids = batch["input_ids"].to(device)
             response_mask = batch["response_mask"].to(device)
 
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                # x_pred: decoded x0 prediction [B, L, d_model], already in embedding space
-                x_pred, _, _ = model(input_ids)
-                logits = model.output_head(x_pred)         # [B, L, vocab]
-                loss_per_token = F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    input_ids.reshape(-1),
-                    reduction="none",
-                )
-                loss = (loss_per_token * response_mask.reshape(-1)).sum() \
-                       / response_mask.sum().clamp(min=1)
-                loss = loss / accum
-
-            scaler.scale(loss).backward()
+            # Model is bf16; no autocast or GradScaler needed
+            x_pred, _, _ = model(input_ids)
+            logits = model.output_head(x_pred)             # [B, L, vocab]
+            loss_per_token = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                input_ids.reshape(-1),
+                reduction="none",
+            )
+            loss = (loss_per_token * response_mask.reshape(-1)).sum() \
+                   / response_mask.sum().clamp(min=1)
+            (loss / accum).backward()
 
             if (global_step + 1) % accum == 0:
-                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
 

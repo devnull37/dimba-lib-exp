@@ -178,10 +178,12 @@ class GRPOTrainer:
         self.ref_model.eval()
 
         # Optimizer
+        _fused = next(model.parameters()).is_cuda
         self.optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=self.cfg.lr,
             weight_decay=self.cfg.weight_decay,
+            fused=_fused,
         )
 
         self.step = 0
