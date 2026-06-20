@@ -74,45 +74,64 @@ See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap 
 ## 📐 Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     DIMBA Architecture                       │
-├─────────────────────────────────────────────────────────────┤
-│  Input Tokens                                               │
-│       ↓                                                     │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐ │
-│  │   Token     │───→│   Prompt    │───→│  Conditioning   │ │
-│  │ Embeddings  │    │  Encoder    │    │      (C)        │ │
-│  └─────────────┘    └─────────────┘    └─────────────────┘ │
-│       ↓                                      ↓              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │           Latent Projection (Optional VAE)          │   │
-│  │     z = μ + σ·ε  (reparameterization trick)         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│       ↓                                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Cosine Noise Schedule                   │   │
-│  │     ᾱ(t) = cos²((t/T + s)/(1+s)·π/2)               │   │
-│  │     x_t = √ᾱ(t)·x₀ + √(1-ᾱ(t))·ε                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│       ↓                                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │         Mamba-2 Denoiser (T iterations)             │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Mamba-2 SSM Block × N layers              │   │   │
-│  │  │  - Linear-time sequence processing         │   │   │
-│  │  │  - Selective state spaces (S6)             │   │   │
-│  │  │  - FiLM/Additive conditioning              │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│       ↓                                                     │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐ │
-│  │   Output    │───→│   Latent    │───→│  Token Logits   │ │
-│  │ Projection  │    │    Decode   │    │   (Softmax)     │ │
-│  └─────────────┘    └─────────────┘    └─────────────────┘ │
-│                                                  ↓          │
-│                                          Generated Text     │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      DIMBA Architecture                       │
+├──────────────────────────────────────────────────────────────┤
+│  Input Tokens                                                │
+│       ↓                                                      │
+│  ┌─────────────┐    ┌─────────────┐    ┌──────────────────┐ │
+│  │   Token     │───→│   Prompt    │───→│  Conditioning    │ │
+│  │ Embeddings  │    │  Encoder    │    │      (C)         │ │
+│  └─────────────┘    └─────────────┘    └──────────────────┘ │
+│       ↓                                       ↓              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │            Latent Projection (Optional VAE)          │   │
+│  │      z = μ + σ·ε  (reparameterization trick)         │   │
+│  └──────────────────────────────────────────────────────┘   │
+│       ↓                                                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │               Cosine Noise Schedule                   │   │
+│  │      ᾱ(t) = cos²((t/T + s)/(1+s)·π/2)               │   │
+│  │      x_t = √ᾱ(t)·x₀ + √(1-ᾱ(t))·ε                  │   │
+│  └──────────────────────────────────────────────────────┘   │
+│       ↓                                                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │           Mamba-2 Denoiser  (T iterations)            │   │
+│  │                                                       │   │
+│  │   ┌───────────────────────────────────────────────┐  │   │
+│  │   │           Mamba-2 Block  × N layers           │  │   │
+│  │   │                                               │  │   │
+│  │   │   x ──→ LayerNorm ──→ ┌─────────────────┐    │  │   │
+│  │   │                       │  Bidirectional  │    │  │   │
+│  │   │                       │  Mamba-2 SSM    │    │  │   │
+│  │   │                       │  ← fwd scan ←  │    │  │   │
+│  │   │                       │  → bwd scan →  │    │  │   │
+│  │   │                       └────────┬────────┘    │  │   │
+│  │   │   x ◄──────────────────────── + (residual)  │  │   │
+│  │   │   ↓                                          │  │   │
+│  │   │   x ──→ LayerNorm ──→ ┌─────────────────┐   │  │   │
+│  │   │                       │  FFN (SwiGLU /  │   │  │   │
+│  │   │                       │  MLP)  [opt]    │   │  │   │
+│  │   │                       └────────┬────────┘   │  │   │
+│  │   │   x ◄──────────────────────── + (residual)  │  │   │
+│  │   │                                               │  │   │
+│  │   │   FiLM / Additive timestep conditioning      │  │   │
+│  │   └───────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────┘   │
+│       ↓                                                      │
+│  ┌─────────────┐    ┌─────────────┐    ┌──────────────────┐ │
+│  │   Output    │───→│   Latent    │───→│  Token Logits    │ │
+│  │ Projection  │    │    Decode   │    │   (Softmax)      │ │
+│  └─────────────┘    └─────────────┘    └──────────────────┘ │
+│                                                   ↓          │
+│                                           Generated Text     │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+> **Block FFN (opt-in):** Each Mamba-2 block can include a channel-mixing FFN
+> (SwiGLU or MLP) after the SSM residual — mirroring modern Mamba LMs like
+> Jamba and Zamba. Required for cross-architecture distillation (Mode A), where
+> the FFN weights are inherited directly from the teacher's MLP layers.
 
 ### Core Components
 
@@ -122,7 +141,8 @@ See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap 
 | **Prompt Encoder** | Lightweight MLP for conditioning on prefix tokens |
 | **Noise Schedule** | Cosine schedule following Nichol & Dhariwal (2021) |
 | **Timestep Embeddings** | Sinusoidal encodings with MLP projection |
-| **Mamba-2 Denoiser** | Stack of SSM blocks with FiLM/additive conditioning |
+| **Mamba-2 Denoiser** | Bidirectional (fwd + bwd scan) SSM blocks with FiLM/additive conditioning |
+| **Block FFN (opt)** | Per-block SwiGLU/MLP channel-mixing; inherited from teacher in distillation Mode A |
 | **VAE (Optional)** | Token-level variational autoencoder for latent diffusion |
 
 ---
@@ -279,28 +299,32 @@ python scripts/train_cdlm.py \
 - [x] Mamba-2 denoiser with FiLM conditioning
 - [x] Pure PyTorch SimpleMamba2 fallback
 - [x] VAE-based latent diffusion
-- [x] DDIM sampling for faster inference
+- [x] DDIM + DPM-Solver++ sampling
 - [x] Interactive training wizard
 - [x] Multi-GPU training (PyTorch Lightning)
-- [x] Apple Silicon (MPS) support
+- [x] Apple Silicon (MPS + MLX) support
 - [x] HuggingFace datasets integration
 - [x] BPE tokenization
 - [x] EMA (Exponential Moving Average) training
 - [x] Checkpointing and resumption
-- [x] Bidirectional Mamba denoiser
+- [x] Bidirectional Mamba denoiser (fwd + bwd scan)
 - [x] Self-conditioning & classifier-free guidance
 - [x] Min-SNR-weighted + cross-entropy (rounding) training objective
 - [x] Zero-terminal-SNR cosine schedule + x0-DDIM sampler
-- [x] DPO post-training + pluggable verifiable rewards for GRPO
+- [x] DPO / IPO / SimPO post-training
+- [x] GRPO with pluggable verifiable rewards
+- [x] Block FFN (SwiGLU / MLP) per Mamba-2 block — opt-in channel mixing
+- [x] Cross-architecture distillation (`src/dimba/distillation/`) — distill any HF Transformer into DIMBA
+- [x] Block-sequential CoT inference — sequential thinking blocks, each a full diffusion pass
 
 ### 🚧 Experimental / In Progress
 
 - [ ] Discrete / masked diffusion mode (LLaDA / MDLM-style)
 - [ ] Consistency distillation for few-step sampling
-- [ ] MLX backend for Apple Silicon
 - [ ] Multi-modal extensions
 - [ ] Quantization support (INT8, INT4) / Q-LoRA polish
 - [ ] ONNX export
+- [ ] Latent-mode distillation (Mode A + `latent_diffusion=True`)
 
 ### ⚠️ Known Limitations
 
@@ -317,30 +341,43 @@ python scripts/train_cdlm.py \
 dimba-lib-exp/
 ├── src/dimba/                 # Core library
 │   ├── models/               # Model implementations
-│   │   ├── diffusion.py      # Main DIMBA model
-│   │   ├── denoiser.py       # Mamba-2 denoiser
+│   │   ├── diffusion.py      # Main DIMBA model + align_forward
+│   │   ├── denoiser.py       # Mamba-2 denoiser + block FFN
+│   │   ├── torch_mamba2.py   # Pure PyTorch Mamba-2 + mixing matrix
 │   │   ├── vae.py            # Token VAE
-│   │   ├── embeddings.py     # Embedding layers
-│   │   └── simple_mamba.py   # Pure PyTorch Mamba
+│   │   └── embeddings.py     # Embedding layers
 │   ├── diffusion/            # Diffusion utilities
 │   │   ├── schedules.py      # Noise schedules
-│   │   └── sampling.py       # Sampling algorithms
+│   │   └── sampling.py       # DDIM + DPM-Solver++ samplers
+│   ├── inference/            # Generation
+│   │   └── block_cot.py      # Block-sequential CoT sampler ⭐
+│   ├── distillation/         # Cross-arch distillation ⭐
+│   │   ├── teacher.py        # HF teacher wrapper
+│   │   ├── surgery.py        # build_student_from_teacher (Mode A)
+│   │   ├── losses.py         # Stage 1/2/3 losses
+│   │   ├── projectors.py     # Projector / LayerMap
+│   │   ├── init.py           # Principled Attention→Mamba init
+│   │   └── trainer.py        # DistillationTrainer
 │   ├── data/                 # Dataset loaders
+│   │   └── cot_dataset.py    # SmolTalk + OrcaMath + BlockCoTDataset
 │   ├── training/             # Training utilities
-│   ├── evaluation/           # Metrics (BLEU, ROUGE, etc.)
+│   │   ├── trainer.py        # Main trainer
+│   │   ├── grpo.py           # GRPO with anti-overthinking ⭐
+│   │   ├── preference.py     # DPO / IPO / SimPO
+│   │   └── rewards.py        # Pluggable verifiable rewards
+│   ├── evaluation/           # Metrics
 │   └── tokenizers/           # Tokenization
 ├── scripts/                  # Training & utility scripts
-│   ├── train_interactive.py  # Interactive wizard ⭐
+│   ├── train_4090.py         # Full pipeline: distill→SFT→GRPO ⭐
+│   ├── distill.py            # Standalone distillation script
+│   ├── monitor.py            # /loop training monitor ⭐
+│   ├── train_interactive.py  # Interactive wizard
 │   ├── train.py              # Generic training
-│   ├── train_vae.py          # VAE pre-training
 │   ├── train_cdlm.py         # Consistency training
 │   ├── generate.py           # Text generation
-│   ├── evaluate.py           # Evaluation
-│   └── setup/                # Installation scripts
-├── configs/                  # Configuration files
-├── tests/                    # Unit tests
-├── notebooks/                # Jupyter notebooks
-├── paper/                    # Research paper
+│   └── evaluate.py           # Evaluation
+├── tests/                    # Unit tests (328 passing)
+├── config.yaml               # Model + distillation config
 └── docs/                     # Documentation
 ```
 
