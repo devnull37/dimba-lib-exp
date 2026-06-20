@@ -479,11 +479,18 @@ class DistillationTrainer:
                 return_matrices=True,
                 drop_cond=True,
             )
-        except NotImplementedError:
-            logger.warning(
-                "align_forward raised NotImplementedError for return_matrices=True; "
-                "stage1 loss will be zero."
-            )
+        except (NotImplementedError, RuntimeError) as exc:
+            # RuntimeError covers the OOM-guard raised when B*L is too large to
+            # materialise mixing matrices (2.3 GB+ at B=32, L=512, 30 layers).
+            # Warn once per stage, then fall back to zero loss so training continues.
+            if not getattr(self, "_stage1_warned", False):
+                logger.warning(
+                    "stage1 matrix loss unavailable (%s: %s); "
+                    "stage1 will be a no-op. Consider shorter sequences or "
+                    "removing stage1 from DISTILL_CFG.",
+                    type(exc).__name__, exc,
+                )
+                self._stage1_warned = True
             device = input_ids.device
             return torch.tensor(0.0, device=device, requires_grad=True)
 
