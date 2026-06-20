@@ -139,9 +139,10 @@ DISTILL_CFG = dict(
         # Stage 3: MOHAWK-faithful co-adaptation pretraining.
         # FFN stays frozen; only the Mamba mixer trains.  Raw web text teaches the
         # mixer to produce activations the FFN already knows how to handle.
-        # 30 K steps × 64 batch × 512 seq ≈ 983 M tokens ≈ 1 B tokens.
-        # kd_weight=0 means no teacher forward pass needed → ~3 hrs on a 4090.
-        {"name": "stage3", "steps": 30_000, "lr": 2e-4,
+        # 60 K steps × 32 batch × 512 seq ≈ 983 M token-updates ≈ 1 B, over the
+        # PRETRAIN cache (~290 M unique tokens at n_cache=400 K → ~3.4 epochs).
+        # kd_weight=0 means no teacher forward pass needed → ~5-6 hrs on the CUDA kernel.
+        {"name": "stage3", "steps": 60_000, "lr": 2e-4,
          "freeze_ffn": True, "kd_weight": 0.0,
          "ce_loss_weight": 1.0, "min_snr_gamma": 5.0},
     ],
@@ -507,13 +508,18 @@ def _build_fineweb_stream(tokenizer, n_cache: int = 50_000) -> torch.Tensor:
     ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
                       split="train", streaming=True, trust_remote_code=True)
     eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-    ids: list = []
+    # Accumulate one small tensor per doc and cat once at the end. A flat Python int
+    # list would balloon to ~8 GB at n_cache=400 K (each CPython int is ~28 B); per-doc
+    # tensors keep peak RAM ~2x the final stream (~5 GB at ~290 M tokens).
+    chunks: list = []
+    i = -1
     for i, row in enumerate(ds):
         if i >= n_cache:
             break
-        ids.extend(tokenizer.encode(row["text"], add_special_tokens=False))
-        ids.append(eos)
-    stream = torch.tensor(ids, dtype=torch.long)
+        enc = tokenizer.encode(row["text"], add_special_tokens=False)
+        enc.append(eos)
+        chunks.append(torch.tensor(enc, dtype=torch.long))
+    stream = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.long)
     logger.info("pretrain cache ready: %d docs → %.1f M packed tokens",
                 min(n_cache, i + 1), stream.numel() / 1e6)
     return stream
@@ -678,7 +684,8 @@ def run_distill(
     _log_vram(device, "post-model-load")
 
     tokenizer = _load_tokenizer(TEACHER_MODEL)
-    stream = _build_fineweb_stream(tokenizer, n_cache=50_000)
+    # ~400 K docs ≈ 290 M unique tokens → ~3.4 epochs over the 60 K-step (~1 B) Stage 3.
+    stream = _build_fineweb_stream(tokenizer, n_cache=400_000)
     align_loader = _make_fineweb_loader(stream, ALIGN_SEQ_LEN, ALIGN_BATCH, num_workers=2)
 
     # ── Stages 1 + 2: alignment (Stage-1 matrices from the live mixer params) ───
