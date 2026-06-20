@@ -132,7 +132,12 @@ class TorchMamba2(nn.Module):
         the materialized matrix is *exactly* the operator the scan applies.
         """
         B, L, _ = u.shape
-        u = u.float()  # run the mixer in fp32 (MPS fp16 is flaky; A_log exp needs precision)
+        # Run the parameterized projections (in_proj, conv1d) in the module's weight
+        # dtype, so a bf16-cast model does not hit a bf16-weight × fp32-input mismatch.
+        # The precision-sensitive state-space math below is upcast to fp32 (MPS fp16 is
+        # flaky and A_log.exp needs the range).
+        w_dtype = self.in_proj.weight.dtype
+        u = u.to(w_dtype)
 
         zxbcdt = self.in_proj(u)
         z, xBC, dt = torch.split(
@@ -149,12 +154,14 @@ class TorchMamba2(nn.Module):
             dim=-1,
         )
 
-        dt = F.softplus(dt + self.dt_bias)        # [B, L, nheads]
-        A = -torch.exp(self.A_log.float())        # [nheads], scalar per head (negative)
+        # Upcast everything that enters the SSM recurrence / mixing matrix to fp32.
+        z = z.float()
+        dt = F.softplus(dt.float() + self.dt_bias.float())     # [B, L, nheads]
+        A = -torch.exp(self.A_log.float())                     # [nheads], scalar per head (negative)
 
-        x = x.view(B, L, self.nheads, self.headdim)            # [B, L, h, p]
-        Bm = Bm.view(B, L, self.ngroups, self.d_state)         # [B, L, g, n]
-        Cm = Cm.view(B, L, self.ngroups, self.d_state)
+        x = x.float().view(B, L, self.nheads, self.headdim)    # [B, L, h, p]
+        Bm = Bm.float().view(B, L, self.ngroups, self.d_state) # [B, L, g, n]
+        Cm = Cm.float().view(B, L, self.ngroups, self.d_state)
         rep = self.nheads // self.ngroups
         Bm = Bm.repeat_interleave(rep, dim=2)                  # [B, L, h, n]
         Cm = Cm.repeat_interleave(rep, dim=2)
@@ -166,11 +173,14 @@ class TorchMamba2(nn.Module):
         z, x, dt, A, Bm, Cm = self._project_inputs(u)
 
         scan = self._scan_chunked if self.use_chunked else self._scan_sequential
-        y = scan(x, dt, A, Bm, Cm)                             # [B, L, h, p]
+        y = scan(x, dt, A, Bm, Cm)                             # [B, L, h, p] fp32
 
-        y = y + self.D.view(1, 1, self.nheads, 1) * x          # D skip (per-head scalar)
+        y = y + self.D.float().view(1, 1, self.nheads, 1) * x  # D skip (per-head scalar)
         y = y.reshape(B, L, self.d_inner)
-        y = self.norm(y, z)                                    # gated RMSNorm (gate then norm)
+        # Cast back to the param dtype for the gated norm + output projection (their
+        # weights follow the module dtype, e.g. bf16 after model.to(bfloat16)).
+        w_dtype = self.out_proj.weight.dtype
+        y = self.norm(y.to(w_dtype), z.to(w_dtype))            # gated RMSNorm (gate then norm)
         out = self.out_proj(y)
         return out.to(orig_dtype)
 

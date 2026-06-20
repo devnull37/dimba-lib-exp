@@ -99,6 +99,7 @@ class DIMBA(nn.Module):
         ffn_hidden: Optional[int] = None,
         use_flow_matching: bool = False,
         flow_logit_normal: bool = True,
+        force_torch_mixer: bool = False,
     ):
         super().__init__()
 
@@ -236,6 +237,7 @@ class DIMBA(nn.Module):
             dropout=dropout,
             bidirectional=bidirectional,
             use_simple_mamba=use_simple_mamba,
+            force_torch_mixer=force_torch_mixer,
             use_gradient_checkpointing=use_gradient_checkpointing,
             bidir_merge=bidir_merge,
             block_ffn=block_ffn,

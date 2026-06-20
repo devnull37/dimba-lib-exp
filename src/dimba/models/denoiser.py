@@ -71,17 +71,32 @@ def _make_mixer(
     expand: int,
     use_simple_mamba: bool,
     headdim: int = 64,
+    force_torch_mixer: bool = False,
 ) -> nn.Module:
     """Construct a single (causal) SSM mixer using the best available backend.
 
     The returned module maps ``[B, L, d_model] -> [B, L, d_model]`` and contains
     no normalization or residual connection (the enclosing block owns those).
+
+    Args:
+        force_torch_mixer: Select the pure-PyTorch :class:`TorchMamba2` even when
+            the CUDA ``mamba_ssm`` kernels are installed. TorchMamba2 is the only
+            backend that exposes ``materialize_mixing_matrix`` (needed for MOHAWK
+            Stage-1 distillation) and is state_dict-compatible with
+            ``mamba_ssm.Mamba2`` (identical 8-key param tree at the default config),
+            so weights can be transferred to the CUDA kernel afterwards.
     """
     global _FALLBACK_WARNED
     if use_simple_mamba:
         from .simple_mamba import SimpleMamba2
 
         return SimpleMamba2(d_model=d_model, d_state=d_state, d_expand=expand)
+
+    if force_torch_mixer:
+        # Matrix-capable backend, regardless of whether mamba_ssm is installed.
+        from .torch_mamba2 import TorchMamba2
+
+        return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
 
     if not HAS_MAMBA_SSM:
         # No CUDA mamba_ssm: use the pure-PyTorch SSD mixer that is weight-compatible
@@ -171,6 +186,7 @@ class Mamba2Block(nn.Module):
         headdim: int = 64,
         bidirectional: bool = True,
         use_simple_mamba: bool = False,
+        force_torch_mixer: bool = False,
         bidir_merge: str = "sum",
         block_ffn: bool = False,
         ffn_mult: int = 4,
@@ -196,9 +212,15 @@ class Mamba2Block(nn.Module):
         # guarantee is preserved (gate=0 at init -> branch is 0 -> dropout(0)=0).
         self.dropout: nn.Module = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
-        self.mamba_fwd = _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba, headdim=headdim)
+        self.mamba_fwd = _make_mixer(
+            d_model, d_state, d_conv, expand, use_simple_mamba,
+            headdim=headdim, force_torch_mixer=force_torch_mixer,
+        )
         self.mamba_bwd = (
-            _make_mixer(d_model, d_state, d_conv, expand, use_simple_mamba, headdim=headdim)
+            _make_mixer(
+                d_model, d_state, d_conv, expand, use_simple_mamba,
+                headdim=headdim, force_torch_mixer=force_torch_mixer,
+            )
             if bidirectional
             else None
         )
@@ -335,6 +357,7 @@ class Mamba2Denoiser(nn.Module):
         dropout: float = 0.1,
         bidirectional: bool = True,
         use_simple_mamba: bool = False,
+        force_torch_mixer: bool = False,
         use_gradient_checkpointing: bool = False,
         bidir_merge: str = "sum",
         block_ffn: bool = False,
@@ -359,6 +382,7 @@ class Mamba2Denoiser(nn.Module):
                     headdim=headdim,
                     bidirectional=bidirectional,
                     use_simple_mamba=use_simple_mamba,
+                    force_torch_mixer=force_torch_mixer,
                     bidir_merge=bidir_merge,
                     block_ffn=block_ffn,
                     ffn_mult=ffn_mult,

@@ -146,6 +146,14 @@ PRETRAIN_SUBSET  = "sample-10BT"
 PRETRAIN_SEQ_LEN = 512
 PRETRAIN_BATCH   = 32   # smaller than SFT — teacher still loaded in VRAM for Stage 1/2
 
+# Stage 1+2 alignment use SHORT sequences. Stage-1 materializes the mixing matrix
+# [B, nheads, L, L] for every layer, which is O(B*nheads*L^2*num_layers): at L=512
+# that is ~2.3 G fp32 elements and trips the denoiser OOM guard. L=256, B=4 keeps it
+# ~0.1-1 GB and is plenty of context for attention→Mamba matrix alignment. Stage 3
+# (no matrices) uses the full PRETRAIN_* size for the heavy co-adaptation run.
+ALIGN_SEQ_LEN = 256
+ALIGN_BATCH   = 4
+
 # SFT stage 1 — full data mix
 SFT_CFG = dict(
     batch_size=64,          # 48 GB → 64 (was 32 on 24 GB)
@@ -451,42 +459,65 @@ def _sft_loop(
 
 # ── phase 1: distillation ─────────────────────────────────────────────────────
 
-def _build_pretrain_loader(tokenizer, seq_len: int, batch_size: int) -> DataLoader:
-    """Streaming FineWeb dataloader for distillation Stage 3 co-adaptation.
+class _FineWebTokenized(Dataset):
+    """Tokenize cached FineWeb text rows to a fixed seq_len on the fly.
 
-    Uses streaming so the 10 BT dataset is never materialised to disk.
-    The loader cycles indefinitely — the trainer stops at the configured step count.
+    Defined at module scope (not inside a closure) so it pickles cleanly under the
+    DataLoader 'spawn' start method as well as 'fork'.  The same row cache is shared
+    by the short-seq alignment loader and the full-length Stage-3 loader.
+    """
+
+    def __init__(self, rows: list, tokenizer, seq_len: int) -> None:
+        self._rows = rows
+        self._tok = tokenizer
+        self._seq_len = seq_len
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        enc = self._tok.encode(self._rows[idx % len(self._rows)],
+                               add_special_tokens=False)
+        pad_id = self._tok.pad_token_id if self._tok.pad_token_id is not None else 0
+        if len(enc) >= self._seq_len:
+            ids = enc[: self._seq_len]
+        else:
+            ids = enc + [pad_id] * (self._seq_len - len(enc))
+        return torch.tensor(ids, dtype=torch.long)
+
+
+def _build_fineweb_rows(n_cache: int = 50_000) -> list:
+    """Stream FineWeb 'sample-10BT' and cache the first *n_cache* raw text rows.
+
+    Streaming means the 10 BT dataset is never materialised to disk; only the text
+    of the first n_cache docs is kept in memory, shared across all distill loaders.
     """
     from datasets import load_dataset
 
-    class _FineWebDataset(Dataset):
-        def __init__(self, n_cache: int = 50_000):
-            ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
-                              split="train", streaming=True, trust_remote_code=True)
-            self._rows: list = []
-            for i, row in enumerate(ds):
-                if i >= n_cache:
-                    break
-                self._rows.append(row["text"])
+    logger.info("building FineWeb pretrain cache (%d docs) …", n_cache)
+    ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
+                      split="train", streaming=True, trust_remote_code=True)
+    rows: list = []
+    for i, row in enumerate(ds):
+        if i >= n_cache:
+            break
+        rows.append(row["text"])
+    logger.info("pretrain cache ready: %d docs", len(rows))
+    return rows
 
-        def __len__(self) -> int:
-            return len(self._rows)
 
-        def __getitem__(self, idx: int) -> torch.Tensor:
-            enc = tokenizer.encode(self._rows[idx % len(self._rows)],
-                                   add_special_tokens=False)
-            # Pad or truncate to fixed seq_len
-            if len(enc) >= seq_len:
-                ids = enc[:seq_len]
-            else:
-                ids = enc + [tokenizer.pad_token_id or 0] * (seq_len - len(enc))
-            return torch.tensor(ids, dtype=torch.long)
+def _make_fineweb_loader(rows: list, tokenizer, seq_len: int,
+                         batch_size: int, num_workers: int = 4) -> DataLoader:
+    """DataLoader over the cached FineWeb rows at a given seq_len / batch_size.
 
-    logger.info("building FineWeb pretrain cache (50 K docs) …")
-    ds = _FineWebDataset(n_cache=50_000)
-    logger.info("pretrain cache ready: %d docs", len(ds))
+    Reusing one row cache for both the alignment loader (Stage 1+2, short seq) and
+    the co-adaptation loader (Stage 3, full seq) means FineWeb downloads only once.
+    The loader cycles; the trainer stops at the configured step count.
+    """
+    ds = _FineWebTokenized(rows, tokenizer, seq_len)
     return DataLoader(ds, batch_size=batch_size, shuffle=True,
-                      num_workers=4, pin_memory=True, persistent_workers=True)
+                      num_workers=num_workers, pin_memory=True,
+                      persistent_workers=(num_workers > 0))
 
 
 def run_distill(
@@ -498,15 +529,23 @@ def run_distill(
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
     logger.info("=== PHASE 1: DISTILLATION (MOHAWK-style) ===")
-    logger.info("Stage 1+2: matrix/hidden alignment (~1K steps, teacher active)")
-    logger.info("Stage 3:   co-adaptation pretraining (~1B tokens, FFN frozen, no teacher)")
+    logger.info("Stage 1+2: matrix/hidden alignment on TorchMamba2 (short seq, teacher active)")
+    logger.info("Stage 3:   co-adaptation pretraining on CUDA kernel (~1B tokens, FFN frozen)")
 
     cfg = DistillationConfig.from_dict({**DISTILL_CFG, "device": str(device)})
+    stages_by_name = {s["name"]: s for s in DISTILL_CFG["stages"]}
 
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     teacher = TeacherWrapper(TEACHER_MODEL, device=str(device), dtype=compute_dtype)
-    model, _layer_map = build_student_from_teacher(
+
+    # ── Build the student on the matrix-capable TorchMamba2 backend ─────────────
+    # force_torch_mixer=True selects TorchMamba2 even though mamba_ssm (CUDA) is
+    # installed: it is the only backend exposing materialize_mixing_matrix (needed
+    # for the Stage-1 matrix alignment) and is state_dict-compatible with the CUDA
+    # Mamba2 kernel, so the trained weights transfer to CUDA for the heavy Stage 3.
+    torch_model, _layer_map = build_student_from_teacher(
         teacher,
+        force_torch_mixer=True,
         num_diffusion_steps=1000,
         d_state=64,
         d_conv=4,
@@ -524,30 +563,75 @@ def run_distill(
 
     if resume and os.path.isfile(resume):
         ckpt = torch.load(resume, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        torch_model.load_state_dict(ckpt["model_state_dict"], strict=False)
         logger.info("resumed distillation from %s", resume)
 
-    model = model.to(device)
+    torch_model = torch_model.to(device)
     if device.type == "cuda":
-        model = model.to(torch.bfloat16)
-    _log_vram(device, "post-model-load")
+        torch_model = torch_model.to(torch.bfloat16)
+    _log_vram(device, "post-torch-model-load")
 
     tokenizer = _load_tokenizer(TEACHER_MODEL)
-    pretrain_loader = _build_pretrain_loader(
-        tokenizer, seq_len=PRETRAIN_SEQ_LEN, batch_size=PRETRAIN_BATCH,
-    )
+    rows = _build_fineweb_rows(n_cache=50_000)
+    align_loader = _make_fineweb_loader(rows, tokenizer, ALIGN_SEQ_LEN, ALIGN_BATCH, num_workers=2)
+    pretrain_loader = _make_fineweb_loader(rows, tokenizer, PRETRAIN_SEQ_LEN, PRETRAIN_BATCH, num_workers=4)
 
-    # Single trainer runs all 3 stages in order.
-    # Stage 3 has kd_weight=0.0 in DISTILL_CFG, so teacher.forward() is never
-    # called during co-adaptation (see DistillationTrainer._stage3_step).
-    # SmolLM-135M in bf16 is ~270 MB — keeping it in VRAM through Stage 3 is fine.
-    trainer = DistillationTrainer(model=model, teacher=teacher, config=cfg)
-    trainer.run(pretrain_loader)
+    # ── Stages 1 + 2: alignment on TorchMamba2 (matrices materializable) ────────
+    align_trainer = DistillationTrainer(model=torch_model, teacher=teacher, config=cfg)
+    for sname in ("stage1", "stage2"):
+        if sname in stages_by_name:
+            logger.info("alignment %s on short-seq loader (L=%d, B=%d)",
+                        sname, ALIGN_SEQ_LEN, ALIGN_BATCH)
+            align_trainer.run_stage(stages_by_name[sname], align_loader)
+    if getattr(align_trainer, "_stage1_warned", False):
+        logger.warning("Stage 1 matrix alignment fell back to a NO-OP — matrices could "
+                       "not be materialized (see warning above).")
+    else:
+        logger.info("Stage 1+2 alignment complete (matrices materialized).")
+    del align_loader  # release its worker processes
+
+    # ── Transfer TorchMamba2 weights → CUDA Mamba2 for the fast Stage 3 ──────────
+    # TorchMamba2 and mamba_ssm.Mamba2 share an identical 8-key param tree at the
+    # default config, so a strict load is the load-bearing compatibility probe:
+    # on success Stage 3 runs on the fast kernel; on ANY mismatch we keep the torch
+    # model (slower but correct) and mark the checkpoint so SFT/GRPO rebuild on it.
+    stage3_model = torch_model
+    fell_back_to_torch = False
+    if device.type == "cuda":
+        try:
+            cuda_model = DIMBA(**torch_model.config)  # no force_torch_mixer → CUDA kernel
+            cuda_model = cuda_model.to(device).to(torch.bfloat16)
+            cuda_model.load_state_dict(torch_model.state_dict(), strict=True)
+            stage3_model = cuda_model
+            del torch_model
+            torch.cuda.empty_cache()
+            logger.info("backend transfer OK: TorchMamba2 → CUDA Mamba2 (strict load passed); "
+                        "Stage 3 runs on the fast kernel.")
+        except Exception as exc:  # noqa: BLE001 — any mismatch must degrade, not crash
+            fell_back_to_torch = True
+            stage3_model = torch_model
+            logger.warning("backend transfer FAILED (%s: %s). Keeping TorchMamba2 for Stage 3 "
+                           "(slower, correct). Checkpoint will set force_torch_mixer=True so "
+                           "SFT/GRPO rebuild on the same backend.", type(exc).__name__, exc)
+    _log_vram(device, "post-transfer")
+
+    # ── Stage 3: co-adaptation pretraining (FFN frozen, teacher unused) ─────────
+    # kd_weight=0.0 in DISTILL_CFG means teacher.forward() is never called here.
+    stage3_trainer = DistillationTrainer(model=stage3_model, teacher=teacher, config=cfg)
+    if "stage3" in stages_by_name:
+        stage3_trainer.run_stage(stages_by_name["stage3"], pretrain_loader)
+
+    # ── Save — config records the backend the checkpoint must be rebuilt on ─────
+    save_config = dict(stage3_model.config)
+    if fell_back_to_torch:
+        # CUDA strict-load failed on this box → weights only load on TorchMamba2.
+        # Persist the flag so _build_or_load_model rebuilds SFT/GRPO on the same backend.
+        save_config["force_torch_mixer"] = True
 
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({
-        "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
-        "config": model.config,
+        "model_state_dict": getattr(stage3_model, "_orig_mod", stage3_model).state_dict(),
+        "config": save_config,
         "phase": "distill",
     }, final_path)
     logger.info("distillation done → %s", final_path)
