@@ -124,17 +124,27 @@ DISTILL_CFG = dict(
     kd_temp=2.0,
     device="cuda",
     stages=[
-        # Stage 1: align Mamba mixing matrices → teacher attention maps (clean pass)
+        # Stage 1: align Mamba mixing matrices → teacher attention maps (clean text)
         {"name": "stage1", "steps": 500,  "lr": 1e-3},
-        # Stage 2: align student hidden states → teacher residual stream (clean pass)
+        # Stage 2: align hidden states → teacher residual stream (clean text)
         {"name": "stage2", "steps": 500,  "lr": 5e-4},
-        # Stage 3: diffusion objective (flow matching) + optional logit-KD.
-        # More steps than DDPM: flow matching velocity targets are a different scale
-        # than DDPM MSE so the loss needs a short warmup before it drops.
-        {"name": "stage3", "steps": 3000, "lr": 2e-4,
+        # Stage 3: MOHAWK-faithful co-adaptation pretraining.
+        # FFN stays frozen; only the Mamba mixer trains.  Raw web text teaches the
+        # mixer to produce activations the FFN already knows how to handle.
+        # 30 K steps × 64 batch × 512 seq ≈ 983 M tokens ≈ 1 B tokens.
+        # kd_weight=0 means no teacher forward pass needed → ~3 hrs on a 4090.
+        {"name": "stage3", "steps": 30_000, "lr": 2e-4,
+         "freeze_ffn": True, "kd_weight": 0.0,
          "ce_loss_weight": 1.0, "min_snr_gamma": 5.0},
     ],
 )
+
+# Pretraining dataset for distillation Stage 3 — raw web text, no labels.
+# FineWeb "sample-10BT" is 10B tokens of high-quality filtered CommonCrawl.
+PRETRAIN_DATASET = "HuggingFaceFW/fineweb"
+PRETRAIN_SUBSET  = "sample-10BT"
+PRETRAIN_SEQ_LEN = 512
+PRETRAIN_BATCH   = 32   # smaller than SFT — teacher still loaded in VRAM for Stage 1/2
 
 # SFT stage 1 — full data mix
 SFT_CFG = dict(
@@ -417,6 +427,44 @@ def _sft_loop(
 
 # ── phase 1: distillation ─────────────────────────────────────────────────────
 
+def _build_pretrain_loader(tokenizer, seq_len: int, batch_size: int) -> DataLoader:
+    """Streaming FineWeb dataloader for distillation Stage 3 co-adaptation.
+
+    Uses streaming so the 10 BT dataset is never materialised to disk.
+    The loader cycles indefinitely — the trainer stops at the configured step count.
+    """
+    from datasets import load_dataset
+
+    class _FineWebDataset(Dataset):
+        def __init__(self, n_cache: int = 50_000):
+            ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
+                              split="train", streaming=True, trust_remote_code=True)
+            self._rows: list = []
+            for i, row in enumerate(ds):
+                if i >= n_cache:
+                    break
+                self._rows.append(row["text"])
+
+        def __len__(self) -> int:
+            return len(self._rows)
+
+        def __getitem__(self, idx: int) -> torch.Tensor:
+            enc = tokenizer.encode(self._rows[idx % len(self._rows)],
+                                   add_special_tokens=False)
+            # Pad or truncate to fixed seq_len
+            if len(enc) >= seq_len:
+                ids = enc[:seq_len]
+            else:
+                ids = enc + [tokenizer.pad_token_id or 0] * (seq_len - len(enc))
+            return torch.tensor(ids, dtype=torch.long)
+
+    logger.info("building FineWeb pretrain cache (50 K docs) …")
+    ds = _FineWebDataset(n_cache=50_000)
+    logger.info("pretrain cache ready: %d docs", len(ds))
+    return DataLoader(ds, batch_size=batch_size, shuffle=True,
+                      num_workers=4, pin_memory=True, persistent_workers=True)
+
+
 def run_distill(
     device: torch.device,
     save_dir: str = "./checkpoints/distill",
@@ -425,10 +473,11 @@ def run_distill(
     hf_repo: Optional[str] = None,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
-    logger.info("=== PHASE 1: DISTILLATION ===")
+    logger.info("=== PHASE 1: DISTILLATION (MOHAWK-style) ===")
+    logger.info("Stage 1+2: matrix/hidden alignment (~1K steps, teacher active)")
+    logger.info("Stage 3:   co-adaptation pretraining (~1B tokens, FFN frozen, no teacher)")
 
-    cfg = DistillationConfig(**DISTILL_CFG)
-    cfg.device = str(device)
+    cfg = DistillationConfig.from_dict({**DISTILL_CFG, "device": str(device)})
 
     teacher = TeacherWrapper(TEACHER_MODEL, device=str(device))
     model = build_student_from_teacher(
@@ -450,13 +499,17 @@ def run_distill(
         model = model.to(torch.bfloat16)
     _log_vram(device, "post-model-load")
 
-    trainer = DistillationTrainer(
-        student=model,
-        teacher=teacher,
-        config=cfg,
-        state_file="./training_state.json",
+    tokenizer = _load_tokenizer(TEACHER_MODEL)
+    pretrain_loader = _build_pretrain_loader(
+        tokenizer, seq_len=PRETRAIN_SEQ_LEN, batch_size=PRETRAIN_BATCH,
     )
-    trainer.run()
+
+    # Single trainer runs all 3 stages in order.
+    # Stage 3 has kd_weight=0.0 in DISTILL_CFG, so teacher.forward() is never
+    # called during co-adaptation (see DistillationTrainer._stage3_step).
+    # SmolLM-135M in bf16 is ~270 MB — keeping it in VRAM through Stage 3 is fine.
+    trainer = DistillationTrainer(student=model, teacher=teacher, config=cfg)
+    trainer.run(pretrain_loader)
 
     final_path = os.path.join(save_dir, "final.pt")
     torch.save({

@@ -320,6 +320,27 @@ class TeacherWrapper(nn.Module):
         return self._ffn_hidden
 
     # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def unload(self) -> None:
+        """Move teacher weights to CPU and free GPU memory.
+
+        The wrapper object remains alive so metadata properties
+        (num_layers, d_model, num_heads, …) continue to work — they
+        read from self._hf_model.config which is a Python object.
+        """
+        if next(self._hf_model.parameters(), None) is not None:
+            self._hf_model.to("cpu")
+        import gc
+        gc.collect()
+        try:
+            import torch as _torch
+            _torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
