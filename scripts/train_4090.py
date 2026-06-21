@@ -794,10 +794,12 @@ def run_sft(
                     "grad_accum→%d (effective batch unchanged).",
                     SFT_CFG["batch_size"], sft_cfg["batch_size"], sft_cfg["grad_accum"])
 
-    # Compile after all structural mutations — but not on the torch path (the python
-    # SSD scan compiles poorly and can clash with checkpointing).
-    if device.type == "cuda" and not on_torch:
-        model = torch.compile(model, mode="reduce-overhead")
+    # NOTE: torch.compile is intentionally NOT used here. mode="reduce-overhead" wraps
+    # the model in CUDA Graphs, whose reused buffers alias across the SFT loop's
+    # multi-call structure (forward → separate output_head → backward, with grad
+    # accumulation), producing "accessing tensor output of CUDAGraphs that has been
+    # overwritten by a subsequent run" on the first backward. The model already runs on
+    # the fast mamba_ssm kernel, so eager mode is plenty and rock-solid.
 
     from torch.utils.data import ConcatDataset
 
@@ -1004,10 +1006,11 @@ def run_grpo(
     if on_torch:
         logger.info("TorchMamba2 backend: gradient checkpointing ON for GRPO.")
 
-    # Compile after all structural mutations — but not on the torch path (the python
-    # SSD scan compiles poorly and can clash with checkpointing).
-    if device.type == "cuda" and not on_torch:
-        model = torch.compile(model, mode="reduce-overhead")
+    # NOTE: torch.compile is intentionally NOT used here. reduce-overhead's CUDA Graphs
+    # alias buffers across GRPO's many model calls (generation under no_grad, ELBO
+    # log-prob forwards, backward), causing the same CUDAGraphs-overwrite crash SFT hit;
+    # and GRPO's variable generation lengths would thrash recompilation anyway. The
+    # mamba_ssm kernel is already fast, so eager mode is the reliable choice.
 
     passes = _load_grpo_data(data)
 
