@@ -170,8 +170,12 @@ ALIGN_BATCH   = 4
 
 # SFT stage 1 — full data mix
 SFT_CFG = dict(
-    batch_size=64,          # 48 GB → 64 (was 32 on 24 GB)
-    grad_accum=2,           # effective batch = 128
+    batch_size=32,          # 32 (was 64): batch 64 ran right at the 49 GB ceiling and OOM'd
+                            # at the epoch-1→2 boundary. The vocab-49k output logits at
+                            # B×512 dominate memory for this otherwise-tiny model, so halving
+                            # the micro-batch buys real headroom. expandable_segments helps
+                            # fragmentation but doesn't shrink the footprint — this does.
+    grad_accum=4,           # effective batch = 128 (unchanged: 32×4 == old 64×2)
     lr=2e-5,
     warmup_steps=100,
     num_epochs=2,
@@ -293,6 +297,14 @@ def _build_or_load_model(
         true_vocab = sd[emb_key].shape[0]
         cfg = {**cfg, "vocab_size": true_vocab}
         model = DIMBA(**cfg)
+        # SFT/GRPO checkpoints saved after the <think> resize carry a redundant tied-weight
+        # key (output_head.embedding_weight == token_embed weight). A freshly-built model
+        # registers that as a NON-persistent buffer (absent from its state_dict), so a strict
+        # load rejects it as an "unexpected key" — which is why SFT intermediates weren't
+        # directly resumable. Drop it before loading: weight tying is re-established at build
+        # (and again after the <think> resize downstream), so the tensor is recreated, not
+        # lost. This makes every SFT/GRPO intermediate checkpoint resumable without surgery.
+        sd.pop("output_head.embedding_weight", None)
         model.load_state_dict(sd, strict=True)
     else:
         logger.info("building fresh student model (Mode A: inherit teacher weights)")
