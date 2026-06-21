@@ -18,6 +18,13 @@ Supported feature matrix (v1 = dimbapeare1-30m baseline; v2 = full new config):
   * noise_dist:        "gaussian" (both; student_t not supported)
   * bidirectional:     True (both)
   * use_weight_tying:  True (both)
+  * latent_diffusion:  False (embedding-space, current base) and True (projector)
+  * use_flow_matching: False (DDIM/DPM cosine schedule) and True (Euler/Heun ODE)
+  * block_ffn:         False and True (per-block SwiGLU/MLP FFN, 6-param adaln only)
+
+Two samplers are wired: a deterministic DDIM path (cosine schedule) and a
+flow-matching Euler/Heun ODE path. ``sample`` auto-selects flow when the model
+config has ``use_flow_matching=True``.
 """
 
 from __future__ import annotations
@@ -107,7 +114,15 @@ class MLXDIMBA:
         self.use_weight_tying = bool(config.get("use_weight_tying", False))
         # cond_projector: maps d_prompt -> d_latent when they differ
         self.d_prompt = config.get("d_prompt", config["d_model"])
-        self.has_cond_projector = (self.d_prompt != self.d_latent and config.get("latent_diffusion", False))
+        self.latent_diffusion = bool(config.get("latent_diffusion", False))
+        self.has_cond_projector = (self.d_prompt != self.d_latent and self.latent_diffusion)
+        # Conditioning dimension fed to the denoiser (mirrors DIMBA.cond_dim):
+        #   latent space -> d_latent ;  embedding space -> d_prompt.
+        self.cond_dim = self.d_latent if self.latent_diffusion else self.d_prompt
+        # Flow matching + per-block FFN (block_ffn).
+        self.use_flow_matching = bool(config.get("use_flow_matching", False))
+        self.block_ffn = bool(config.get("block_ffn", False))
+        self.ffn_type = config.get("ffn_type", "mlp")
 
         # 12 forward + 12 backward SSD mixers (mixer d_model == d_latent).
         # headdim must divide d_inner = d_latent * expand.  Default 64; shrink if needed.
@@ -142,6 +157,15 @@ class MLXDIMBA:
             _unsupported.append(f"conditioning_type={cfg.get('conditioning_type')}")
         if cfg.get("head_type", "linear") not in ("linear", "attn"):
             _unsupported.append(f"head_type={cfg.get('head_type')}")
+        # block_ffn is only supported on the adaln (6-param) path: the FFN modulation
+        # comes from the second (scale2, shift2, gate2) triplet of AdaLNZeroConditioning.
+        if cfg.get("block_ffn", False) and cfg.get("conditioning_type", "film") != "adaln":
+            _unsupported.append(
+                f"block_ffn=True with conditioning_type={cfg.get('conditioning_type')} "
+                "(only adaln is wired)"
+            )
+        if cfg.get("ffn_type", "mlp") not in ("mlp", "swiglu"):
+            _unsupported.append(f"ffn_type={cfg.get('ffn_type')}")
         if _unsupported:
             raise NotImplementedError(
                 f"MLXDIMBA does not support: {_unsupported}. "
@@ -165,16 +189,19 @@ class MLXDIMBA:
         p["sqrt_acp"] = _to_mx(g("noise_schedule.sqrt_alphas_cumprod"))  # [T]
         p["sqrt_om"] = _to_mx(g("noise_schedule.sqrt_one_minus_alphas_cumprod"))  # [T]
 
-        # latent projector decoder (decode_latent) + encoder (encode, for prompts)
-        p["dec0_w"], p["dec0_b"] = _to_mx(g("latent_projector.decoder.0.weight")), _to_mx(g("latent_projector.decoder.0.bias"))
-        p["dec3_w"], p["dec3_b"] = _to_mx(g("latent_projector.decoder.3.weight")), _to_mx(g("latent_projector.decoder.3.bias"))
-        p["enc0_w"], p["enc0_b"] = _to_mx(g("latent_projector.encoder.0.weight")), _to_mx(g("latent_projector.encoder.0.bias"))
-        p["enc3_w"], p["enc3_b"] = _to_mx(g("latent_projector.encoder.3.weight")), _to_mx(g("latent_projector.encoder.3.bias"))
+        # latent projector decoder (decode_latent) + encoder (encode, for prompts).
+        # Only present when latent_diffusion=True; otherwise encode/decode are the
+        # identity (modulo the latent_scale) and these keys do not exist.
+        if self.latent_diffusion:
+            p["dec0_w"], p["dec0_b"] = _to_mx(g("latent_projector.decoder.0.weight")), _to_mx(g("latent_projector.decoder.0.bias"))
+            p["dec3_w"], p["dec3_b"] = _to_mx(g("latent_projector.decoder.3.weight")), _to_mx(g("latent_projector.decoder.3.bias"))
+            p["enc0_w"], p["enc0_b"] = _to_mx(g("latent_projector.encoder.0.weight")), _to_mx(g("latent_projector.encoder.0.bias"))
+            p["enc3_w"], p["enc3_b"] = _to_mx(g("latent_projector.encoder.3.weight")), _to_mx(g("latent_projector.encoder.3.bias"))
 
-        # latent_norm (v2): LayerNorm on the encoder output before *latent_scale
-        if self.latent_norm:
-            p["latent_norm_w"] = _to_mx(g("latent_projector.latent_norm.weight"))
-            p["latent_norm_b"] = _to_mx(g("latent_projector.latent_norm.bias"))
+            # latent_norm (v2): LayerNorm on the encoder output before *latent_scale
+            if self.latent_norm:
+                p["latent_norm_w"] = _to_mx(g("latent_projector.latent_norm.weight"))
+                p["latent_norm_b"] = _to_mx(g("latent_projector.latent_norm.bias"))
 
         # prompt encoder (for conditional sampling)
         p["pe0_w"], p["pe0_b"] = _to_mx(g("prompt_encoder.mlp.0.weight")), _to_mx(g("prompt_encoder.mlp.0.bias"))
@@ -200,6 +227,15 @@ class MLXDIMBA:
 
         p["ln_w"], p["ln_b"] = [], []
 
+        # Per-block FFN sub-layer (block_ffn): norm2 + (swiglu | mlp) weights.
+        if self.block_ffn:
+            p["ln2_w"], p["ln2_b"] = [], []
+            if self.ffn_type == "swiglu":
+                p["ffn_gate_w"], p["ffn_up_w"], p["ffn_down_w"] = [], [], []
+            else:  # mlp
+                p["ffn_ff1_w"], p["ffn_ff1_b"] = [], []
+                p["ffn_ff2_w"], p["ffn_ff2_b"] = [], []
+
         for i in range(self.num_layers):
             c = f"denoiser.conditioning.{i}."
             if ctype == "film":
@@ -208,7 +244,8 @@ class MLXDIMBA:
                 p["film_b_w"].append(_to_mx(g(c + "beta_proj.weight")))
                 p["film_b_b"].append(_to_mx(g(c + "beta_proj.bias")))
             elif ctype == "adaln":
-                # AdaLNZeroConditioning: SiLU -> Linear(cond_dim, 3*d_latent)
+                # AdaLNZeroConditioning: SiLU -> Linear(cond_dim, n_params*d_latent).
+                # n_params is 3 (mixer only) or 6 (mixer + FFN, block_ffn=True).
                 # state dict key: denoiser.conditioning.{i}.modulation.1.weight/bias
                 p["adaln_w"].append(_to_mx(g(c + "modulation.1.weight")))
                 p["adaln_b"].append(_to_mx(g(c + "modulation.1.bias")))
@@ -218,6 +255,22 @@ class MLXDIMBA:
             # RMSNorm has no bias; store None so forward uses _rms_norm
             bias_key = b + "norm.bias"
             p["ln_b"].append(_to_mx(sd[bias_key]) if bias_key in sd else None)
+
+            if self.block_ffn:
+                # norm2 (RMSNorm, no bias) + FFN weights (all bias-free per _BlockFFN).
+                p["ln2_w"].append(_to_mx(g(b + "norm2.weight")))
+                n2bias = b + "norm2.bias"
+                p["ln2_b"].append(_to_mx(sd[n2bias]) if n2bias in sd else None)
+                if self.ffn_type == "swiglu":
+                    p["ffn_gate_w"].append(_to_mx(g(b + "ffn.gate_proj.weight")))
+                    p["ffn_up_w"].append(_to_mx(g(b + "ffn.up_proj.weight")))
+                    p["ffn_down_w"].append(_to_mx(g(b + "ffn.down_proj.weight")))
+                else:  # mlp: ff2(gelu(ff1(x))), both Linear with bias
+                    p["ffn_ff1_w"].append(_to_mx(g(b + "ffn.ff1.weight")))
+                    p["ffn_ff1_b"].append(_to_mx(g(b + "ffn.ff1.bias")))
+                    p["ffn_ff2_w"].append(_to_mx(g(b + "ffn.ff2.weight")))
+                    p["ffn_ff2_b"].append(_to_mx(g(b + "ffn.ff2.bias")))
+
             fwd = {k[len(b + "mamba_fwd."):]: v for k, v in sd.items() if k.startswith(b + "mamba_fwd.")}
             bwd = {k[len(b + "mamba_bwd."):]: v for k, v in sd.items() if k.startswith(b + "mamba_bwd.")}
             load_torch_mamba2_state_dict(self.mixers_fwd[i], fwd)
@@ -299,20 +352,42 @@ class MLXDIMBA:
                 y = y + _flip_seq(self.mixers_bwd[i](_flip_seq(h)))
                 x = conditioned + y
             elif ctype == "adaln":
-                # AdaLN-Zero: SiLU(combined) -> Linear -> (scale, shift, gate)
+                # AdaLN-Zero: SiLU(combined) -> Linear -> (scale, shift, gate[, scale2, shift2, gate2]).
+                # Mirrors Mamba2Block.forward_adaln: norm->modulate->mix->gated residual,
+                # then (block_ffn) norm2->modulate2->FFN->gated residual.
                 silu_cond = mlx_nn.silu(combined)
-                mod = _linear(silu_cond, p["adaln_w"][i], p["adaln_b"][i])  # [B,1,3*d_latent]
+                mod = _linear(silu_cond, p["adaln_w"][i], p["adaln_b"][i])  # [B,1,n*d_latent]
                 d = self.d_latent
                 scale = mod[..., :d]
                 shift = mod[..., d:2*d]
-                gate  = mod[..., 2*d:]
+                gate  = mod[..., 2*d:3*d]
                 h = _norm(x, p["ln_w"][i], p["ln_b"][i])
                 h = h * (1.0 + scale) + shift
                 y = self.mixers_fwd[i](h)
                 y = y + _flip_seq(self.mixers_bwd[i](_flip_seq(h)))
                 x = x + gate * y
+                if self.block_ffn:
+                    scale2 = mod[..., 3*d:4*d]
+                    shift2 = mod[..., 4*d:5*d]
+                    gate2  = mod[..., 5*d:6*d]
+                    h2 = _norm(x, p["ln2_w"][i], p["ln2_b"][i])
+                    h2 = h2 * (1.0 + scale2) + shift2
+                    x = x + gate2 * self._block_ffn(h2, i)
 
         return x
+
+    def _block_ffn(self, h, i):
+        """Per-block FFN sub-layer (mirrors _BlockFFN.forward).
+
+        swiglu: down(silu(gate(x)) * up(x))   (all bias-free Linears).
+        mlp:    ff2(gelu(ff1(x)))              (Linear with bias).
+        """
+        p = self.p
+        if self.ffn_type == "swiglu":
+            gated = mlx_nn.silu(_linear(h, p["ffn_gate_w"][i])) * _linear(h, p["ffn_up_w"][i])
+            return _linear(gated, p["ffn_down_w"][i])
+        ff = mlx_nn.gelu(_linear(h, p["ffn_ff1_w"][i], p["ffn_ff1_b"][i]))
+        return _linear(ff, p["ffn_ff2_w"][i], p["ffn_ff2_b"][i])
 
     def _raw_to_x0(self, x_t, raw, t_idx):
         """Convert raw denoiser output to x0 estimate depending on prediction_type."""
@@ -364,9 +439,11 @@ class MLXDIMBA:
         """
         p = self.p
         h = z / self.latent_scale
-        h = _linear(h, p["dec0_w"], p["dec0_b"])
-        h = mlx_nn.gelu(h)
-        h = _linear(h, p["dec3_w"], p["dec3_b"])                # [B,L,d_model]
+        # decode_latent: identity when there is no latent projector (latent_diffusion=False).
+        if self.latent_diffusion:
+            h = _linear(h, p["dec0_w"], p["dec0_b"])
+            h = mlx_nn.gelu(h)
+            h = _linear(h, p["dec3_w"], p["dec3_b"])            # [B,L,d_model]
 
         # Attention rounding head (v2, head_type=="attn")
         if self.head_type == "attn":
@@ -390,6 +467,9 @@ class MLXDIMBA:
     def _encode_latent(self, emb):
         """Encode token embeddings -> scaled latent. emb:[B,P,d_model] -> [B,P,d_latent]."""
         p = self.p
+        # encode_latent: identity (modulo scale) when there is no latent projector.
+        if not self.latent_diffusion:
+            return self.latent_scale * emb
         h = _linear(emb, p["enc0_w"], p["enc0_b"])
         h = mlx_nn.gelu(h)
         h = _linear(h, p["enc3_w"], p["enc3_b"])                # [B,P,d_latent]
@@ -423,6 +503,27 @@ class MLXDIMBA:
         return self._project_cond(pooled)                        # [B,1,cond_dim]
 
     # ------------------------------------------------------------------ sampling
+    def _setup_conditioning(self, noise: np.ndarray, prompt_ids: Optional[np.ndarray]):
+        """Build (cond, x_t, prompt_latent, prompt_len) shared by every sampler.
+
+        Mirrors the prompt-prefix + pooled/null conditioning logic of
+        ``sample_from_model`` / ``sample_from_model_flow`` (sampling.py).
+        """
+        B = noise.shape[0]
+        if prompt_ids is not None:
+            prompt_latent, prompt_emb = self._encode_prompt_latent(prompt_ids)
+            prompt_len = prompt_latent.shape[1]
+            cond = self._pooled_cond(prompt_emb)                # [B,1,cond_dim]
+            x_t = mx.concatenate([prompt_latent, mx.array(noise)], axis=1)
+        else:
+            prompt_latent, prompt_len = None, 0
+            # null_cond is d_prompt; project to cond_dim if needed (no-op when equal)
+            null = self.p["null_cond"].reshape(1, 1, -1)        # [1,1,d_prompt]
+            null = self._project_cond(null)                      # [1,1,cond_dim]
+            cond = mx.broadcast_to(null, (B, 1, self.cond_dim))
+            x_t = mx.array(noise)
+        return cond, x_t, prompt_latent, prompt_len
+
     def sample_logits(self, noise: np.ndarray, num_steps: Optional[int] = None,
                       prompt_ids: Optional[np.ndarray] = None):
         """Deterministic DDIM (eta=0) -> final response logits ``[B, seq_len, V]`` (mx.array).
@@ -435,21 +536,8 @@ class MLXDIMBA:
         ns = min(num_steps, T)
         timesteps = np.linspace(T - 1, 0, ns).round().astype(int)
         acp = self.p["acp"]
-        B = noise.shape[0]
 
-        # conditioning + (optional) clean prompt prefix
-        if prompt_ids is not None:
-            prompt_latent, prompt_emb = self._encode_prompt_latent(prompt_ids)
-            prompt_len = prompt_latent.shape[1]
-            cond = self._pooled_cond(prompt_emb)                # [B,1,cond_dim]
-            x_t = mx.concatenate([prompt_latent, mx.array(noise)], axis=1)
-        else:
-            prompt_latent, prompt_len = None, 0
-            # null_cond is d_prompt; project to cond_dim (d_latent) if needed
-            null = self.p["null_cond"].reshape(1, 1, -1)        # [1,1,d_prompt]
-            null = self._project_cond(null)                      # [1,1,cond_dim]
-            cond = mx.broadcast_to(null, (B, 1, self.d_latent))
-            x_t = mx.array(noise)
+        cond, x_t, prompt_latent, prompt_len = self._setup_conditioning(noise, prompt_ids)
 
         x_self_cond = None  # carries x0_hat across steps for self-conditioning
 
@@ -478,15 +566,94 @@ class MLXDIMBA:
         mx.eval(logits)
         return logits
 
+    def _flow_t_idx(self, t_val: float) -> int:
+        """Continuous t in (0,1] -> discrete timestep-embedding index (mirrors denoise_flow)."""
+        T = self.num_diffusion_steps
+        idx = int(round(min(max(t_val, 0.0), 1.0) * (T - 1)))
+        return max(0, min(T - 1, idx))
+
+    def sample_logits_flow(self, noise: np.ndarray, num_steps: int = 20,
+                           sampler: str = "euler",
+                           prompt_ids: Optional[np.ndarray] = None):
+        """Flow-matching ODE sampler -> final response logits ``[B, seq_len, V]`` (mx.array).
+
+        Integrates ``dx/dt = v_theta(x_t, t, cond)`` from t=1 (pure noise) to t=0
+        (clean data) with Euler or Heun steps.  Mirrors ``sample_from_model_flow``
+        (diffusion/sampling.py): the denoiser's raw output is the x0 prediction and
+        the velocity is derived as ``v = (x_t - x0) / t``.
+
+        ``noise`` is the initial response latent ``[B, seq_len, d_latent]`` (the t=1
+        state).  Pass the same array used by the torch flow sampler for a faithful
+        comparison.
+        """
+        if sampler not in ("euler", "heun"):
+            raise ValueError(f"sampler must be 'euler' or 'heun', got {sampler!r}")
+
+        cond, x_t, prompt_latent, prompt_len = self._setup_conditioning(noise, prompt_ids)
+
+        # Uniform time grid t=1 -> t=0 (num_steps+1 points), as in sample_from_model_flow.
+        ts = np.linspace(1.0, 0.0, num_steps + 1).astype(np.float64)
+
+        def _velocity(xt, t_val, x_self_cond):
+            # Flow raw output is always x0 (velocity derived outside, like denoise_flow).
+            t_idx = self._flow_t_idx(t_val)
+            x0_hat = self._denoiser(xt, cond, t_idx, x_self_cond)
+            # v = (x_t - x0) / t   (rearranged from x_t = (1-t)*x0 + t*noise)
+            v = (xt - x0_hat) / max(t_val, 1e-5)
+            return v, x0_hat
+
+        x_self_cond = None
+        for i in range(num_steps):
+            t_cur = float(ts[i])
+            t_nxt = float(ts[i + 1])
+            dt = t_nxt - t_cur                                   # negative (backward)
+
+            v_cur, x0_hat = _velocity(x_t, t_cur, x_self_cond)
+            if self.self_conditioning:
+                x_self_cond = x0_hat
+
+            if sampler == "heun" and i < num_steps - 1:
+                # Predictor.
+                x_mid = x_t + v_cur * dt
+                if prompt_latent is not None:
+                    x_mid = mx.concatenate(
+                        [prompt_latent, x_mid[:, prompt_len:, :]], axis=1)
+                v_nxt, _ = _velocity(x_mid, t_nxt, x_self_cond)
+                # Corrector: average the two velocities.
+                x_t = x_t + 0.5 * (v_cur + v_nxt) * dt
+            else:
+                x_t = x_t + v_cur * dt
+
+            if prompt_latent is not None:                        # hold prefix clean
+                x_t = mx.concatenate(
+                    [prompt_latent, x_t[:, prompt_len:, :]], axis=1)
+            mx.eval(x_t)
+
+        response = x_t[:, prompt_len:, :]
+        logits = self._decode_logits(response)
+        mx.eval(logits)
+        return logits
+
     def sample(self, seq_len: int, num_steps: Optional[int] = None, temperature: float = 1.0,
                prompt_ids: Optional[np.ndarray] = None, noise: Optional[np.ndarray] = None,
-               seed: int = 0) -> np.ndarray:
-        """Generate token ids ``[B, seq_len]`` (greedy by default; set temperature for sampling)."""
+               seed: int = 0, sampler: Optional[str] = None) -> np.ndarray:
+        """Generate token ids ``[B, seq_len]`` (greedy by default; set temperature for sampling).
+
+        Auto-selects the flow-matching Euler/Heun ODE sampler when the model was
+        trained with ``use_flow_matching=True`` (``sampler`` then chooses euler/heun,
+        default euler); otherwise runs the DDIM path.  ``num_steps`` is the number of
+        DDIM / Euler steps.
+        """
         if noise is None:
             rng = np.random.default_rng(seed)
             B = 1 if prompt_ids is None else prompt_ids.shape[0]
             noise = rng.standard_normal((B, seq_len, self.d_latent)).astype(np.float32)
-        logits = np.array(self.sample_logits(noise, num_steps, prompt_ids))
+        if self.use_flow_matching:
+            ns = num_steps if num_steps is not None else 20
+            logits = np.array(self.sample_logits_flow(
+                noise, num_steps=ns, sampler=(sampler or "euler"), prompt_ids=prompt_ids))
+        else:
+            logits = np.array(self.sample_logits(noise, num_steps, prompt_ids))
         logits = logits / max(temperature, 1e-6)
         if temperature <= 1e-6:
             return logits.argmax(-1)
