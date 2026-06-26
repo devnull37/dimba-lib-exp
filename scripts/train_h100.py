@@ -113,25 +113,34 @@ H100_SFT_BATCH_SIZE = 64  # vs 32 on 48 GB GPU
 H100_SFT_GRAD_ACCUM = 2   # 64 × 2 = 128 effective (unchanged vs 4090)
 
 # ── staged token-budget presets (docs/NEXT_RUN_PLAN.md §3) ───────────────────
+# `subset` picks the FineWeb config so each preset draws GENUINELY UNIQUE tokens
+# (no looping/repetition — the data-starvation failure mode of run #1). sample-10BT
+# (~10B) covers everything up to the 5B scale gate; the 30B full run needs a bigger
+# pool, so it uses sample-100BT (~100B unique). apply_h100_overrides sets
+# train_4090.PRETRAIN_SUBSET from this.
 _PRESETS: dict[str, dict] = {
     "smoke": {
         "frozen":   100_000_000,   # 100 M
         "unfrozen":  35_000_000,   #  35 M  → ~135 M total (S0 plumbing gate)
+        "subset":   "sample-10BT",
         "desc": "~135M tokens — plumbing only; not a quality gate",
     },
     "validation": {
         "frozen":   700_000_000,   # 700 M
         "unfrozen": 300_000_000,   # 300 M  → ~1 B total (S1 recipe check)
+        "subset":   "sample-10BT",
         "desc": "~1B tokens — validates recipe vs run #1",
     },
     "scale": {
         "frozen":   3_000_000_000,  # 3 B
         "unfrozen": 2_000_000_000,  # 2 B   → ~5 B total (S2 decision gate)
+        "subset":   "sample-10BT",  # 5B < 10B → unique, no looping
         "desc": "~5B tokens — S2 scale-test / GO·NO-GO decision gate",
     },
     "full": {
         "frozen":   20_000_000_000,  # 20 B
         "unfrozen": 10_000_000_000,  # 10 B  → ~30 B total (S3, 67/33 split)
+        "subset":   "sample-100BT",  # 30B unique needs >10B → 100BT pool
         "desc": "~30B tokens — full run after S2 GO gate (lower end of 20–50B target)",
     },
 }
@@ -212,6 +221,11 @@ def apply_h100_overrides(preset: str) -> None:
     _t4.STAGE3_FROZEN_TOKENS   = frozen_tokens
     _t4.STAGE3_UNFROZEN_TOKENS = unfrozen_tok
 
+    # ── FineWeb subset (unique-token pool sized to the budget) ────────────────
+    # Stage-3 streams from this config; a budget larger than the pool would loop
+    # the same docs (run #1's data-starvation failure). Pick a pool ≥ the budget.
+    _t4.PRETRAIN_SUBSET = budget["subset"]
+
     # ── Alignment (Stage 1 + 2) ───────────────────────────────────────────────
     _t4.ALIGN_BATCH   = H100_ALIGN_BATCH
     _t4.ALIGN_SEQ_LEN = H100_ALIGN_SEQ_LEN
@@ -244,9 +258,9 @@ def apply_h100_overrides(preset: str) -> None:
         preset, budget["desc"],
     )
     logger.info(
-        "  Stage-3  batch=%d  seq=%d  |  "
+        "  Stage-3  batch=%d  seq=%d  subset=%s  |  "
         "frozen=%s tok → %s steps  |  unfrozen=%s tok → %s steps",
-        H100_STAGE3_BATCH, H100_STAGE3_SEQ,
+        H100_STAGE3_BATCH, H100_STAGE3_SEQ, budget["subset"],
         f"{frozen_tokens:,}", f"{_h100_steps_for_tokens(frozen_tokens):,}",
         f"{unfrozen_tok:,}", f"{_h100_steps_for_tokens(unfrozen_tok):,}",
     )
@@ -273,14 +287,15 @@ def _print_dry_run(preset: str) -> None:
     print(f"  SFT effective batch   = {H100_SFT_BATCH_SIZE * H100_SFT_GRAD_ACCUM}")
     print()
     print(f"  {'Preset':<12}  {'Frozen tokens':>18}  {'Unfrozen tokens':>18}  "
-          f"{'Frozen steps':>14}  {'Unfrozen steps':>14}")
-    print(f"  {'─' * 12}  {'─' * 18}  {'─' * 18}  {'─' * 14}  {'─' * 14}")
+          f"{'Frozen steps':>14}  {'Unfrozen steps':>14}  {'FineWeb subset':>15}")
+    print(f"  {'─' * 12}  {'─' * 18}  {'─' * 18}  {'─' * 14}  {'─' * 14}  {'─' * 15}")
     for name, b in _PRESETS.items():
         marker = " ← selected" if name == preset else ""
         print(
             f"  {name:<12}  {b['frozen']:>18,}  {b['unfrozen']:>18,}  "
             f"  {_h100_steps_for_tokens(b['frozen']):>12,}  "
-            f"  {_h100_steps_for_tokens(b['unfrozen']):>12,}"
+            f"  {_h100_steps_for_tokens(b['unfrozen']):>12,}  "
+            f"{b['subset']:>15}"
             f"{marker}"
         )
     print(f"{'─' * 70}\n")

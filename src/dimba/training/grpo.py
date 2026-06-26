@@ -641,14 +641,20 @@ class GRPOTrainer:
         """
         ckpt = torch.load(path, map_location="cpu")
         msd = ckpt["model_state_dict"]
+        # Weight-tied head: output_head.embedding_weight is a VIEW of the token
+        # embedding, not an independent parameter. A checkpoint saved from a model
+        # that materialised it (e.g. an SFT final.pt loaded via --checkpoint
+        # --resume) would inject an unexpected key and crash a strict load. Drop it
+        # and load non-strict — mirrors the distill/SFT loaders (train_4090.py).
+        msd.pop("output_head.embedding_weight", None)
         # Tolerate torch.compile prefix differences between the saving and loading model.
         try:
-            self.model.load_state_dict(msd)
+            self.model.load_state_dict(msd, strict=False)
         except RuntimeError:
             from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
             consume_prefix_in_state_dict_if_present(msd, "_orig_mod.")
             target = getattr(self.model, "_orig_mod", self.model)
-            target.load_state_dict(msd)
+            target.load_state_dict(msd, strict=False)
         if weights_only:
             logger.info("loaded weights <- %s (fresh optimizer/scheduler for new pass)", path)
             return

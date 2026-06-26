@@ -437,6 +437,12 @@ def _make_loader(ds: Dataset, cfg: dict, shuffle: bool = True) -> DataLoader:
     )
 
 
+# Max consecutive per-micro-batch CUDA OOMs to tolerate in SFT before aborting:
+# a few are transient fragmentation spikes (skip & recover); many in a row mean
+# the batch genuinely doesn't fit (fail loudly rather than make no progress).
+_SFT_MAX_OOM_SKIPS = 20
+
+
 def _sft_loop(
     model: nn.Module,
     loader: DataLoader,
@@ -474,29 +480,54 @@ def _sft_loop(
     for epoch in range(cfg["num_epochs"]):
         logger.info("%s epoch %d/%d", label, epoch + 1, cfg["num_epochs"])
         micro_step = 0
+        oom_skips = 0
         for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            response_mask = batch["response_mask"].to(device)
-            prompt_mask = batch["prompt_mask"].to(device)
+            try:
+                input_ids = batch["input_ids"].to(device)
+                response_mask = batch["response_mask"].to(device)
+                prompt_mask = batch["prompt_mask"].to(device)
 
-            # Sample random diffusion timesteps — DIMBA.forward requires t.
-            t = torch.randint(
-                0, model.num_diffusion_steps, (input_ids.shape[0],), device=device
-            )
-            # Model is bf16 natively — no autocast or GradScaler needed.
-            # Pass prompt_mask so the prompt stays clean and pooled conditioning
-            # is built from it, matching the conditioning path used at inference.
-            x_pred, _, _ = model(input_ids, t, prompt_mask=prompt_mask)
-            # Pass live embedding weight so weight-tying stays correct after resize.
-            logits = model.output_head(x_pred, embedding_weight=model.token_embed.get_weight())
-            loss_per_token = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                input_ids.reshape(-1),
-                reduction="none",
-            )
-            loss = (loss_per_token * response_mask.reshape(-1)).sum() \
-                   / response_mask.sum().clamp(min=1)
-            (loss / accum).backward()
+                # Sample random diffusion timesteps — DIMBA.forward requires t.
+                t = torch.randint(
+                    0, model.num_diffusion_steps, (input_ids.shape[0],), device=device
+                )
+                # Model is bf16 natively — no autocast or GradScaler needed.
+                # Pass prompt_mask so the prompt stays clean and pooled conditioning
+                # is built from it, matching the conditioning path used at inference.
+                x_pred, _, _ = model(input_ids, t, prompt_mask=prompt_mask)
+                # Pass live embedding weight so weight-tying stays correct after resize.
+                logits = model.output_head(x_pred, embedding_weight=model.token_embed.get_weight())
+                loss_per_token = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    input_ids.reshape(-1),
+                    reduction="none",
+                )
+                loss = (loss_per_token * response_mask.reshape(-1)).sum() \
+                       / response_mask.sum().clamp(min=1)
+                (loss / accum).backward()
+            except torch.cuda.OutOfMemoryError:
+                # A transient fragmentation OOM (run #1 hit one at the epoch
+                # boundary at B=64) must not crash a multi-hour SFT and force
+                # redoing both stages from the base. Discard this micro-batch's
+                # partial grads, free the cache, and skip it — costs one
+                # micro-batch, not the whole run. Many CONSECUTIVE OOMs mean the
+                # batch genuinely doesn't fit, so abort loudly instead of
+                # silently making no progress for a whole epoch.
+                oom_skips += 1
+                optimizer.zero_grad(set_to_none=True)
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                if oom_skips > _SFT_MAX_OOM_SKIPS:
+                    logger.error("%s: %d consecutive CUDA OOMs — SFT batch too "
+                                 "large to fit; aborting (lower SFT batch_size).",
+                                 label, oom_skips)
+                    raise
+                logger.warning("%s: CUDA OOM on a micro-batch (%d/%d consecutive) "
+                               "— cleared grads, emptied cache, skipping it.",
+                               label, oom_skips, _SFT_MAX_OOM_SKIPS)
+                continue
+            oom_skips = 0  # a successful step resets the transient-OOM counter
 
             running_loss += loss.item()
             running_n += 1
@@ -641,32 +672,37 @@ class _FineWebStreaming(IterableDataset):
         self._seq_len = seq_len
 
     def __iter__(self):
-        import itertools
         from datasets import load_dataset
 
         worker_info = torch.utils.data.get_worker_info()
-
-        ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
-                          split="train", streaming=True)
-
-        if worker_info is not None and worker_info.num_workers > 1:
-            # Each worker gets a disjoint slice of documents.
-            ds = ds.shard(num_shards=worker_info.num_workers,
-                          index=worker_info.id)
-
         eos = (self._tokenizer.eos_token_id
                if self._tokenizer.eos_token_id is not None else 0)
         seq_len = self._seq_len
 
         buf: list[int] = []
-        # Repeat the stream so training never exhausts it.
-        for row in itertools.cycle(ds):
-            enc = self._tokenizer.encode(row["text"], add_special_tokens=False)
-            enc.append(eos)
-            buf.extend(enc)
-            while len(buf) >= seq_len:
-                yield torch.tensor(buf[:seq_len], dtype=torch.long)
-                buf = buf[seq_len:]
+        # Re-stream from scratch each outer pass so training never exhausts the
+        # data — WITHOUT itertools.cycle, which caches every yielded row in host
+        # RAM to replay it (≈45 GB at the 5B run, ≈100 GB at 30B → host-OOM that
+        # the CUDA-OOM retry can't catch, after distillation already burned GPU
+        # hours). `for row in ds` over a fresh streaming iterator keeps RAM
+        # bounded. For budgets under the subset size the inner loop never
+        # exhausts before the trainer hits its step count (load_dataset is called
+        # once); over-subset budgets re-stream from the start (the documented
+        # "data loops" behaviour) — still bounded RAM.
+        while True:
+            ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
+                              split="train", streaming=True)
+            if worker_info is not None and worker_info.num_workers > 1:
+                # Each worker gets a disjoint slice of documents.
+                ds = ds.shard(num_shards=worker_info.num_workers,
+                              index=worker_info.id)
+            for row in ds:
+                enc = self._tokenizer.encode(row["text"], add_special_tokens=False)
+                enc.append(eos)
+                buf.extend(enc)
+                while len(buf) >= seq_len:
+                    yield torch.tensor(buf[:seq_len], dtype=torch.long)
+                    buf = buf[seq_len:]
 
 
 def _make_fineweb_streaming_loader(tokenizer, seq_len: int,
@@ -772,11 +808,20 @@ def _run_stage3_resilient(trainer, stage_cfg, tokenizer, seq_len, batch, device,
     ~290 M cached tokens. The streaming loader is rebuilt on each OOM retry so the
     worker processes are cleanly replaced after memory is freed.
     """
+    base_batch = batch
+    base_steps = int(stage_cfg["steps"])
     while True:
+        # Preserve the token budget when the batch shrinks on OOM: a halved batch
+        # needs proportionally more steps to deliver the same #tokens, else the
+        # co-adaptation silently trains on half the intended data (the exact
+        # token-starvation that hurt run #1).
+        steps = base_steps * base_batch // max(1, batch)
+        run_cfg = {**stage_cfg, "steps": steps}
         loader = _make_fineweb_streaming_loader(tokenizer, seq_len, batch, num_workers=2)
         try:
-            logger.info("Stage 3: co-adaptation at batch=%d, L=%d", batch, seq_len)
-            trainer.run_stage(stage_cfg, loader)
+            logger.info("Stage 3: co-adaptation at batch=%d, L=%d (%d steps, ~%.2fB tokens)",
+                        batch, seq_len, steps, steps * batch * seq_len / 1e9)
+            trainer.run_stage(run_cfg, loader)
             return batch
         except torch.cuda.OutOfMemoryError:
             del loader
@@ -787,7 +832,8 @@ def _run_stage3_resilient(trainer, stage_cfg, tokenizer, seq_len, batch, device,
                 logger.error("CUDA OOM even at batch=%d — cannot proceed.", batch)
                 raise
             new_batch = max(min_batch, batch // 2)
-            logger.warning("CUDA OOM at batch=%d → freed memory, retrying Stage 3 at batch=%d.",
+            logger.warning("CUDA OOM at batch=%d → freed memory, retrying Stage 3 at "
+                           "batch=%d (steps scale up to hold the token budget).",
                            batch, new_batch)
             batch = new_batch
 
@@ -905,11 +951,15 @@ def run_distill(
         logger.info("Stage 3%s: co-adaptation — FFN %s, lr=%g, %d steps",
                     phase, "FROZEN" if frozen else "UNFROZEN",
                     stage_cfg["lr"], int(stage_cfg["steps"]))
+        budget_batch = stage3_batch  # batch at entry — what the token budget is sized for
         eff_batch = _run_stage3_resilient(
             trainer, stage_cfg, tokenizer, PRETRAIN_SEQ_LEN, stage3_batch, device,
         )
         stage3_batch = eff_batch  # carry the OOM-survivable batch into the next phase
-        total_toks += int(stage_cfg["steps"]) * eff_batch * PRETRAIN_SEQ_LEN
+        # Steps scale up inside _run_stage3_resilient on an OOM downshift, so the
+        # delivered budget is the intended steps × entry-batch × seq regardless of
+        # the final (possibly reduced) batch.
+        total_toks += int(stage_cfg["steps"]) * budget_batch * PRETRAIN_SEQ_LEN
         # Checkpoint after each phase except the last so a crash in a later phase
         # (e.g. the new FFN-unfrozen Finetune #2) doesn't lose the frozen-FFN base.
         if i < len(coadapt_stages) - 1:
@@ -920,6 +970,11 @@ def run_distill(
                 "phase": "distill",
             }, inter_path)
             logger.info("saved intermediate co-adaptation checkpoint → %s", inter_path)
+            # Upload it too — the FFN-frozen base is expensive (up to 20B tokens);
+            # on a box that wipes local disk on restart, a crash in the unfrozen
+            # phase would otherwise lose it entirely.
+            _upload_checkpoint(inter_path, hf_token, hf_repo,
+                               f"distill/distill_stage3{phase}.pt")
     if coadapt_stages:
         logger.info("Stage 3 (all phases) done at batch=%d → ~%.2f B tokens co-adaptation.",
                     stage3_batch, total_toks / 1e9)
