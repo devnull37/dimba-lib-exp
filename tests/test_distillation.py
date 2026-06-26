@@ -1106,6 +1106,60 @@ class TestDistillationTrainer:
         for name, param in model.named_parameters():
             assert torch.isfinite(param).all(), f"Non-finite param after stage1: {name}"
 
+    def test_log_hook_is_called_each_log_point(self) -> None:
+        """A log_hook passed to DistillationTrainer fires with
+        (stage, step, n_steps, loss, optimizer) — the channel train_4090 uses to
+        write training_state.json during distillation (so monitor.py isn't blind)
+        and to apply live overrides."""
+        from dimba.distillation.trainer import DistillationConfig, DistillationTrainer
+
+        teacher = StubTeacher(num_layers=_LT, num_heads=_HT, d_model=_DT, vocab_size=_VOCAB)
+        model, lm = build_student_from_teacher(
+            teacher, num_student_layers=_LS, block_ffn=False, use_simple_mamba=True,
+        )
+        cfg = DistillationConfig(
+            teacher_model="stub", teacher_type="causal",
+            stages=[{"name": "stage3", "steps": 3, "lr": 1e-4}],
+        )
+        loader = self._make_tiny_dataloader(_VOCAB, _L, n_batches=4)
+        calls: List[tuple] = []
+
+        def hook(stage, step, n_steps, loss, optimizer):
+            assert hasattr(optimizer, "param_groups")
+            calls.append((stage, step, n_steps, float(loss)))
+            return None
+
+        trainer = DistillationTrainer(model, teacher, cfg, layer_map=lm, log_hook=hook)
+        trainer.run_stage(cfg.stages[0], loader)
+        assert calls, "log_hook was never called"
+        assert all(c[0] == "stage3" for c in calls)
+        assert calls[-1][1] == 3, "hook should fire at the final step"
+
+    def test_log_hook_stop_ends_stage_early(self) -> None:
+        """Returning 'stop' from the log_hook ends the stage before n_steps — the
+        mechanism behind the 'stop' override."""
+        from dimba.distillation.trainer import DistillationConfig, DistillationTrainer
+
+        teacher = StubTeacher(num_layers=_LT, num_heads=_HT, d_model=_DT, vocab_size=_VOCAB)
+        model, lm = build_student_from_teacher(
+            teacher, num_student_layers=_LS, block_ffn=False, use_simple_mamba=True,
+        )
+        cfg = DistillationConfig(
+            teacher_model="stub", teacher_type="causal",
+            stages=[{"name": "stage3", "steps": 50, "lr": 1e-4}],
+        )
+        loader = self._make_tiny_dataloader(_VOCAB, _L, n_batches=8)
+        seen: List[int] = []
+
+        def hook(stage, step, n_steps, loss, optimizer):
+            seen.append(step)
+            return "stop"
+
+        trainer = DistillationTrainer(model, teacher, cfg, layer_map=lm, log_hook=hook)
+        trainer.run_stage(cfg.stages[0], loader)
+        assert seen, "log_hook never fired"
+        assert seen[-1] < 50, "'stop' should have ended the stage well before n_steps"
+
     def test_trainer_run_all_stages(self) -> None:
         """DistillationTrainer.run should iterate all stages and return the model."""
         from dimba.distillation.trainer import DistillationConfig, DistillationTrainer

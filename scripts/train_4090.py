@@ -294,6 +294,49 @@ def _write_state(state: dict, path: str = "./training_state.json") -> None:
         json.dump({**state, "timestamp": time.time()}, f, indent=2)
 
 
+# scripts/monitor.py (the /loop babysitter) writes one-shot adjustments here; the
+# trainers poll + CONSUME them at each log interval. Supported keys:
+#   "lr"                     float  — all phases
+#   "kl_coeff"               float  — GRPO only
+#   "thinking_length_weight" float  — GRPO only
+#   "stop"                   bool   — end the current phase gracefully (save + exit)
+# Consume-once (the file is deleted on read) so a stale override is not re-applied
+# on every poll. See docs/BABYSIT_LOOP.md.
+OVERRIDE_FILE = "./training_state_override.json"
+
+
+def _read_override(path: str = OVERRIDE_FILE) -> Optional[dict]:
+    """Read and CONSUME (delete) the override file. None if absent/unreadable."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 — a half-written file must never crash training
+        return None
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    data.pop("written_at", None)
+    return data or None
+
+
+def _override_set_lr(optimizer, new_lr: float, scheduler=None) -> None:
+    """Set lr on every param group. When a LambdaLR scheduler is given (SFT/GRPO),
+    also overwrite its cached ``base_lrs`` (and each group's ``initial_lr``) so the
+    next ``scheduler.step()`` recomputes from the new base instead of snapping back
+    to the original lr — LambdaLR snapshots base_lrs at construction, so patching
+    the param group alone is not enough. Distillation passes ``scheduler=None`` (it
+    uses a fixed-lr AdamW with no scheduler), so the raw lr set here sticks."""
+    for pg in optimizer.param_groups:
+        pg["lr"] = new_lr
+        if "initial_lr" in pg:
+            pg["initial_lr"] = new_lr
+    if scheduler is not None and hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [new_lr for _ in scheduler.base_lrs]
+
+
 def _upload_checkpoint(
     local_path: str,
     hf_token: Optional[str],
@@ -550,6 +593,22 @@ def _sft_loop(
                     _write_state({"stage": label, "step": opt_step,
                                   "loss": avg_loss, "lr": lr_now})
                     running_loss, running_n = 0.0, 0
+                    # Apply any one-shot override from the /loop monitor.
+                    ov = _read_override()
+                    if ov:
+                        if "lr" in ov:
+                            _override_set_lr(optimizer, float(ov["lr"]), scheduler)
+                            logger.warning("%s OVERRIDE: lr → %.3e", label, float(ov["lr"]))
+                        if ov.get("stop"):
+                            logger.warning("%s OVERRIDE: stop — saving + ending this SFT "
+                                           "stage at step %d.", label, opt_step)
+                            stop_path = os.path.join(save_dir, f"{label}_stop{opt_step}.pt")
+                            torch.save({
+                                "model_state_dict": getattr(model, '_orig_mod', model).state_dict(),
+                                "config": getattr(model, "config", STUDENT_CFG),
+                                "step": opt_step, "phase": label,
+                            }, stop_path)
+                            return opt_step
 
                 if opt_step % cfg["save_interval"] == 0:
                     ckpt_path = os.path.join(save_dir, f"sft_step{opt_step}.pt")
@@ -909,8 +968,26 @@ def run_distill(
     stream = _build_fineweb_stream(tokenizer, n_cache=400_000)
     align_loader = _make_fineweb_loader(stream, ALIGN_SEQ_LEN, ALIGN_BATCH, num_workers=2)
 
+    # Live monitoring + control during distillation: write training_state.json at
+    # every log point (so scripts/monitor.py works during Stage 1/2/3 — run_distill
+    # writes no state otherwise, leaving the monitor blind through the entire,
+    # longest phase) and apply any one-shot override (lr / stop). Stage 3 uses a
+    # plain fixed-lr AdamW (no scheduler), so an lr override sticks immediately.
+    def _distill_log_hook(stage_name, step, n_steps, loss, optimizer):
+        _write_state({"stage": stage_name, "step": step, "total_steps": n_steps,
+                      "loss": loss, "lr": optimizer.param_groups[0]["lr"]})
+        ov = _read_override()
+        if ov:
+            if "lr" in ov:
+                _override_set_lr(optimizer, float(ov["lr"]))
+                logger.warning("OVERRIDE [%s]: lr → %.3e", stage_name, float(ov["lr"]))
+            if ov.get("stop"):
+                return "stop"
+        return None
+
     # ── Stages 1 + 2: alignment (Stage-1 matrices from the live mixer params) ───
-    trainer = DistillationTrainer(model=model, teacher=teacher, config=cfg)
+    trainer = DistillationTrainer(model=model, teacher=teacher, config=cfg,
+                                  log_hook=_distill_log_hook)
     for stage_cfg in align_stages:
         logger.info("alignment %s on short-seq loader (L=%d, B=%d)",
                     stage_cfg["name"], ALIGN_SEQ_LEN, ALIGN_BATCH)
@@ -1224,6 +1301,26 @@ def _run_grpo_pass(
                 metrics["mean_reward"], metrics["mean_think_blocks"],
                 metrics["kl"], metrics["group_accuracy"], metrics["lr"],
             )
+            # Apply any one-shot override from the /loop monitor. GRPO reads
+            # cfg.kl_coeff / cfg.thinking_length_weight per step, so mutating them
+            # takes effect immediately; the scheduler recomputes lr from initial_lr.
+            ov = _read_override()
+            if ov:
+                if "lr" in ov:
+                    _override_set_lr(trainer.optimizer, float(ov["lr"]),
+                                     getattr(trainer, "scheduler", None))
+                    logger.warning("GRPO[%s] OVERRIDE: lr → %.3e", label, float(ov["lr"]))
+                if "kl_coeff" in ov:
+                    trainer.cfg.kl_coeff = float(ov["kl_coeff"])
+                    logger.warning("GRPO[%s] OVERRIDE: kl_coeff → %.3f", label, float(ov["kl_coeff"]))
+                if "thinking_length_weight" in ov:
+                    trainer.cfg.thinking_length_weight = float(ov["thinking_length_weight"])
+                    logger.warning("GRPO[%s] OVERRIDE: thinking_length_weight → %.3f",
+                                   label, float(ov["thinking_length_weight"]))
+                if ov.get("stop"):
+                    logger.warning("GRPO[%s] OVERRIDE: stop requested at step %d — "
+                                   "ending pass.", label, step_idx)
+                    break
 
     pass_path = os.path.join(save_dir, f"grpo_{label}_final.pt")
     return trainer.save_checkpoint(pass_path)

@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -179,10 +179,18 @@ class DistillationTrainer:
         teacher: TeacherWrapper,
         config: DistillationConfig,
         layer_map: Optional[LayerMap] = None,
+        log_hook: Optional[Callable[[str, int, int, float, Any], Optional[str]]] = None,
     ) -> None:
         self.model = model
         self.teacher = teacher
         self.config = config
+        # Optional callback fired at every log point with
+        # (stage_name, step, n_steps, loss, optimizer). Returning the string
+        # "stop" ends the current stage early. scripts/train_4090.py uses this to
+        # write training_state.json DURING distillation (so scripts/monitor.py is
+        # not blind here — run_distill writes no state otherwise) and to apply
+        # one-shot live overrides (lr / stop) from training_state_override.json.
+        self._log_hook = log_hook
 
         if layer_map is None:
             n_student = len(model.denoiser.blocks)
@@ -450,6 +458,14 @@ class DistillationTrainer:
                     n_steps,
                     loss.item(),
                 )
+                if self._log_hook is not None:
+                    if self._log_hook(stage_name, step, n_steps,
+                                      loss.item(), optimizer) == "stop":
+                        logger.warning(
+                            "DistillationTrainer [%s]: early stop requested via "
+                            "log_hook at step %d/%d.", stage_name, step, n_steps,
+                        )
+                        break
 
     # ------------------------------------------------------------------
     # Per-stage loss computations
