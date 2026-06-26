@@ -55,7 +55,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 # ── add project root to path ──────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -570,15 +570,18 @@ class _PackedChunks(Dataset):
 def _build_fineweb_stream(tokenizer, n_cache: int = 50_000) -> torch.Tensor:
     """Stream FineWeb 'sample-10BT', tokenize the first *n_cache* docs, pack into one stream.
 
-    Streaming means the 10 BT dataset is never materialised to disk. Documents are
-    separated by the eos token. Returns a flat ``[T]`` int64 tensor reused (sliced) by
-    both the alignment and Stage-3 loaders, so FineWeb downloads + tokenizes only once.
+    Used ONLY for Stage 1+2 alignment (short-seq, small step count). Streaming means
+    the dataset is never fully materialised to disk. Documents are separated by the eos
+    token. Returns a flat ``[T]`` int64 tensor for the alignment DataLoader.
+
+    Stage 3 co-adaptation uses _FineWebStreaming (true on-the-fly streaming, no RAM cache)
+    so the multi-billion-token budget can scale without repeating data.
     """
     from datasets import load_dataset
 
     logger.info("building FineWeb pretrain cache (%d docs) …", n_cache)
     ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
-                      split="train", streaming=True, trust_remote_code=True)
+                      split="train", streaming=True)
     eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
     # Accumulate one small tensor per doc and cat once at the end. A flat Python int
     # list would balloon to ~8 GB at n_cache=400 K (each CPython int is ~28 B); per-doc
@@ -605,6 +608,94 @@ def _make_fineweb_loader(stream: torch.Tensor, seq_len: int,
     """
     ds = _PackedChunks(stream, seq_len)
     return DataLoader(ds, batch_size=batch_size, shuffle=True,
+                      num_workers=num_workers, pin_memory=True,
+                      persistent_workers=(num_workers > 0))
+
+
+# ── Stage-3 true streaming dataset ────────────────────────────────────────────
+
+# sample-10BT covers ~10B tokens. For runs that need more unique tokens, switch
+# PRETRAIN_SUBSET to a larger FineWeb config (e.g. "CC-MAIN-2024-10" or the full
+# "default" dump, see https://huggingface.co/datasets/HuggingFaceFW/fineweb).
+# This constant is referenced by the budget-check warning below.
+_FINEWEB_SUBSET_APPROX_TOKENS = 10_000_000_000  # sample-10BT ≈ 10 B tokens
+
+
+class _FineWebStreaming(IterableDataset):
+    """True streaming IterableDataset over FineWeb — no RAM cache.
+
+    Each DataLoader worker shards the HuggingFace IterableDataset via
+    ``ds.shard(num_shards=num_workers, index=worker_id)`` so that workers
+    produce DISJOINT documents (no duplicate data). Tokenization and seq_len
+    packing are done on the fly.
+
+    Streams continuously; the trainer stops at its configured step count.
+    sample-10BT is ~10 B tokens. If the total Stage-3 budget exceeds
+    _FINEWEB_SUBSET_APPROX_TOKENS, data will loop. See the comment above
+    that constant for how to switch to a larger FineWeb subset.
+    """
+
+    def __init__(self, tokenizer, seq_len: int) -> None:
+        super().__init__()
+        self._tokenizer = tokenizer
+        self._seq_len = seq_len
+
+    def __iter__(self):
+        import itertools
+        from datasets import load_dataset
+
+        worker_info = torch.utils.data.get_worker_info()
+
+        ds = load_dataset(PRETRAIN_DATASET, name=PRETRAIN_SUBSET,
+                          split="train", streaming=True)
+
+        if worker_info is not None and worker_info.num_workers > 1:
+            # Each worker gets a disjoint slice of documents.
+            ds = ds.shard(num_shards=worker_info.num_workers,
+                          index=worker_info.id)
+
+        eos = (self._tokenizer.eos_token_id
+               if self._tokenizer.eos_token_id is not None else 0)
+        seq_len = self._seq_len
+
+        buf: list[int] = []
+        # Repeat the stream so training never exhausts it.
+        for row in itertools.cycle(ds):
+            enc = self._tokenizer.encode(row["text"], add_special_tokens=False)
+            enc.append(eos)
+            buf.extend(enc)
+            while len(buf) >= seq_len:
+                yield torch.tensor(buf[:seq_len], dtype=torch.long)
+                buf = buf[seq_len:]
+
+
+def _make_fineweb_streaming_loader(tokenizer, seq_len: int,
+                                   batch_size: int,
+                                   num_workers: int = 4) -> DataLoader:
+    """DataLoader backed by _FineWebStreaming — no shuffle, no RAM tensor.
+
+    Each worker tokenizes and packs its own disjoint shard of FineWeb on the
+    fly, so the Stage-3 co-adaptation budget can be arbitrarily large without
+    cycling the same documents. The trainer stops at its step count.
+
+    Notes:
+        * No shuffle: streaming order is effectively random (CommonCrawl shards
+          are shuffled at build time), so per-worker sequential reads are fine.
+        * pin_memory=True: async DMA to GPU; harmless on CPU-only boxes.
+        * persistent_workers=True (when num_workers>0): avoids re-launching the
+          dataset iterator (and the HuggingFace streaming connection) on every
+          DataLoader exhaustion cycle.
+    """
+    total_stage3_tokens = STAGE3_FROZEN_TOKENS + STAGE3_UNFROZEN_TOKENS
+    if total_stage3_tokens > _FINEWEB_SUBSET_APPROX_TOKENS:
+        logger.warning(
+            "Stage-3 budget (%.1f B tokens) exceeds sample-10BT size (~10 B tokens). "
+            "Data will loop. For >10 B unique-token runs set PRETRAIN_SUBSET to a "
+            "larger FineWeb config (e.g. 'CC-MAIN-2024-10' or 'default').",
+            total_stage3_tokens / 1e9,
+        )
+    ds = _FineWebStreaming(tokenizer, seq_len)
+    return DataLoader(ds, batch_size=batch_size, shuffle=False,
                       num_workers=num_workers, pin_memory=True,
                       persistent_workers=(num_workers > 0))
 
@@ -666,7 +757,7 @@ def _shrink_batch_for_torch(cfg: dict, max_bs: int = 16) -> dict:
     return out
 
 
-def _run_stage3_resilient(trainer, stage_cfg, stream, seq_len, batch, device,
+def _run_stage3_resilient(trainer, stage_cfg, tokenizer, seq_len, batch, device,
                           min_batch: int = 1) -> int:
     """Run a distillation stage, halving the batch and retrying on CUDA OOM.
 
@@ -675,9 +766,14 @@ def _run_stage3_resilient(trainer, stage_cfg, stream, seq_len, batch, device,
     Stage 3 builds a fresh optimiser each attempt, so a retry is a clean restart — and
     OOM almost always fires on the first step, so little work is lost. Returns the batch
     size that ultimately succeeded.
+
+    Uses the TRUE STREAMING loader (_make_fineweb_streaming_loader) so that the
+    Stage-3 co-adaptation budget can scale to 5 B+ tokens without cycling the same
+    ~290 M cached tokens. The streaming loader is rebuilt on each OOM retry so the
+    worker processes are cleanly replaced after memory is freed.
     """
     while True:
-        loader = _make_fineweb_loader(stream, seq_len, batch, num_workers=2)
+        loader = _make_fineweb_streaming_loader(tokenizer, seq_len, batch, num_workers=2)
         try:
             logger.info("Stage 3: co-adaptation at batch=%d, L=%d", batch, seq_len)
             trainer.run_stage(stage_cfg, loader)
@@ -761,7 +857,9 @@ def run_distill(
     _log_vram(device, "post-model-load")
 
     tokenizer = _load_tokenizer(TEACHER_MODEL)
-    # ~400 K docs ≈ 290 M unique tokens → ~3.4 epochs over the 60 K-step (~1 B) Stage 3.
+    # Stage 1+2 alignment: cache a small slice (400 K docs ≈ 290 M tokens) for the
+    # short-sequence align passes. The cache is fine here — these stages are tiny
+    # (~1 K steps each) and the cached loader avoids re-downloading on every call.
     stream = _build_fineweb_stream(tokenizer, n_cache=400_000)
     align_loader = _make_fineweb_loader(stream, ALIGN_SEQ_LEN, ALIGN_BATCH, num_workers=2)
 
@@ -777,6 +875,9 @@ def run_distill(
     else:
         logger.info("Stage 1+2 alignment complete (matrices materialized).")
     del align_loader
+    # Free the RAM cache used by alignment stages — Stage 3 uses the true streaming
+    # loader and doesn't need the cached tensor (which would hold ~2-5 GB of RAM).
+    del stream
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -794,6 +895,8 @@ def run_distill(
     # Run the co-adaptation phases in order (FFN-frozen → FFN-unfrozen). Each
     # run_stage call re-applies its own trainability mask and builds a fresh AdamW,
     # so the unfrozen phase correctly unfreezes the FFN at its own (lower) LR.
+    # Stage 3 uses _make_fineweb_streaming_loader (true streaming, no RAM tensor)
+    # so the 5B+ token budget never cycles the same data.
     stage3_batch = PRETRAIN_BATCH_TORCH if on_torch else PRETRAIN_BATCH
     total_toks = 0
     for i, stage_cfg in enumerate(coadapt_stages):
@@ -803,7 +906,7 @@ def run_distill(
                     phase, "FROZEN" if frozen else "UNFROZEN",
                     stage_cfg["lr"], int(stage_cfg["steps"]))
         eff_batch = _run_stage3_resilient(
-            trainer, stage_cfg, stream, PRETRAIN_SEQ_LEN, stage3_batch, device,
+            trainer, stage_cfg, tokenizer, PRETRAIN_SEQ_LEN, stage3_batch, device,
         )
         stage3_batch = eff_batch  # carry the OOM-survivable batch into the next phase
         total_toks += int(stage_cfg["steps"]) * eff_batch * PRETRAIN_SEQ_LEN
