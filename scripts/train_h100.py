@@ -92,10 +92,12 @@ logger = logging.getLogger("train_h100")
 # See module docstring for the VRAM reasoning behind each choice.
 #
 # Stage-3 co-adaptation (distillation pretraining, CUDA Mamba2 kernel):
-#   B=128 → estimated peak ~10–12 GB. OOM-retry halves automatically on OOM.
-H100_PRETRAIN_BATCH   = 128   # vs 32 on 48 GB GPU
+#   B=128 OOM'd at L=512 on a 96 GB H100 NVL (the auto-downshift then dropped it to
+#   B=64, eff-batch 64, ~92/96 GB — healthy). We now set B=64 explicitly so the run
+#   starts clean with no OOM-retry. Stage 3 has no grad_accum path, so eff-batch == B.
+H100_PRETRAIN_BATCH   = 64    # was 128 (OOM at L=512); 64 fits at ~92/96 GB, no downshift
 H100_PRETRAIN_SEQ_LEN = 512   # unchanged; L=512 is the correct context window
-H100_STAGE3_BATCH     = 128   # must equal H100_PRETRAIN_BATCH (_steps_for_tokens uses this)
+H100_STAGE3_BATCH     = 64    # must equal H100_PRETRAIN_BATCH (_steps_for_tokens uses this)
 H100_STAGE3_SEQ       = 512   # must equal H100_PRETRAIN_SEQ_LEN
 
 # Stage-1/2 alignment (mixing-matrix memory is O(B × nheads × L² × num_layers)):
@@ -142,6 +144,16 @@ _PRESETS: dict[str, dict] = {
         "unfrozen": 17_000_000_000,  # 17 B  → 50 B total (S3, ~66/34 split)
         "subset":   "sample-100BT",  # 50B unique needs >10B → 100BT pool (~100B)
         "desc": "~50B tokens — full target run after S2 GO gate (33B frozen + 17B unfrozen)",
+    },
+    # Budget-capped variant: ~28B distill tokens to keep the whole distill→SFT→GRPO
+    # pipeline under a ~$400 / $2.5-per-GPU-hour ceiling (≈160 GPU-h: ~118h distill at
+    # ~66k tok/s + reserve for SFT/GRPO). 28B is ~28× run #1's ~1B, so well clear of the
+    # token-starvation failure; 18/10 keeps full's ~64/36 frozen:unfrozen split.
+    "budget28": {
+        "frozen":   18_000_000_000,  # 18 B
+        "unfrozen": 10_000_000_000,  # 10 B  → 28 B total (cost-capped full run)
+        "subset":   "sample-100BT",  # 28B unique needs >10B → 100BT pool (~100B)
+        "desc": "~28B tokens — cost-capped run (~$385 @ $2.5/GPU-h; 18B frozen + 10B unfrozen)",
     },
 }
 
