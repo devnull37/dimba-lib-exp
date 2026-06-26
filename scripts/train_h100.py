@@ -138,10 +138,10 @@ _PRESETS: dict[str, dict] = {
         "desc": "~5B tokens — S2 scale-test / GO·NO-GO decision gate",
     },
     "full": {
-        "frozen":   20_000_000_000,  # 20 B
-        "unfrozen": 10_000_000_000,  # 10 B  → ~30 B total (S3, 67/33 split)
-        "subset":   "sample-100BT",  # 30B unique needs >10B → 100BT pool
-        "desc": "~30B tokens — full run after S2 GO gate (lower end of 20–50B target)",
+        "frozen":   33_000_000_000,  # 33 B
+        "unfrozen": 17_000_000_000,  # 17 B  → 50 B total (S3, ~66/34 split)
+        "subset":   "sample-100BT",  # 50B unique needs >10B → 100BT pool (~100B)
+        "desc": "~50B tokens — full target run after S2 GO gate (33B frozen + 17B unfrozen)",
     },
 }
 
