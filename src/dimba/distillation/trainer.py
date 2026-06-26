@@ -565,13 +565,32 @@ class DistillationTrainer:
         device = input_ids.device
         B = input_ids.shape[0]
 
-        # Sample random timesteps uniformly for the diffusion objective.
-        t = torch.randint(
-            0,
-            self.model.num_diffusion_steps,
-            (B,),
-            device=device,
+        # Sample timesteps for the diffusion objective.
+        #
+        # When the model is configured for flow matching with logit-normal sampling
+        # (``flow_logit_normal=True`` → ``flow_schedule.logit_normal_sampling``), draw
+        # logit-normal *integer* indices (SD3 / FLUX schedule) instead of uniform ones.
+        # This concentrates training effort on the mid-noise region where token content
+        # is actually decided.  The old plain ``randint`` bypassed the configured
+        # schedule entirely — exactly the footgun flagged in
+        # ``FlowMatchingSchedule.sample_timesteps``'s docstring — which starves the
+        # decisive noise band and hurts base coherence.  ``CosineNoiseSchedule`` is
+        # always present as ``model.noise_schedule`` and its ``"logit_normal"`` mode
+        # returns integer indices in ``[0, T)``, preserving the discrete-index contract
+        # that ``compute_dimba_losses`` and ``model.forward`` expect.
+        _fm = bool(getattr(self.model, "use_flow_matching", False))
+        _fm_logit_normal = _fm and bool(
+            getattr(getattr(self.model, "flow_schedule", None), "logit_normal_sampling", False)
         )
+        if _fm_logit_normal:
+            t = self.model.noise_schedule.sample_timesteps(B, device, mode="logit_normal")
+        else:
+            t = torch.randint(
+                0,
+                self.model.num_diffusion_steps,
+                (B,),
+                device=device,
+            )
 
         loss, _parts = compute_dimba_losses(
             self.model,

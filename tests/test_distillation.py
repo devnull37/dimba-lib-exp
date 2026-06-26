@@ -1165,3 +1165,99 @@ class TestDistillationTrainer:
             emb = model.token_embed(input_ids)
             logits = model.output_head(emb)
         assert torch.isfinite(logits).all()
+
+    # ------------------------------------------------------------------
+    # FFN frozen→unfrozen co-adaptation schedule (the dropped "Finetune #2")
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ffn_params(model: DIMBA) -> List[torch.Tensor]:
+        """Collect the block-FFN parameters exactly as _freeze_ffn targets them."""
+        out: List[torch.Tensor] = []
+        for blk in model.denoiser.blocks:
+            ffn = getattr(blk, "ffn", None)
+            if ffn is not None:
+                out.extend(list(ffn.parameters()))
+        return out
+
+    @staticmethod
+    def _mixer_params(model: DIMBA) -> List[torch.Tensor]:
+        """Collect the forward-mixer parameters (always trainable in stage3)."""
+        out: List[torch.Tensor] = []
+        for blk in model.denoiser.blocks:
+            out.extend(list(blk.mamba_fwd.parameters()))
+        return out
+
+    def test_stage3_unfrozen_ffn_receives_gradients(
+        self, tiny_student_with_ffn: DIMBA, stub_teacher: StubTeacher
+    ) -> None:
+        """stage3 with freeze_ffn=False: the inherited FFN must be trainable and update.
+
+        Guards the fix for run #1, where the FFN was frozen for the entire base and
+        never co-adapted. Confirms the FFN parameters (a) report requires_grad=True
+        and (b) actually change after a few optimiser steps (gradients flowed).
+        """
+        from dimba.distillation.trainer import DistillationConfig, DistillationTrainer
+
+        model = tiny_student_with_ffn
+        cfg = DistillationConfig(
+            teacher_model="stub",
+            teacher_type="causal",
+            stages=[{"name": "stage3", "steps": 3, "lr": 1e-2, "freeze_ffn": False}],
+        )
+        loader = self._make_tiny_dataloader(_VOCAB, _L, n_batches=4)
+        trainer = DistillationTrainer(model, stub_teacher, cfg)
+
+        ffn_params = self._ffn_params(model)
+        assert ffn_params, "fixture must have block-FFN parameters"
+        before = [p.detach().clone() for p in ffn_params]
+
+        trainer.run_stage(cfg.stages[0], loader)
+
+        assert all(p.requires_grad for p in ffn_params), (
+            "FFN params must be trainable when freeze_ffn=False"
+        )
+        changed = any(not torch.equal(b, p.detach()) for b, p in zip(before, ffn_params))
+        assert changed, "FFN params should change after an unfrozen stage3 (gradients flowed)"
+        for p in ffn_params:
+            assert torch.isfinite(p).all()
+
+    def test_stage3_frozen_ffn_stays_frozen(
+        self, tiny_student_with_ffn: DIMBA, stub_teacher: StubTeacher
+    ) -> None:
+        """stage3 with freeze_ffn=True: the FFN must NOT update, but the mixer must.
+
+        Confirms the freeze switch still works (so the FFN-frozen first phase is a real
+        thing) and that the rest of the block trains, so a frozen phase is not a no-op.
+        """
+        from dimba.distillation.trainer import DistillationConfig, DistillationTrainer
+
+        model = tiny_student_with_ffn
+        cfg = DistillationConfig(
+            teacher_model="stub",
+            teacher_type="causal",
+            stages=[{"name": "stage3", "steps": 3, "lr": 1e-2, "freeze_ffn": True}],
+        )
+        loader = self._make_tiny_dataloader(_VOCAB, _L, n_batches=4)
+        trainer = DistillationTrainer(model, stub_teacher, cfg)
+
+        ffn_params = self._ffn_params(model)
+        mixer_params = self._mixer_params(model)
+        assert ffn_params and mixer_params
+        ffn_before = [p.detach().clone() for p in ffn_params]
+        mixer_before = [p.detach().clone() for p in mixer_params]
+
+        trainer.run_stage(cfg.stages[0], loader)
+
+        assert not any(p.requires_grad for p in ffn_params), (
+            "FFN params must be frozen when freeze_ffn=True"
+        )
+        # Frozen params are excluded from the optimiser → exactly unchanged.
+        assert all(torch.equal(b, p.detach()) for b, p in zip(ffn_before, ffn_params)), (
+            "FFN params must not change when freeze_ffn=True"
+        )
+        # The mixer is still trainable, so a frozen stage is not a no-op.
+        mixer_changed = any(
+            not torch.equal(b, p.detach()) for b, p in zip(mixer_before, mixer_params)
+        )
+        assert mixer_changed, "Mixer params should train even when the FFN is frozen"

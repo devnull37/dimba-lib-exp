@@ -116,6 +116,72 @@ STUDENT_CFG = dict(
     ffn_type="swiglu",           # SmolLM uses SwiGLU
 )
 
+# ── Stage-3 co-adaptation token budget ────────────────────────────────────────
+# The token budget is the knob; optimiser *steps* are derived from it so the recipe
+# scales by editing one or two numbers.  One Stage-3 step on the fast CUDA kernel
+# processes PRETRAIN_BATCH × PRETRAIN_SEQ_LEN = 32 × 512 = 16,384 tokens.  (On the
+# slow TorchMamba2 fallback the realised batch is smaller, so realised tokens scale
+# down proportionally — the run logs the true count.)  See docs/NEXT_RUN_PLAN.md for
+# the per-stage budget and the citations behind these numbers.
+_STAGE3_BATCH = 32   # keep in sync with PRETRAIN_BATCH (defined below)
+_STAGE3_SEQ   = 512  # keep in sync with PRETRAIN_SEQ_LEN (defined below)
+
+
+def _steps_for_tokens(n_tokens: int) -> int:
+    """Convert a Stage-3 token budget into optimiser steps (CUDA-kernel batch)."""
+    return max(1, round(n_tokens / (_STAGE3_BATCH * _STAGE3_SEQ)))
+
+
+# Co-adaptation budget, split FROZEN-FFN → UNFROZEN-FFN.  Run #1 used ~1B
+# frozen-only tokens and was incoherent.  The attention→Mamba conversion literature
+# lands at 3-20B tokens WITH the FFN co-adapting end-to-end (MOHAWK/Phi-Mamba 3-5B;
+# Llamba-1B 8B; Mamba-in-Llama 20B).  DIMBA additionally swaps the objective
+# (autoregressive → diffusion/flow-matching) and direction (causal → bidirectional),
+# which dilutes per-token signal, so we budget toward the upper end of that band AND
+# always run the previously-dropped FFN-unfrozen "Finetune #2".
+#
+# Presets (set the two knobs below; either may be 0 to skip that phase):
+#   SMOKE / plumbing gate    : 100_000_000  frozen +  35_000_000  unfrozen (~135M)
+#   VALIDATION gate          : 700_000_000  frozen + 300_000_000  unfrozen (~1B)
+#   SCALE-TEST gate (default): 3_000_000_000 frozen + 2_000_000_000 unfrozen (~5B)
+#   FULL run (post-gate)     : 20_000_000_000+ frozen + 10_000_000_000+ unfrozen
+#   VALIDATION continuation  : 0 frozen + 5_000_000_000..10_000_000_000 unfrozen,
+#                              run with --resume on the existing base checkpoint to
+#                              cheaply test the undertraining fix (FFN unfrozen only).
+STAGE3_FROZEN_TOKENS   = 3_000_000_000   # 3B: re-bed the new Mamba mixer into the inherited FFN
+STAGE3_UNFROZEN_TOKENS = 2_000_000_000   # 2B: low-LR FFN co-adaptation (the dropped "Finetune #2")
+
+# LRs for the two co-adaptation phases.  The unfrozen phase uses a much lower LR so
+# the inherited ~600B-token SmolLM FFN co-adapts to the matured mixer WITHOUT being
+# washed out (standard low-LR continued-pretraining / unfreeze practice).
+STAGE3_FROZEN_LR   = 2e-4
+STAGE3_UNFROZEN_LR = 3e-5
+
+
+def _coadapt_stages() -> list:
+    """Build the Stage-3 co-adaptation phases (frozen FFN → unfrozen FFN).
+
+    Both phases run the same DIMBA diffusion objective on raw web text; they differ
+    only in whether the inherited FFN is trainable and at what LR.  A phase with a
+    zero token budget is omitted (e.g. set STAGE3_FROZEN_TOKENS=0 for a pure
+    unfrozen continuation of an already-co-adapted base).
+    """
+    phases = []
+    if STAGE3_FROZEN_TOKENS > 0:
+        # FFN FROZEN: only the Mamba mixer trains, learning to produce activations
+        # the inherited FFN already knows how to consume (MOHAWK-faithful).
+        phases.append({"name": "stage3", "steps": _steps_for_tokens(STAGE3_FROZEN_TOKENS),
+                       "lr": STAGE3_FROZEN_LR, "freeze_ffn": True, "kd_weight": 0.0,
+                       "ce_loss_weight": 1.0, "min_snr_gamma": 5.0})
+    if STAGE3_UNFROZEN_TOKENS > 0:
+        # FFN UNFROZEN ("Finetune #2"): let the FFN co-adapt to the matured mixer at
+        # low LR.  This is the step dropped in run #1 that left the FFN never adapted.
+        phases.append({"name": "stage3", "steps": _steps_for_tokens(STAGE3_UNFROZEN_TOKENS),
+                       "lr": STAGE3_UNFROZEN_LR, "freeze_ffn": False, "kd_weight": 0.0,
+                       "ce_loss_weight": 1.0, "min_snr_gamma": 5.0})
+    return phases
+
+
 DISTILL_CFG = dict(
     teacher_model=TEACHER_MODEL,
     teacher_type=TEACHER_TYPE,
@@ -136,15 +202,9 @@ DISTILL_CFG = dict(
         {"name": "stage1", "steps": 500,  "lr": 1e-3},
         # Stage 2: align hidden states → teacher residual stream (clean text)
         {"name": "stage2", "steps": 500,  "lr": 5e-4},
-        # Stage 3: MOHAWK-faithful co-adaptation pretraining.
-        # FFN stays frozen; only the Mamba mixer trains.  Raw web text teaches the
-        # mixer to produce activations the FFN already knows how to handle.
-        # 60 K steps × 32 batch × 512 seq ≈ 983 M token-updates ≈ 1 B, over the
-        # PRETRAIN cache (~290 M unique tokens at n_cache=400 K → ~3.4 epochs).
-        # kd_weight=0 means no teacher forward pass needed → ~5-6 hrs on the CUDA kernel.
-        {"name": "stage3", "steps": 60_000, "lr": 2e-4,
-         "freeze_ffn": True, "kd_weight": 0.0,
-         "ce_loss_weight": 1.0, "min_snr_gamma": 5.0},
+        # Stage 3: co-adaptation pretraining, FFN FROZEN then UNFROZEN (see knobs above).
+        # kd_weight=0 → no teacher forward pass needed during Stage 3 (fast on the CUDA kernel).
+        *_coadapt_stages(),
     ],
 )
 
@@ -649,7 +709,12 @@ def run_distill(
     logger.info("Stage 3:   co-adaptation pretraining (~FFN frozen, teacher unused)")
 
     cfg = DistillationConfig.from_dict({**DISTILL_CFG, "device": str(device)})
-    stages_by_name = {s["name"]: s for s in DISTILL_CFG["stages"]}
+    # Split the configured stages into alignment (stage1/stage2, teacher active, short
+    # seq) and co-adaptation (one or more stage3 phases, teacher unused, full seq).
+    # Ordered lists (not a name→stage dict) let us run MULTIPLE stage3 phases — the
+    # FFN-frozen phase followed by the FFN-unfrozen "Finetune #2".
+    align_stages = [s for s in DISTILL_CFG["stages"] if s["name"] in ("stage1", "stage2")]
+    coadapt_stages = [s for s in DISTILL_CFG["stages"] if s["name"] == "stage3"]
 
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     teacher = TeacherWrapper(TEACHER_MODEL, device=str(device), dtype=compute_dtype)
@@ -702,11 +767,10 @@ def run_distill(
 
     # ── Stages 1 + 2: alignment (Stage-1 matrices from the live mixer params) ───
     trainer = DistillationTrainer(model=model, teacher=teacher, config=cfg)
-    for sname in ("stage1", "stage2"):
-        if sname in stages_by_name:
-            logger.info("alignment %s on short-seq loader (L=%d, B=%d)",
-                        sname, ALIGN_SEQ_LEN, ALIGN_BATCH)
-            trainer.run_stage(stages_by_name[sname], align_loader)
+    for stage_cfg in align_stages:
+        logger.info("alignment %s on short-seq loader (L=%d, B=%d)",
+                    stage_cfg["name"], ALIGN_SEQ_LEN, ALIGN_BATCH)
+        trainer.run_stage(stage_cfg, align_loader)
     if getattr(trainer, "_stage1_warned", False):
         logger.warning("Stage 1 matrix alignment fell back to a NO-OP — matrices could "
                        "not be materialized (see warning above).")
@@ -727,15 +791,35 @@ def run_distill(
 
     # ── Stage 3: co-adaptation pretraining (FFN frozen, teacher unused) ─────────
     # Graceful OOM handling: halve the batch and retry instead of crashing.
+    # Run the co-adaptation phases in order (FFN-frozen → FFN-unfrozen). Each
+    # run_stage call re-applies its own trainability mask and builds a fresh AdamW,
+    # so the unfrozen phase correctly unfreezes the FFN at its own (lower) LR.
     stage3_batch = PRETRAIN_BATCH_TORCH if on_torch else PRETRAIN_BATCH
-    if "stage3" in stages_by_name:
+    total_toks = 0
+    for i, stage_cfg in enumerate(coadapt_stages):
+        frozen = bool(stage_cfg.get("freeze_ffn", False))
+        phase = chr(ord("a") + i)  # 3a, 3b, ...
+        logger.info("Stage 3%s: co-adaptation — FFN %s, lr=%g, %d steps",
+                    phase, "FROZEN" if frozen else "UNFROZEN",
+                    stage_cfg["lr"], int(stage_cfg["steps"]))
         eff_batch = _run_stage3_resilient(
-            trainer, stages_by_name["stage3"], stream,
-            PRETRAIN_SEQ_LEN, stage3_batch, device,
+            trainer, stage_cfg, stream, PRETRAIN_SEQ_LEN, stage3_batch, device,
         )
-        toks = int(stages_by_name["stage3"]["steps"]) * eff_batch * PRETRAIN_SEQ_LEN
-        logger.info("Stage 3 done at batch=%d → ~%.0f M tokens co-adaptation.",
-                    eff_batch, toks / 1e6)
+        stage3_batch = eff_batch  # carry the OOM-survivable batch into the next phase
+        total_toks += int(stage_cfg["steps"]) * eff_batch * PRETRAIN_SEQ_LEN
+        # Checkpoint after each phase except the last so a crash in a later phase
+        # (e.g. the new FFN-unfrozen Finetune #2) doesn't lose the frozen-FFN base.
+        if i < len(coadapt_stages) - 1:
+            inter_path = os.path.join(save_dir, f"distill_stage3{phase}.pt")
+            torch.save({
+                "model_state_dict": getattr(model, "_orig_mod", model).state_dict(),
+                "config": _save_config_with_backend(model),
+                "phase": "distill",
+            }, inter_path)
+            logger.info("saved intermediate co-adaptation checkpoint → %s", inter_path)
+    if coadapt_stages:
+        logger.info("Stage 3 (all phases) done at batch=%d → ~%.2f B tokens co-adaptation.",
+                    stage3_batch, total_toks / 1e9)
 
     # ── Save — config pins the backend the checkpoint must be rebuilt on ────────
     final_path = os.path.join(save_dir, "final.pt")
@@ -773,6 +857,16 @@ def run_sft(
     """
     os.makedirs(save_dir, exist_ok=True)
     logger.info("=== PHASE 2: SFT (two-stage block-CoT) ===")
+    # COHERENCE GATE: SFT (and GRPO) only pay off once the distilled BASE produces
+    # coherent continuations. Run #1 was incoherent because the base was token-starved
+    # and the FFN never co-adapted; SFT on limited instruction data could not rescue it
+    # and GRPO accuracy stayed ~0 (nothing to optimise). Before running this phase,
+    # confirm the base checkpoint passes the coherence gate in docs/NEXT_RUN_PLAN.md
+    # (coherent ≥30-token continuations / perplexity below threshold).
+    logger.warning(
+        "SFT precondition: the base checkpoint must pass the coherence gate "
+        "(see docs/NEXT_RUN_PLAN.md). SFT cannot fix an incoherent / undertrained base."
+    )
 
     if resume:
         logger.warning(
@@ -996,6 +1090,14 @@ def run_grpo(
     logger.info("=== PHASE 3: GRPO (MGPO + Long2Short + flow sampler) ===")
     logger.info("MGPO gamma=%.1f | Long2Short λ=%.2f | group_size=%d",
                 GRPO_CFG.mgpo_gamma, GRPO_CFG.long2short_lambda, GRPO_CFG.group_size)
+    # COHERENCE GATE: GRPO optimises verifiable rewards over sampled completions. If the
+    # SFT model cannot produce coherent, occasionally-correct completions, every group is
+    # uniformly wrong, advantages are ~0, and GRPO makes no progress (run #1: accuracy ~0).
+    logger.warning(
+        "GRPO precondition: the SFT model must already produce coherent, sometimes-correct "
+        "completions (see docs/NEXT_RUN_PLAN.md). GRPO cannot bootstrap signal from an "
+        "incoherent policy."
+    )
 
     model = _build_or_load_model(checkpoint, device)
     tokenizer = _load_tokenizer(TEACHER_MODEL)
