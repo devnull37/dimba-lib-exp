@@ -973,9 +973,30 @@ def run_distill(
     # writes no state otherwise, leaving the monitor blind through the entire,
     # longest phase) and apply any one-shot override (lr / stop). Stage 3 uses a
     # plain fixed-lr AdamW (no scheduler), so an lr override sticks immediately.
+    # Crash insurance: Stage-3 (3a/3b) runs for DAYS with no intermediate save —
+    # only the 3a→3b boundary + final. A crash/credit-lapse mid-stage loses all of
+    # it. Here we overwrite a single rolling checkpoint (local + HF) every
+    # STAGE3_SAVE_EVERY steps, written atomically (tmp → os.replace) so a crash
+    # mid-write can't corrupt the only copy; any save/upload error is swallowed so
+    # training never dies because of insurance. Boundary/final saves are unchanged.
+    STAGE3_SAVE_EVERY = 25_000  # ~3.4 h at ~123 steps/min on this H100
     def _distill_log_hook(stage_name, step, n_steps, loss, optimizer):
         _write_state({"stage": stage_name, "step": step, "total_steps": n_steps,
                       "loss": loss, "lr": optimizer.param_groups[0]["lr"]})
+        if stage_name == "stage3" and step > 0 and step % STAGE3_SAVE_EVERY == 0:
+            roll = os.path.join(save_dir, "distill_latest.pt")
+            try:
+                torch.save({
+                    "model_state_dict": getattr(model, "_orig_mod", model).state_dict(),
+                    "config": _save_config_with_backend(model),
+                    "phase": "distill",
+                    "stage3_step": step,
+                }, roll + ".tmp")
+                os.replace(roll + ".tmp", roll)
+                logger.info("rolling Stage-3 checkpoint saved → %s (step %d)", roll, step)
+                _upload_checkpoint(roll, hf_token, hf_repo, "distill/distill_latest.pt")
+            except Exception as e:  # never let insurance crash the run
+                logger.warning("rolling checkpoint at step %d failed: %s", step, e)
         ov = _read_override()
         if ov:
             if "lr" in ov:
