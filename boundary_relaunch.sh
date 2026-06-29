@@ -103,7 +103,7 @@ cmd_verify() {
         local gen_out
         # Use CUDA_VISIBLE_DEVICES="" to force CPU; the script auto-selects cpu when no CUDA
         gen_out=$(
-            CUDA_VISIBLE_DEVICES="" python3 "$REPO_DIR/scripts/generate.py" \
+            CUDA_VISIBLE_DEVICES="" "$VENV/bin/python3" "$REPO_DIR/scripts/generate.py" \
                 --checkpoint "$REPO_DIR/$CKPT" \
                 --prompt "The quick brown fox jumps over" \
                 --length 32 \
