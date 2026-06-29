@@ -916,6 +916,12 @@ def run_distill(
     # FFN-frozen phase followed by the FFN-unfrozen "Finetune #2".
     align_stages = [s for s in DISTILL_CFG["stages"] if s["name"] in ("stage1", "stage2")]
     coadapt_stages = [s for s in DISTILL_CFG["stages"] if s["name"] == "stage3"]
+    if resume and os.path.isfile(resume):
+        logger.info(
+            "resume detected (%s) — skipping stage1/stage2 alignment to preserve co-adapted weights",
+            resume,
+        )
+        align_stages = []
 
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     teacher = TeacherWrapper(TEACHER_MODEL, device=str(device), dtype=compute_dtype)

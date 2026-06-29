@@ -155,6 +155,12 @@ _PRESETS: dict[str, dict] = {
         "subset":   "sample-100BT",  # 28B unique needs >10B → 100BT pool (~100B)
         "desc": "~28B tokens — cost-capped run (~$385 @ $2.5/GPU-h; 18B frozen + 10B unfrozen)",
     },
+    "budget28_3b": {
+        "frozen":            0,       # 0 → _build_stage3_phases skips the 3a frozen phase
+        "unfrozen": 10_000_000_000,  # 10 B  → 3b-only unfrozen continuation
+        "subset":   "sample-100BT",  # same pool as budget28
+        "desc": "3b-only continuation from distill_stage3a.pt (no frozen 3a re-run, no alignment)",
+    },
 }
 
 
@@ -441,7 +447,10 @@ def main() -> None:
     user_ckpt = args.checkpoint
 
     def _resume_for(phase: str) -> Optional[str]:
-        # Pass --resume only for the explicitly selected single phase.
+        # distill resumes from --checkpoint even under --phase all (3b continuation);
+        # sft/grpo resume only when their own phase is explicitly selected.
+        if phase == "distill" and args.resume and args.phase in ("distill", "all"):
+            return user_ckpt
         return user_ckpt if (args.resume and args.phase == phase) else None
 
     ckpt = args.checkpoint
