@@ -636,9 +636,16 @@ class DistillationTrainer:
 
                 # Require matching vocab sizes for soft-label KD.
                 if student_logits.shape[-1] == teacher_logits.shape[-1]:
+                    # Align targets: a causal teacher's logits at position i are its
+                    # distribution for token i+1, while the diffusion student's logits
+                    # at position i reconstruct token i. Shift so both describe the
+                    # same token: teacher[:, :-1] (predicting tokens 1..L-1) vs
+                    # student[:, 1:] (reconstructing tokens 1..L-1). Unshifted, the
+                    # KD term teaches next-token prediction against the CE loss's
+                    # same-token target — two contradictory objectives per position.
                     kd_loss = stage3_kd_loss(
-                        student_logits,
-                        teacher_logits.to(student_logits.dtype),
+                        student_logits[:, 1:],
+                        teacher_logits[:, :-1].to(student_logits.dtype),
                         kd_temp=kd_temp,
                     )
                     loss = loss + kd_weight * kd_loss
