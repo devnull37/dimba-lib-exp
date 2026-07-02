@@ -114,6 +114,8 @@ def compute_dimba_losses(
     *,
     ce_loss_weight: float = 1.0,
     min_snr_gamma: float = 5.0,
+    snr_floor: float = 1e-3,
+    ce_time_fade: bool = False,
     prompt_mask: Optional[torch.Tensor] = None,
     loss_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -189,13 +191,17 @@ def compute_dimba_losses(
         if model.prediction_type == "v":
             # flow velocity target has unit-ish scale; SNR+1 normalization keeps min-SNR-v consistent
             weight = weight / (snr_flow + 1.0)
-        weight = weight.clamp(min=1e-3)
+        # snr_floor: the default 1e-3 leaves the high-noise region effectively
+        # untrained, so x0_hat degenerates to a noise-independent blend at t~1
+        # and generation from pure noise fails (see docs/ROOT_CAUSE_BUDGET28.md).
+        # A floor >=0.5 keeps gradient pressure on the mode-selection regime.
+        weight = weight.clamp(min=snr_floor)
     else:
         snr = model.noise_schedule.snr(t)
         weight = torch.clamp(snr, max=min_snr_gamma)
         if model.prediction_type == "v":
             weight = weight / (snr + 1.0)
-        weight = weight.clamp(min=1e-3)
+        weight = weight.clamp(min=snr_floor)
     diff_loss = (per_sample * weight).mean()
 
     # --- cross-entropy / rounding anchor ---
@@ -206,9 +212,16 @@ def compute_dimba_losses(
     ).view(B, L)
     if eff is not None:
         m = eff.to(ce_per.dtype)
-        ce_loss = ((ce_per * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)).mean()
+        ce_sample = (ce_per * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
     else:
-        ce_loss = ce_per.mean()
+        ce_sample = ce_per.mean(dim=1)
+    if ce_time_fade:
+        # At high noise the CE-optimal output is the unigram distribution, so a
+        # full-strength anchor there actively teaches token-frequency spam
+        # exactly where generation starts. Fade it out with noise level.
+        t_fade = (t.float() / (model.num_diffusion_steps - 1)).clamp(0.0, 1.0)
+        ce_sample = ce_sample * (1.0 - t_fade)
+    ce_loss = ce_sample.mean()
 
     loss = model.recon_loss_weight * diff_loss + ce_loss_weight * ce_loss
     parts = {"diff_loss": diff_loss.detach(), "ce_loss": ce_loss.detach()}
