@@ -537,7 +537,7 @@ def _sft_loop(
                 # Model is bf16 natively — no autocast or GradScaler needed.
                 # Pass prompt_mask so the prompt stays clean and pooled conditioning
                 # is built from it, matching the conditioning path used at inference.
-                x_pred, _, _ = model(input_ids, t, prompt_mask=prompt_mask)
+                x_pred, _, info = model(input_ids, t, prompt_mask=prompt_mask)
                 # Pass live embedding weight so weight-tying stays correct after resize.
                 logits = model.output_head(x_pred, embedding_weight=model.token_embed.get_weight())
                 loss_per_token = F.cross_entropy(
@@ -545,8 +545,19 @@ def _sft_loop(
                     input_ids.reshape(-1),
                     reduction="none",
                 )
-                loss = (loss_per_token * response_mask.reshape(-1)).sum() \
+                ce_loss = (loss_per_token * response_mask.reshape(-1)).sum() \
                        / response_mask.sum().clamp(min=1)
+                # High-noise latent anchor (docs/ROOT_CAUSE_BUDGET28.md): CE alone
+                # constrains only the decoded argmax; the sampler's ODE integrates
+                # z0_hat itself, so its geometry at high t must also be pinned to
+                # real latents or generation from near-pure noise degenerates.
+                dm = info.get("diffuse_mask")
+                dm = (dm if dm is not None else response_mask).to(torch.float32)
+                per_pos = ((info["z0_hat"].float() - info["z_0"].float()) ** 2).mean(-1)
+                per_sample = (per_pos * dm).sum(1) / dm.sum(1).clamp(min=1.0)
+                t_cont = (t.float() / (model.num_diffusion_steps - 1)).clamp(1e-5, 1 - 1e-5)
+                w = torch.clamp(((1.0 - t_cont) / t_cont) ** 2, min=0.5, max=5.0)
+                loss = ce_loss + 0.5 * (per_sample * w).mean()
                 (loss / accum).backward()
             except torch.cuda.OutOfMemoryError:
                 # A transient fragmentation OOM (run #1 hit one at the epoch
@@ -1483,6 +1494,10 @@ def parse_args() -> argparse.Namespace:
                    help="HuggingFace API token for auto-upload (or set HF_TOKEN env var)")
     p.add_argument("--hf-repo", default=None,
                    help="HuggingFace repo to upload checkpoints to, e.g. 'yourusername/dimba-135m'")
+    p.add_argument("--save-dir", default=None,
+                   help="Override the checkpoint output dir for the selected phase "
+                        "(default: ./checkpoints/<phase>). Use to avoid overwriting "
+                        "a previous run's final.pt.")
     return p.parse_args()
 
 
@@ -1532,13 +1547,20 @@ def main() -> None:
     if args.phase in ("distill", "all"):
         ckpt = run_distill(device, resume=_resume_for("distill"), **hf_kw)
 
+    # --save-dir only overrides the single explicitly-selected phase; in
+    # --phase all mode each phase keeps its default dir (the handoff paths).
+    def _save_dir_for(phase: str, default: str) -> str:
+        return args.save_dir if (args.save_dir and args.phase == phase) else default
+
     if args.phase in ("sft", "all"):
         ckpt = run_sft(ckpt, device, resume=_resume_for("sft"),
+                       save_dir=_save_dir_for("sft", "./checkpoints/sft"),
                        use_frontier=not args.no_frontier, **hf_kw)
 
     if args.phase in ("grpo", "all"):
         ckpt = run_grpo(ckpt, device,
                         resume=_resume_for("grpo"),
+                        save_dir=_save_dir_for("grpo", "./checkpoints/grpo"),
                         num_steps=args.grpo_steps,
                         data=grpo_data,
                         **hf_kw)
