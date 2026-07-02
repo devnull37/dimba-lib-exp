@@ -1032,9 +1032,19 @@ def run_distill(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # The teacher is unused in Stage 3 (kd_weight=0) — free its VRAM. The wrapper stays
-    # alive so its metadata (num_layers, …) still answers any trainer query.
-    teacher.unload()
+    # The teacher is unused in Stage 3 only when every phase runs kd_weight=0 — then
+    # free its VRAM. With KD on, _stage3_step forwards the teacher every step, so it
+    # must stay resident on the training device (unloading it returns CPU logits and
+    # stage3_kd_loss crosses devices). The wrapper stays alive either way so its
+    # metadata (num_layers, …) still answers any trainer query.
+    _stage3_kd_on = any(
+        float(s.get("kd_weight", getattr(trainer.config, "kd_weight", 0.0)) or 0.0) > 0.0
+        for s in coadapt_stages
+    )
+    if _stage3_kd_on:
+        logger.info("Stage 3 KD active (kd_weight>0) — keeping teacher resident on %s.", device)
+    else:
+        teacher.unload()
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()

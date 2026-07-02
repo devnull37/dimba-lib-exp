@@ -645,7 +645,9 @@ class DistillationTrainer:
                     # same-token target — two contradictory objectives per position.
                     kd_loss = stage3_kd_loss(
                         student_logits[:, 1:],
-                        teacher_logits[:, :-1].to(student_logits.dtype),
+                        teacher_logits[:, :-1].to(
+                            device=student_logits.device, dtype=student_logits.dtype
+                        ),
                         kd_temp=kd_temp,
                     )
                     loss = loss + kd_weight * kd_loss
