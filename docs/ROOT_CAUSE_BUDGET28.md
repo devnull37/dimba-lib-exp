@@ -4,6 +4,15 @@ Date: 2 Jul 2026 (UAE). Run: distill→SFT→GRPO on 1×H100, preset `budget28`
 (~28B tokens, ~$358). Pipeline completed mechanically; all checkpoints valid and
 loadable. The final model does not produce coherent text.
 
+> **UPDATE (2 Jul 2026, evening): the primary root cause was found and is NOT
+> what the first analysis below concluded.** See "Definitive root cause (found
+> by experiment)" at the end. In particular, "the model learned unigram
+> statistics and stopped" is **refuted**: the budget28 model reconstructs
+> *unseen* English text with 98–100% accuracy from up to 90% noise. The model
+> learned strong conditional structure; it is blind only at exactly t=1.0 —
+> the pure-noise starting point of every generation. The KD-off finding below
+> remains true and still matters, but it is secondary.
+
 ## Symptom
 
 All three checkpoints (`distill/final.pt`, `sft/final.pt`, `grpo/final.pt`)
@@ -112,10 +121,95 @@ once, and then the bridge was removed entirely for Stage 3.
    tokens (~3–4 H100-hours). Any candidate fix can be validated with a ~1–2B
    token run + the blocking coherence gate before committing to a full budget.
 
+## Definitive root cause (found by experiment, 2 Jul 2026 evening)
+
+A chain of cheap controlled experiments (~$3 total, scratchpad scripts) located
+the true failure. All on the exact production architecture (d_model=576, 30
+layers, flow matching, logit-normal t, bf16).
+
+### Experiment chain
+
+1. **Overfit contract test** (`overfit_test.py`): train from scratch on 8 fixed
+   sentences with the *identical* stage-3 loss path until memorized.
+   Result: t=0 clean-pass reconstruction accuracy **1.000**, yet
+   `sample_from_model_flow` produced unigram soup ("in in the the, and…").
+   → the train→sample contract itself is broken; no token budget or KD signal
+   could ever have produced coherent generations.
+2. **Diffusion-LM clamp trick** (`clamp_sample_test.py`): snapping x0̂ to the
+   nearest token embedding each ODE step (all-steps and late-steps variants,
+   Euler/Heun). **Refuted** — still soup. Not a sampler-level fix.
+3. **Partial-noise recovery ladder** (`partial_noise_test.py`) — the decisive
+   experiment. Noise a known row to level t_start, integrate the flow ODE to 0:
+
+   | t_start | 0.1 | 0.3 | 0.5 | 0.7 | 0.8 | 0.9 | **1.0** |
+   |---|---|---|---|---|---|---|---|
+   | recovery (overfit model) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | **0.02** |
+   | recovery (budget28, UNSEEN text) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.98–1.00 | **0.00–0.01** |
+
+   A razor-sharp cliff at exactly t=1.0. The model is an excellent denoiser
+   whenever *any* true signal exists and blind only at pure noise — which is
+   where every real generation must start.
+
+### Mechanism
+
+Two compounding terms in `compute_dimba_losses`:
+
+- **min-SNR weighting kills the high-t gradient.** `snr_flow = ((1−t)/t)²`
+  clamped to [1e-3, 5]: at t=0.9 the diffusion loss weight is ~0.012, at t≈1 it
+  is 1e-3. The model gets essentially no gradient pressure to make its x0̂
+  *depend on the input noise* at high t, so it converges to a constant
+  posterior-mean blend there.
+- **The unweighted CE anchor actively teaches unigram output at high t.** CE is
+  applied at full strength at every t; from pure noise its optimum is the
+  marginal token distribution. The model is literally trained to emit
+  "in/the/and/," when shown noise.
+
+At sampling time the ODE starts at t=1.0 in exactly that regime: the first
+steps write a noise-independent unigram-blend seed, and the (excellent)
+denoiser then faithfully amplifies that garbage seed into polished soup. This
+also explains why the stage-3 loss plateau was misread: the min-SNR-weighted
+loss was dominated by well-trained mid/low-t regions and could not show that
+the high-t region was dead.
+
+### Fix (validated at overfit scale, `overfit_v2_fixedloss.py`)
+
+Two lines in the objective, plus t-coverage:
+
+1. `weight = clamp(snr_flow, min=0.5, max=5.0)` (was min=1e-3) — forces the
+   model to learn noise-*dependent* prediction at high t.
+2. `ce_loss = (ce_per_sample * (1 − t)).mean()` — the CE anchor fades at high
+   noise instead of teaching unigram there.
+3. 50/50 uniform/logit-normal timestep sampling (logit-normal alone
+   undersamples t≈1).
+
+Result: free generation from pure noise went from pure unigram soup to
+locally-coherent memorized phrases. Remaining known gap: **global mode
+commitment** — the sample stitches fragments of different memorized rows
+(topic drift). Clamp trick and high-t-dense ODE schedules do not fix the
+drift; it appears to need training-scale exposure and/or architectural work
+(bidirectional Mamba's effective range through noise). For natural-language
+(non-memorization) generation, "locally coherent with drift" is the normal
+operating point of weak continuous text diffusion — categorically better than
+budget28's output.
+
+### Consequence for the budget28 checkpoint
+
+The dead zone lives in the **weights** (trained under the broken weighting), so
+no sampler patch can rescue `distill/final.pt` as-is. However, the ladder shows
+the 28B tokens bought a genuinely strong denoiser for t ≤ 0.9 on unseen text.
+A **repair finetune** — resume from `final.pt` with the fixed objective,
+oversampling high t — only needs to teach the thin t∈(0.9, 1.0] slice and is
+the cheapest plausible path to recovering the $358 investment (est. 1–4 H100
+hours to first signal, vs 100+ hours to retrain).
+
 ## Artifacts
 
 - Checkpoints: `checkpoints/{distill,sft,grpo}/final.pt` (+ `grpo/math/`).
 - Full log: `~/dimba_train.log` (filter `grep -vE "httpx|HTTP Request|cas-bridge|examples/s"`).
 - Inference test scripts (correct loaders, incl. flow sampler):
   scratchpad `infer_gpu_cmp.py`, `infer_flow.py`, `infer_cpu_multi.py`.
+- Root-cause experiment scripts (scratchpad, 2 Jul): `overfit_test.py`,
+  `clamp_sample_test.py`, `partial_noise_test.py`, `overfit_v2_fixedloss.py`,
+  `dense_schedule_test.py`; logs `~/dimba_overfit*.log`; trained probes
+  `overfit_model.pt`, `overfit_v2_model.pt` (scratchpad — ephemeral).
 - HF backup repo: `devnull37/d1-135m-50b` (private).
