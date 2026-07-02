@@ -161,6 +161,19 @@ _PRESETS: dict[str, dict] = {
         "subset":   "sample-100BT",  # same pool as budget28
         "desc": "3b-only continuation from distill_stage3a.pt (no frozen 3a re-run, no alignment)",
     },
+    # KD-on validation (docs/ROOT_CAUSE_BUDGET28.md): budget28's Stage 3 ran with
+    # kd_weight=0 (teacher unused for 28B tokens) and the loss plateaued by ~1.6B
+    # tokens at a unigram-only optimum. This preset tests fix #1 — teacher KD kept
+    # ON through Stage 3 — inside the same window where the plateau appeared, so a
+    # changed trajectory (or the same collapse) is visible within ~2B tokens.
+    "kdval2b": {
+        "frozen":   1_500_000_000,   # 1.5 B — the plateau window from budget28
+        "unfrozen":   500_000_000,   # 0.5 B low-LR FFN co-adaptation
+        "subset":   "sample-10BT",   # 2B < 10B → unique tokens, no looping
+        "kd_weight": 1.0,            # THE fix under test: teacher KD on in Stage 3
+        "align_steps": 2000,         # fix #4: 4× longer Stage-1/2 bridge (was 500)
+        "desc": "~2B tokens, Stage-3 KD ON — validates ROOT_CAUSE_BUDGET28 fix #1",
+    },
 }
 
 
@@ -180,6 +193,7 @@ def _build_stage3_phases(
     unfrozen_tokens: int,
     frozen_lr: float,
     unfrozen_lr: float,
+    kd_weight: float = 0.0,
 ) -> list:
     """Build Stage-3 phase dicts in the schema expected by DistillationTrainer.
 
@@ -194,7 +208,7 @@ def _build_stage3_phases(
             "steps":          _h100_steps_for_tokens(frozen_tokens),
             "lr":             frozen_lr,
             "freeze_ffn":     True,
-            "kd_weight":      0.0,
+            "kd_weight":      kd_weight,
             "ce_loss_weight": 1.0,
             "min_snr_gamma":  5.0,
         })
@@ -204,7 +218,7 @@ def _build_stage3_phases(
             "steps":          _h100_steps_for_tokens(unfrozen_tokens),
             "lr":             unfrozen_lr,
             "freeze_ffn":     False,
-            "kd_weight":      0.0,
+            "kd_weight":      kd_weight,
             "ce_loss_weight": 1.0,
             "min_snr_gamma":  5.0,
         })
@@ -267,8 +281,15 @@ def apply_h100_overrides(preset: str) -> None:
     # Replace the stage-3 entries with ones computed from H100 batch sizes.
     align_phases  = [s for s in _t4.DISTILL_CFG["stages"]
                      if s["name"] in ("stage1", "stage2")]
+    # align_steps: preset override for the Stage-1/2 alignment length. budget28's
+    # 500+500 steps were the only teacher bridge and stage2 ended at loss 0.556
+    # (not converged) — see docs/ROOT_CAUSE_BUDGET28.md fix #4.
+    if "align_steps" in budget:
+        for s in align_phases:
+            s["steps"] = budget["align_steps"]
     stage3_phases = _build_stage3_phases(frozen_tokens, unfrozen_tok,
-                                         frozen_lr, unfrozen_lr)
+                                         frozen_lr, unfrozen_lr,
+                                         kd_weight=budget.get("kd_weight", 0.0))
     _t4.DISTILL_CFG["stages"] = align_phases + stage3_phases
 
     logger.info(
