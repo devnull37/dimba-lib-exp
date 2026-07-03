@@ -29,8 +29,8 @@ from transformers import AutoTokenizer
 
 from dimba import DIMBA
 
-CKPT = "checkpoints/repair/repaired_final.pt"
-OUT_DIR = "checkpoints/masked_diffusion"
+CKPT = "checkpoints/masked_diffusion/mdm_final.pt"
+OUT_DIR = "checkpoints/masked_diffusion2"
 SEQ_LEN = 512
 LR = 1e-4
 WARMUP = 200
@@ -58,11 +58,14 @@ class PackedChunks(Dataset):
         return self.stream[i * self.seq_len:(i + 1) * self.seq_len]
 
 
-def build_stream(tokenizer, n_docs: int) -> torch.Tensor:
+def build_stream(tokenizer, n_docs: int, skip_docs: int = 0) -> torch.Tensor:
     from datasets import load_dataset
-    print(f"streaming FineWeb sample-10BT, caching {n_docs} docs ...", flush=True)
+    print(f"streaming FineWeb sample-10BT, skipping {skip_docs}, "
+          f"caching {n_docs} docs ...", flush=True)
     ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT",
                       split="train", streaming=True)
+    if skip_docs:
+        ds = ds.skip(skip_docs)
     eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
     chunks = []
     for i, row in enumerate(ds):
@@ -167,6 +170,7 @@ def main():
     ap.add_argument("--steps", type=int, default=40000)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--docs", type=int, default=200_000)
+    ap.add_argument("--skip-docs", type=int, default=0)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.smoke:
@@ -178,12 +182,16 @@ def main():
     cfg = dict(ck["config"])
     sd = ck["model_state_dict"]
     emb_key = next(k for k in sd if k.endswith("token_embed.embedding.weight"))
-    old_vocab = sd[emb_key].shape[0]
-    mask_id = old_vocab
-    # one new row for [MASK], init = mean embedding (head is tied, so this is all)
-    sd[emb_key] = torch.cat([sd[emb_key],
-                             sd[emb_key].mean(dim=0, keepdim=True)], dim=0)
-    cfg["vocab_size"] = old_vocab + 1
+    if "mask_id" in ck:
+        # resuming a masked-diffusion checkpoint: [MASK] row already present
+        mask_id = ck["mask_id"]
+    else:
+        old_vocab = sd[emb_key].shape[0]
+        mask_id = old_vocab
+        # one new row for [MASK], init = mean embedding (head is tied, so this is all)
+        sd[emb_key] = torch.cat([sd[emb_key],
+                                 sd[emb_key].mean(dim=0, keepdim=True)], dim=0)
+        cfg["vocab_size"] = old_vocab + 1
     sig = set(inspect.signature(DIMBA.__init__).parameters) - {"self"}
     model = DIMBA(**{k: v for k, v in cfg.items() if k in sig})
     miss, unexp = model.load_state_dict(sd, strict=False)
@@ -193,7 +201,7 @@ def main():
     model = model.to(DEVICE).to(torch.bfloat16)
     del ck, sd
 
-    stream = build_stream(tokenizer, args.docs)
+    stream = build_stream(tokenizer, args.docs, args.skip_docs)
     loader = DataLoader(PackedChunks(stream, SEQ_LEN), batch_size=args.batch,
                         shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 
