@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 from dimba import DIMBA
 
 CKPT = "checkpoints/masked_diffusion/mdm_latest.pt"
-OUT_DIR = "checkpoints/mdm_sft"
+OUT_DIR = "checkpoints/mdm_sft2"
 SEQ_LEN = 256
 LR = 5e-5
 WARMUP = 100
@@ -41,16 +41,16 @@ EVAL_PROMPTS = [
 
 
 class SFTRows(Dataset):
-    """Fixed-length rows + prompt lengths, prebuilt on CPU."""
+    """Fixed-length rows + prompt/response lengths, prebuilt on CPU."""
 
-    def __init__(self, rows: torch.Tensor, plens: torch.Tensor):
-        self.rows, self.plens = rows, plens
+    def __init__(self, rows, plens, rlens):
+        self.rows, self.plens, self.rlens = rows, plens, rlens
 
     def __len__(self):
         return self.rows.shape[0]
 
     def __getitem__(self, i):
-        return self.rows[i], self.plens[i]
+        return self.rows[i], self.plens[i], self.rlens[i]
 
 
 def build_sft_rows(tokenizer):
@@ -58,7 +58,7 @@ def build_sft_rows(tokenizer):
     print("loading tatsu-lab/alpaca ...", flush=True)
     ds = load_dataset("tatsu-lab/alpaca", split="train")
     eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-    rows, plens = [], []
+    rows, plens, rlens = [], [], []
     for ex in ds:
         q = ex["instruction"]
         if ex.get("input"):
@@ -68,20 +68,25 @@ def build_sft_rows(tokenizer):
         if len(p) >= SEQ_LEN - 8:  # need room for at least a stub answer
             continue
         row = (p + r)[:SEQ_LEN - 1] + [eos]
+        rlen = len(row)  # content + exactly one EOS; padding beyond is NOT trained
         row = row + [eos] * (SEQ_LEN - len(row))
         rows.append(row)
         plens.append(len(p))
+        rlens.append(rlen)
     rows = torch.tensor(rows, dtype=torch.long)
     plens = torch.tensor(plens, dtype=torch.long)
+    rlens = torch.tensor(rlens, dtype=torch.long)
     print(f"SFT rows: {rows.shape[0]} x {SEQ_LEN}", flush=True)
-    return SFTRows(rows, plens)
+    return SFTRows(rows, plens, rlens)
 
 
-def sft_loss(model, rows, plens, mask_id: int):
+def sft_loss(model, rows, plens, rlens, mask_id: int):
     B, L = rows.shape
     t = torch.rand(B, device=rows.device) * (1.0 - T_MIN) + T_MIN
     pos = torch.arange(L, device=rows.device)[None, :]
-    resp = pos >= plens[:, None]                      # response region (incl. EOS pad)
+    # response + first EOS only; v1 trained the whole EOS pad tail and the
+    # model collapsed to predicting EOS everywhere (empty answers)
+    resp = (pos >= plens[:, None]) & (pos < rlens[:, None])
     mask = (torch.rand(B, L, device=rows.device) < t[:, None]) & resp
     none_masked = ~mask.any(dim=1)
     if none_masked.any():
@@ -188,13 +193,14 @@ def main():
     step, t0, it = 0, time.time(), iter(loader)
     while step < args.steps:
         try:
-            rows, plens = next(it)
+            rows, plens, rlens = next(it)
         except StopIteration:
             it = iter(loader)
-            rows, plens = next(it)
+            rows, plens, rlens = next(it)
         rows = rows.to(DEVICE, non_blocking=True)
         plens = plens.to(DEVICE, non_blocking=True)
-        loss, parts = sft_loss(model, rows, plens, mask_id)
+        rlens = rlens.to(DEVICE, non_blocking=True)
+        loss, parts = sft_loss(model, rows, plens, rlens, mask_id)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
