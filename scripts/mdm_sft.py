@@ -24,8 +24,8 @@ from transformers import AutoTokenizer
 
 from dimba import DIMBA
 
-CKPT = "checkpoints/masked_diffusion/mdm_latest.pt"
-OUT_DIR = "checkpoints/mdm_sft2"
+CKPT = "checkpoints/masked_diffusion2/mdm_latest.pt"
+OUT_DIR = "checkpoints/mdm2_sft"
 SEQ_LEN = 256
 LR = 5e-5
 WARMUP = 100
