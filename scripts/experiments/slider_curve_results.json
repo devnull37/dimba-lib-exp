@@ -1,0 +1,2562 @@
+{
+  "meta": {
+    "seed": 11,
+    "quality_levels": [
+      0.1,
+      0.3,
+      0.5,
+      0.7,
+      0.9,
+      1.0
+    ],
+    "n_questions": 40,
+    "wall_clock_total_s": 2983.689966917038
+  },
+  "curve": [
+    {
+      "Q": 0.1,
+      "steps": 21,
+      "n": 1,
+      "accuracy": 0.075,
+      "median_s_per_answer": 2.2313305139541626,
+      "total_s": 94.63449430465698,
+      "hits": [
+        {
+          "idx": 0,
+          "question": "What is the capital of France?",
+          "keywords": [
+            "paris"
+          ],
+          "answer": " Parisville is Paris, Paris, France, France, France, Paris, France, France and France. Russia is India is Paris is in Paris or in London, London and London. Russia\n\n",
+          "hit": true,
+          "seconds": 7.584911823272705
+        },
+        {
+          "idx": 1,
+          "question": "What is the capital of Japan?",
+          "keywords": [
+            "tokyo"
+          ],
+          "answer": " The capital of China India is Paris is Paris, Paris, France, France, France, France, Italy and China and China and Japan. The South Africa. South Africa is in India of India.",
+          "hit": false,
+          "seconds": 2.2377705574035645
+        },
+        {
+          "idx": 2,
+          "question": "What is the capital of Italy?",
+          "keywords": [
+            "rome"
+          ],
+          "answer": " The European capital is Paris, Paris, Paris, France, France, France, Italy. Russia is China is Europe in China. China is in Germany and Russia is China, India and India.\n",
+          "hit": false,
+          "seconds": 2.238041400909424
+        },
+        {
+          "idx": 3,
+          "question": "What is the capital of Egypt?",
+          "keywords": [
+            "cairo"
+          ],
+          "answer": " Paris China is the largest the capital of France is Paris, Paris Paris, France, France, France and China Europe. China, Japan, India and South Africa is in Europe of the European Egypt.",
+          "hit": false,
+          "seconds": 2.2354791164398193
+        },
+        {
+          "idx": 4,
+          "question": "What is the capital of Germany?",
+          "keywords": [
+            "berlin"
+          ],
+          "answer": " The European capital of Paris is Paris is the capital of of America in Paris, France, France, France, France and Europe, Europe, European Europe and Russia are China in Russia and India.\n",
+          "hit": false,
+          "seconds": 2.2300140857696533
+        },
+        {
+          "idx": 5,
+          "question": "What is the capital of Australia?",
+          "keywords": [
+            "canberra"
+          ],
+          "answer": " The capital of Paris Africa is Paris is Paris, the capital of Paris is Paris.\n\nIn China China in China is the cities of France, France, France, France, and India.\n",
+          "hit": false,
+          "seconds": 2.2334699630737305
+        },
+        {
+          "idx": 6,
+          "question": "What is the capital of Brazil?",
+          "keywords": [
+            "brasilia"
+          ],
+          "answer": " The capital of of Paris is Paris is Paris in the capital of Paris, Paris, France, France China France. The European India and Japan, Japan, France, France, and in Russia.\n",
+          "hit": false,
+          "seconds": 2.2273786067962646
+        },
+        {
+          "idx": 7,
+          "question": "What is the capital of Canada?",
+          "keywords": [
+            "ottawa"
+          ],
+          "answer": " Paris is Paris is Paris, Paris, France, France, France, France, France and Europe Europe in China, China. Japan is Germany, London in London, London and London. Russia\nM",
+          "hit": false,
+          "seconds": 2.229875087738037
+        },
+        {
+          "idx": 8,
+          "question": "What is the capital of Spain?",
+          "keywords": [
+            "madrid"
+          ],
+          "answer": " The capital of in Paris is that the capital of Paris is Paris, Paris, France, France, France, France. Russia and China is Europe Europe in Japan Africa, Spain and Russia and China.",
+          "hit": false,
+          "seconds": 2.2313718795776367
+        },
+        {
+          "idx": 9,
+          "question": "What is the capital of China?",
+          "keywords": [
+            "beijing"
+          ],
+          "answer": " France is Paris is Paris, Paris, France, France, France, Italy, in China China, China, Japan and Japan. India. European European Europe and in Japan as part of China and India",
+          "hit": false,
+          "seconds": 2.2467708587646484
+        },
+        {
+          "idx": 10,
+          "question": "What color is the sky on a clear day?",
+          "keywords": [
+            "blue"
+          ],
+          "answer": " The blue sky is a bright green green.. sky is a bright blue blue, dark, dark red light, light light bright light in the dark sky in the sky in the sky. The sky",
+          "hit": true,
+          "seconds": 2.2362940311431885
+        },
+        {
+          "idx": 11,
+          "question": "What color is grass?",
+          "keywords": [
+            "green"
+          ],
+          "answer": " The color of red colors in blue colors is blue, the blue color is the colour and colour colour. colour colour ofcolor color is red color. The color is the color in color.\n\n",
+          "hit": false,
+          "seconds": 2.254142999649048
+        },
+        {
+          "idx": 12,
+          "question": "What color is blood?",
+          "keywords": [
+            "red"
+          ],
+          "answer": " Blood is blood and blood, and blood pressure in which heart protects the skin skin in the skin. It also is heart: blood, blood, blood, blood, blood, blood, and water.",
+          "hit": false,
+          "seconds": 2.2345376014709473
+        },
+        {
+          "idx": 13,
+          "question": "What color is snow?",
+          "keywords": [
+            "white"
+          ],
+          "answer": " The sun sun is dark blue and dark blue water in the rain: snow, snow, mountains, and water..\nCold water: snow, snow, snow, snow and snow.\nThe",
+          "hit": false,
+          "seconds": 2.2427196502685547
+        },
+        {
+          "idx": 14,
+          "question": "What color is coal?",
+          "keywords": [
+            "black"
+          ],
+          "answer": " The coal used in coal oil is an oil is an oil and olive oil in the oil.\nThe oil is gas, gas, gas, gas, gas, carbon fuel, and carbon fuel.",
+          "hit": false,
+          "seconds": 2.2419843673706055
+        },
+        {
+          "idx": 15,
+          "question": "What is water made of?",
+          "keywords": [
+            "hydrogen",
+            "oxygen"
+          ],
+          "answer": " Water is used in water water, drinking water and water, which causes the water water. Water is is used to produce gas energy gas in the water, reducing the water and its water levels.\n",
+          "hit": false,
+          "seconds": 2.2371346950531006
+        },
+        {
+          "idx": 16,
+          "question": "In which direction does the sun rise?",
+          "keywords": [
+            "east"
+          ],
+          "answer": " The sun is the sun, with a light shade of sunlight in the sun, and sunlight, and light sun.\nThis is the darkness of sunlight in the sun of the sun.\n\nThe",
+          "hit": false,
+          "seconds": 2.2263519763946533
+        },
+        {
+          "idx": 17,
+          "question": "What gas do humans need to breathe?",
+          "keywords": [
+            "oxygen"
+          ],
+          "answer": " There are people deaths that causes people who share their lives, because they are suffering, because they decrease their lives against them, because they have their death deaths and deaths deaths in their deaths.\n\n",
+          "hit": false,
+          "seconds": 2.231466770172119
+        },
+        {
+          "idx": 18,
+          "question": "What planet do we live on?",
+          "keywords": [
+            "earth"
+          ],
+          "answer": " The planet of our planet, our planet is a planet, and humanity, and the world around our world. Come in our vast world around the world around the world around the world.\n\nWorld",
+          "hit": false,
+          "seconds": 2.223189353942871
+        },
+        {
+          "idx": 19,
+          "question": "How many days are in a week?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The summer day is the summer day in the morning morning in the morning morning. The afternoon Friday morning, five days last week, a week afternoon, and a week in the summer last week.\n",
+          "hit": false,
+          "seconds": 2.2264134883880615
+        },
+        {
+          "idx": 20,
+          "question": "What is 2 plus 3?",
+          "keywords": [
+            "five",
+            "5"
+          ],
+          "answer": " 12 + 4 + +84 + 44 + 30 + +23 +  12 + 30 + 12 = 8.\n",
+          "hit": false,
+          "seconds": 2.2304441928863525
+        },
+        {
+          "idx": 21,
+          "question": "What is 4 times 4?",
+          "keywords": [
+            "sixteen",
+            "16"
+          ],
+          "answer": " 10 + 54 = 39 = 24 = 10 = 30 + 35 = 20 + 15 = -4\n\n",
+          "hit": false,
+          "seconds": 2.2227630615234375
+        },
+        {
+          "idx": 22,
+          "question": "What is 10 minus 3?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " 10 + 10 = 100 = = 20 = 20cm.\n\nThe total: Half of 23 centimeters of a total.\n3",
+          "hit": false,
+          "seconds": 2.2283639907836914
+        },
+        {
+          "idx": 23,
+          "question": "What is 6 divided by 2?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " 12, 26, 27, 46, 36, 33.4 = 14 + 73 = 135.\n",
+          "hit": true,
+          "seconds": 2.2361598014831543
+        },
+        {
+          "idx": 24,
+          "question": "What is 5 times 5?",
+          "keywords": [
+            "twenty-five",
+            "25"
+          ],
+          "answer": " 55 - 35 = 29 = 40 - 6 = -240 = -120 - 11.\n\n3. - 2",
+          "hit": false,
+          "seconds": 2.2278988361358643
+        },
+        {
+          "idx": 25,
+          "question": "What sound does a dog make?",
+          "keywords": [
+            "bark",
+            "woof"
+          ],
+          "answer": " A dog, a dog or a dog is a cat or a car car.\nThe car in the is:\nSo, the dog, a cat, cat,, and the dog.\n",
+          "hit": false,
+          "seconds": 2.232448101043701
+        },
+        {
+          "idx": 26,
+          "question": "What do cows produce?",
+          "keywords": [
+            "milk"
+          ],
+          "answer": " 12 people are 2: 120 people. by 2000 people in their their lives.\n-, they of the dogs and their numbers are:\n1",
+          "hit": false,
+          "seconds": 2.2293214797973633
+        },
+        {
+          "idx": 27,
+          "question": "What is the largest land animal?",
+          "keywords": [
+            "elephant"
+          ],
+          "answer": " The animal population is an animal that is the largest of the species of human species and the human population of all human species. The animals are land, land, land, land, etc, which is",
+          "hit": false,
+          "seconds": 2.2225637435913086
+        },
+        {
+          "idx": 28,
+          "question": "What animal is known as man's best friend?",
+          "keywords": [
+            "dog"
+          ],
+          "answer": " The man is a man who is a human man, a woman, boy, young woman, and the person of any man.. TheThe woman is like a woman as a human man.\n",
+          "hit": false,
+          "seconds": 2.2295308113098145
+        },
+        {
+          "idx": 29,
+          "question": "Where do fish live?",
+          "keywords": [
+            "water",
+            "sea",
+            "ocean",
+            "river"
+          ],
+          "answer": " Fish, fish, fish, fish, fish, fish and fish:\nFish.\n* Fish: Fish:\n* These are: 11 fish in fish.\n5. Self-",
+          "hit": false,
+          "seconds": 2.2292280197143555
+        },
+        {
+          "idx": 30,
+          "question": "What is the largest ocean?",
+          "keywords": [
+            "pacific"
+          ],
+          "answer": " The largest ocean is the largest largest largest cities of the world, its vast oceans and oceans. It also is Africa. Its Africa is its vast sea,, oceans, and its oceans. It is",
+          "hit": false,
+          "seconds": 2.221993923187256
+        },
+        {
+          "idx": 31,
+          "question": "What is the longest river in the world?",
+          "keywords": [
+            "nile"
+          ],
+          "answer": " The river river is the vast majority of the river which is the vast majority of the oceans surrounding.\n the forests are vast forests, forests, rivers, rivers, rivers, rivers and rivers.\n",
+          "hit": false,
+          "seconds": 2.2240848541259766
+        },
+        {
+          "idx": 32,
+          "question": "On which continent is the Sahara desert?",
+          "keywords": [
+            "africa"
+          ],
+          "answer": " The river river is the vast sea in the sea.\nThe oceans is where the mountains all of the mountains are forests in forests and rivers, rivers, rivers, rivers, rivers and rivers..",
+          "hit": false,
+          "seconds": 2.231874465942383
+        },
+        {
+          "idx": 33,
+          "question": "What is the tallest mountain in the world?",
+          "keywords": [
+            "everest"
+          ],
+          "answer": " The mountain is is a large city of the city, which is rivers, rivers, and mountains in the mountains. It is a giant mountain mountains, the roots of the mountain in the world is.",
+          "hit": false,
+          "seconds": 2.2304131984710693
+        },
+        {
+          "idx": 34,
+          "question": "How many continents are there?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The United continent is the world around the world is the world. There are two major countries in the world are located in the world, including are in many different countries, and other countries.\n\n",
+          "hit": false,
+          "seconds": 2.2283987998962402
+        },
+        {
+          "idx": 35,
+          "question": "How many sides does a triangle have?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " There are two sides of sides,, 24 inches, 2 inches each.\nThe sides of the circle is 4 meters = 11 = 5 inches.\n\nThe",
+          "hit": false,
+          "seconds": 2.2322723865509033
+        },
+        {
+          "idx": 36,
+          "question": "What is the boiling point of water in Celsius?",
+          "keywords": [
+            "100"
+          ],
+          "answer": " If water is temperature, large amount of water is the amount of water to be used to decrease the amount of water in the water in the water.\nThe temperature of length is::\nP",
+          "hit": false,
+          "seconds": 2.233869791030884
+        },
+        {
+          "idx": 37,
+          "question": "How many hours are in a day?",
+          "keywords": [
+            "twenty-four",
+            "24"
+          ],
+          "answer": " One day is a day day, lasts 3 hours of hours, days, and days in few days.\nAn afternoon morning, morning morning morning morning is 10 hours per day.\n",
+          "hit": false,
+          "seconds": 2.2302963733673096
+        },
+        {
+          "idx": 38,
+          "question": "What is the chemical symbol for gold?",
+          "keywords": [
+            "au"
+          ],
+          "answer": " The gold is gold and gold is the core of the core. The planet is it is a planet that has its roots of Earth which makes it in the gold and its roots.\n\n3.",
+          "hit": false,
+          "seconds": 2.2312891483306885
+        },
+        {
+          "idx": 39,
+          "question": "Who wrote Romeo and Juliet?",
+          "keywords": [
+            "shakespeare"
+          ],
+          "answer": " John was father, Sarah, Harry, and Joe and Mary Mary with her father in Rome..\n Mr. John was born in Paris, but her father, James, and his father. John",
+          "hit": false,
+          "seconds": 2.2319610118865967
+        }
+      ]
+    },
+    {
+      "Q": 0.3,
+      "steps": 37,
+      "n": 1,
+      "accuracy": 0.175,
+      "median_s_per_answer": 3.919488310813904,
+      "total_s": 157.6032555103302,
+      "hits": [
+        {
+          "idx": 0,
+          "question": "What is the capital of France?",
+          "keywords": [
+            "paris"
+          ],
+          "answer": " Parisville is Paris, Paris, France, France, France, France and France, Europe, Africa, Europe, Europe, Europe and India. Russia is Paris to Paris and in the European countries.",
+          "hit": true,
+          "seconds": 3.927363395690918
+        },
+        {
+          "idx": 1,
+          "question": "What is the capital of Japan?",
+          "keywords": [
+            "tokyo"
+          ],
+          "answer": " The capital of France is the largest city of Paris is Paris, Paris, France, France, France. Europe Europe, China and China are India. China. in China is Japan in Japan, Russia",
+          "hit": false,
+          "seconds": 3.91995906829834
+        },
+        {
+          "idx": 2,
+          "question": "What is the capital of Italy?",
+          "keywords": [
+            "rome"
+          ],
+          "answer": " Europe is Europe is Paris, Paris, France, France, France, France, and China, and China. Russia is Nigeria and Africa and Europe in Paris to the Paris region of India. India.",
+          "hit": false,
+          "seconds": 3.9189915657043457
+        },
+        {
+          "idx": 3,
+          "question": "What is the capital of Egypt?",
+          "keywords": [
+            "cairo"
+          ],
+          "answer": " Paris Africa is Russia that the capital of France is Paris, France, France, France, France, Europe and Europe in Paris, Paris, France, and Russia in Paris. China is China China.",
+          "hit": false,
+          "seconds": 3.9239046573638916
+        },
+        {
+          "idx": 4,
+          "question": "What is the capital of Germany?",
+          "keywords": [
+            "berlin"
+          ],
+          "answer": " The European capital of Paris is Paris, Paris, France, France, France, France and Europe, Europe, France and European Africa. China is Paris to Europe in Europe in Europe and European countries.",
+          "hit": false,
+          "seconds": 3.9211978912353516
+        },
+        {
+          "idx": 5,
+          "question": "What is the capital of Australia?",
+          "keywords": [
+            "canberra"
+          ],
+          "answer": " The capital of Paris France is Paris, Paris, Paris, France, France, France, France, Italy and China. Russia and China are India in China India is China is India and India.\n",
+          "hit": false,
+          "seconds": 3.9194562435150146
+        },
+        {
+          "idx": 6,
+          "question": "What is the capital of Brazil?",
+          "keywords": [
+            "brasilia"
+          ],
+          "answer": " The capital capital of Paris Paris is part of the capital of France is Paris and France in Paris. Paris and is Paris, from Japan, France, France, France, India and South America.\n",
+          "hit": false,
+          "seconds": 3.9222443103790283
+        },
+        {
+          "idx": 7,
+          "question": "What is the capital of Canada?",
+          "keywords": [
+            "ottawa"
+          ],
+          "answer": " Paris is Paris is Paris, Paris, France, France, France, France, China, and India. India is China and South Africa are India and China. Israel Brazil is the country of India.",
+          "hit": false,
+          "seconds": 3.9262852668762207
+        },
+        {
+          "idx": 8,
+          "question": "What is the capital of Spain?",
+          "keywords": [
+            "madrid"
+          ],
+          "answer": " The European Europe is Paris, Paris, France, France, France, France and Europe. Europe and Italy, Italy in Paris and is Paris. Russia is located in Paris to London and England.\n",
+          "hit": false,
+          "seconds": 3.9243011474609375
+        },
+        {
+          "idx": 9,
+          "question": "What is the capital of China?",
+          "keywords": [
+            "beijing"
+          ],
+          "answer": " Germany of France is Paris, Paris, France, France, France, and China. In China, China, Japan and Japan in Paris is located in Europe and European Europe in Europe and European Europe.",
+          "hit": false,
+          "seconds": 3.931330680847168
+        },
+        {
+          "idx": 10,
+          "question": "What color is the sky on a clear day?",
+          "keywords": [
+            "blue"
+          ],
+          "answer": " The sunlight in the sky is a bright blue blue on the sky.\nThe sunlight bright light of light light is a bright dark sky. The sky on the sky in the sky is sky",
+          "hit": true,
+          "seconds": 3.9216866493225098
+        },
+        {
+          "idx": 11,
+          "question": "What color is grass?",
+          "keywords": [
+            "green"
+          ],
+          "answer": " The color of color color is blue. The blue color and blue color is made of green colors are yellow colors, black yellow, yellow, blue, blue, red red and red colors.\n\n",
+          "hit": true,
+          "seconds": 3.9170854091644287
+        },
+        {
+          "idx": 12,
+          "question": "What color is blood?",
+          "keywords": [
+            "red"
+          ],
+          "answer": " Blood is blood and blood pressure in the body body. Blood is is carbon. The body includes: The heart is heart: blood, blood, blood, blood, blood, blood, and hair.",
+          "hit": false,
+          "seconds": 3.920605421066284
+        },
+        {
+          "idx": 13,
+          "question": "What color is snow?",
+          "keywords": [
+            "white"
+          ],
+          "answer": " The color is blue and blue. The color is dark and blue colors with colors the color in color. Color color. Color: snow, snow, snow, snow, snow and snow.\n\n",
+          "hit": false,
+          "seconds": 3.918205499649048
+        },
+        {
+          "idx": 14,
+          "question": "What color is coal?",
+          "keywords": [
+            "black"
+          ],
+          "answer": " Oil oil is oil oil in coal, coal, coal, oil, olive oil, and oil in hydrogen oil is a gas of hydrogen and hydrogen fuel gas as gas gas and gas fuel gas.\n",
+          "hit": false,
+          "seconds": 3.915010929107666
+        },
+        {
+          "idx": 15,
+          "question": "What is water made of?",
+          "keywords": [
+            "hydrogen",
+            "oxygen"
+          ],
+          "answer": " Water is used in water water, drinking water, and water water is used to drink water. Water and Water. If the water is full of water, consuming the water and drinking water.\n\n",
+          "hit": false,
+          "seconds": 3.916254758834839
+        },
+        {
+          "idx": 16,
+          "question": "In which direction does the sun rise?",
+          "keywords": [
+            "east"
+          ],
+          "answer": " The sun is that the sun is a sun, and light light. light light of rain is a warmth of sunlight in the sun, which contains the sunlight of sunlight in the sun, and the sun",
+          "hit": false,
+          "seconds": 3.9111218452453613
+        },
+        {
+          "idx": 17,
+          "question": "What gas do humans need to breathe?",
+          "keywords": [
+            "oxygen"
+          ],
+          "answer": " There are many deaths in their lives because they have their living lives in their lives because they are killed by death in deaths, deaths, deaths, deaths, death, death, and death.\nThe",
+          "hit": false,
+          "seconds": 3.9234488010406494
+        },
+        {
+          "idx": 18,
+          "question": "What planet do we live on?",
+          "keywords": [
+            "earth"
+          ],
+          "answer": " The planet of our planet is a world.\nWorld is our world, we live to in our world around the world where we live in the world around the world around the world.\n\nWe",
+          "hit": false,
+          "seconds": 3.919520378112793
+        },
+        {
+          "idx": 19,
+          "question": "How many days are in a week?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The summer day in the summer day in the morning morning morning morning in the morning morning.\nThe afternoon afternoon lasts 2 days a week, so for a week and evening for a week.\n",
+          "hit": false,
+          "seconds": 3.9283692836761475
+        },
+        {
+          "idx": 20,
+          "question": "What is 2 plus 3?",
+          "keywords": [
+            "five",
+            "5"
+          ],
+          "answer": " 12 + 3x + 3 + + 2 + 4++3+24 x + 5 + 12 = 16 = 5.\n",
+          "hit": true,
+          "seconds": 3.929502248764038
+        },
+        {
+          "idx": 21,
+          "question": "What is 4 times 4?",
+          "keywords": [
+            "sixteen",
+            "16"
+          ],
+          "answer": " 42 + 36 = 36 = 62 = 14 = 12 = 50 + 75 = 10 = 5\nThe",
+          "hit": false,
+          "seconds": 3.973651170730591
+        },
+        {
+          "idx": 22,
+          "question": "What is 10 minus 3?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " 10 + 30 + 10 = 10 = 20 = 20\nTotal: The total of 26 = 34 minutes.\n3",
+          "hit": false,
+          "seconds": 4.675202369689941
+        },
+        {
+          "idx": 23,
+          "question": "What is 6 divided by 2?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " 12, 46, 26, 25, 37 is are divided by 3.5, divided by 3 = 1144.\n",
+          "hit": true,
+          "seconds": 3.9260692596435547
+        },
+        {
+          "idx": 24,
+          "question": "What is 5 times 5?",
+          "keywords": [
+            "twenty-five",
+            "25"
+          ],
+          "answer": " 25 - 35 = 25 = 15 = 144 - 49 = -39 - 92 = -36\n\n6.",
+          "hit": true,
+          "seconds": 3.9126996994018555
+        },
+        {
+          "idx": 25,
+          "question": "What sound does a dog make?",
+          "keywords": [
+            "bark",
+            "woof"
+          ],
+          "answer": " A dog, a dog or a dog that is:\nA. A: A dog, a dog, cat, and cat.\nP. \nB. \nA. \n",
+          "hit": false,
+          "seconds": 3.910195827484131
+        },
+        {
+          "idx": 26,
+          "question": "What do cows produce?",
+          "keywords": [
+            "milk"
+          ],
+          "answer": " 10 people are 10 in 2016,000 people in 1996.\n9.57 by 2020.\n5",
+          "hit": false,
+          "seconds": 3.917219638824463
+        },
+        {
+          "idx": 27,
+          "question": "What is the largest land animal?",
+          "keywords": [
+            "elephant"
+          ],
+          "answer": " The animal population is a large population, which is a large population of human species. The population is a population of its species, and its roots in the human population, the population of the population.",
+          "hit": false,
+          "seconds": 3.9128897190093994
+        },
+        {
+          "idx": 28,
+          "question": "What animal is known as man's best friend?",
+          "keywords": [
+            "dog"
+          ],
+          "answer": " The man who the woman is a woman who is an old man and young man. She is a young woman, who is an elderly woman, as a woman as a man and a man.\n",
+          "hit": false,
+          "seconds": 3.909044027328491
+        },
+        {
+          "idx": 29,
+          "question": "Where do fish live?",
+          "keywords": [
+            "water",
+            "sea",
+            "ocean",
+            "river"
+          ],
+          "answer": " Fish, fish, fish, fish, fish, fish, and fish;;\n* Answer: \n4. The answer are:\n5.\nThe answer are: 100",
+          "hit": false,
+          "seconds": 3.918107032775879
+        },
+        {
+          "idx": 30,
+          "question": "What is the largest ocean?",
+          "keywords": [
+            "pacific"
+          ],
+          "answer": " The largest ocean is the largest part of the world.\nThe vast ocean is the largest part of the world in its world. In this century, is the 18th century, which is",
+          "hit": false,
+          "seconds": 3.9187240600585938
+        },
+        {
+          "idx": 31,
+          "question": "What is the longest river in the world?",
+          "keywords": [
+            "nile"
+          ],
+          "answer": " The river river is the vast seas of the oceans. the oceans are vast vast of forests and forests are forests and forests, forests, rivers, rivers, rivers, rivers, rivers and rivers.\n",
+          "hit": false,
+          "seconds": 3.9109482765197754
+        },
+        {
+          "idx": 32,
+          "question": "On which continent is the Sahara desert?",
+          "keywords": [
+            "africa"
+          ],
+          "answer": " The north coast of Africa, is the Asia Ocean Europe is the north coast of South Africa. and the South North North, North Carolina, South Africa, Africa, Mexico, and its southern sea.",
+          "hit": true,
+          "seconds": 3.914442777633667
+        },
+        {
+          "idx": 33,
+          "question": "What is the tallest mountain in the world?",
+          "keywords": [
+            "everest"
+          ],
+          "answer": " The mountain is the coast of the mountain, which is a giant mountain hill in the mountains, the mountains in the mountains, and the sea is a vast tree, and its vast forests.\nThe",
+          "hit": false,
+          "seconds": 3.9171359539031982
+        },
+        {
+          "idx": 34,
+          "question": "How many continents are there?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The United continent that are Europe in Europe, Germany, Asia, and many countries, countries, and other countries.\nMost countries are there are so many different countries, and in many different countries.",
+          "hit": false,
+          "seconds": 3.931638479232788
+        },
+        {
+          "idx": 35,
+          "question": "How many sides does a triangle have?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " There are billions of apples, oranges, oranges, oranges, and apples, and other fruits from the fruits. These fruits are found in the apples are two pieces of apples and raw oranges.\n\n",
+          "hit": false,
+          "seconds": 3.9283385276794434
+        },
+        {
+          "idx": 36,
+          "question": "What is the boiling point of water in Celsius?",
+          "keywords": [
+            "100"
+          ],
+          "answer": " If boiling water is due to milk, the amount of water water is to increase the amount of water in the water of the water in the water.\nTherefore, then there is something to make up",
+          "hit": false,
+          "seconds": 3.9181902408599854
+        },
+        {
+          "idx": 37,
+          "question": "How many hours are in a day?",
+          "keywords": [
+            "twenty-four",
+            "24"
+          ],
+          "answer": " One day day is a day, about 10 hours, 10 days in the days are six days, five days per hour hours, and takes 20 hours per day.\n",
+          "hit": false,
+          "seconds": 3.917743444442749
+        },
+        {
+          "idx": 38,
+          "question": "What is the chemical symbol for gold?",
+          "keywords": [
+            "au"
+          ],
+          "answer": " The gold is a gold. gold is a chemical molecule, which is a chemical chemical that it is true. The atom is part of the core of the atoms, atoms, and its natural chemicals.",
+          "hit": false,
+          "seconds": 3.9152653217315674
+        },
+        {
+          "idx": 39,
+          "question": "Who wrote Romeo and Juliet?",
+          "keywords": [
+            "shakespeare"
+          ],
+          "answer": " John was father, William, William, Jean, and Mr. John was born in the father. Mr. John was born in Mary's mother and his father in Paris, and his father. John",
+          "hit": false,
+          "seconds": 3.9199042320251465
+        }
+      ]
+    },
+    {
+      "Q": 0.5,
+      "steps": 64,
+      "n": 2,
+      "accuracy": 0.1,
+      "median_s_per_answer": 7.111631274223328,
+      "total_s": 284.47941303253174,
+      "hits": [
+        {
+          "idx": 0,
+          "question": "What is the capital of France?",
+          "keywords": [
+            "paris"
+          ],
+          "answer": " Paris Rome is Paris to Paris, Paris, France, France, France, France, France and China India is China. Russia and China Britain is China in Europe, Europe, Europe and European Europe.",
+          "hit": true,
+          "seconds": 7.240601062774658
+        },
+        {
+          "idx": 1,
+          "question": "What is the capital of Japan?",
+          "keywords": [
+            "tokyo"
+          ],
+          "answer": " The capital of the Paris capital is the capital of Paris is Paris. Russia, Russia is China and China. The China is Japan currency in Japan, Japan, France, France, France, France.",
+          "hit": false,
+          "seconds": 7.1159656047821045
+        },
+        {
+          "idx": 2,
+          "question": "What is the capital of Italy?",
+          "keywords": [
+            "rome"
+          ],
+          "answer": " The European capital is Paris. Paris is the capital of Paris, France, France, France, France, France and the Europe and is Europe. Russia is part of Paris and in Paris. Russia has",
+          "hit": false,
+          "seconds": 7.11225152015686
+        },
+        {
+          "idx": 3,
+          "question": "What is the capital of Egypt?",
+          "keywords": [
+            "cairo"
+          ],
+          "answer": " Paris Africa is the capital of France of France, Paris, France, France, South Africa, South Africa and South Africa.\nThe capital of India China is China in Paris, India is India.",
+          "hit": false,
+          "seconds": 7.09526515007019
+        },
+        {
+          "idx": 4,
+          "question": "What is the capital of Germany?",
+          "keywords": [
+            "berlin"
+          ],
+          "answer": " The European capital of Paris is Paris in Paris, France, France, France, the UK China is the Netherlands of Europe and Europe in Paris and is Paris. Russia is Europe and the European Europe.",
+          "hit": false,
+          "seconds": 7.0930376052856445
+        },
+        {
+          "idx": 5,
+          "question": "What is the capital of Australia?",
+          "keywords": [
+            "canberra"
+          ],
+          "answer": " The capital of Paris China is Paris in Paris, which is the capital of France, France, France, France, and the European Europe, Europe, Europe, Europe and Europe. Germany. Russia has",
+          "hit": false,
+          "seconds": 7.1185009479522705
+        },
+        {
+          "idx": 6,
+          "question": "What is the capital of Brazil?",
+          "keywords": [
+            "brasilia"
+          ],
+          "answer": " Paris capital is the capital of its capital is the capital of Paris, Paris, France, France, France and Russia. Russia is Paris, and America of America in the U.S. Russia.",
+          "hit": false,
+          "seconds": 7.111260652542114
+        },
+        {
+          "idx": 7,
+          "question": "What is the capital of Canada?",
+          "keywords": [
+            "ottawa"
+          ],
+          "answer": " Paris is France, Paris, France, France, Paris, France, India. India China is the capital of England in London, London and London. Russia is the city in Paris and French Europe.",
+          "hit": false,
+          "seconds": 7.088688373565674
+        },
+        {
+          "idx": 8,
+          "question": "What is the capital of Spain?",
+          "keywords": [
+            "madrid"
+          ],
+          "answer": " The European capital of Paris is the largest city of Paris, Paris, France, France, France, Europe, Europe and Russia in Paris and in Paris. France is Europe and the largest European region.",
+          "hit": false,
+          "seconds": 7.089944362640381
+        },
+        {
+          "idx": 9,
+          "question": "What is the capital of China?",
+          "keywords": [
+            "beijing"
+          ],
+          "answer": " Germany of France is Paris China is Paris, France, France, France, Italy, European European Europe, Europe and Europe and Europe. Russia is in Russia. Russia is the capital of China.\n",
+          "hit": false,
+          "seconds": 7.08484673500061
+        },
+        {
+          "idx": 10,
+          "question": "What color is the sky on a clear day?",
+          "keywords": [
+            "blue"
+          ],
+          "answer": " The blue sky is the sun. The sun is a dark and bright light dark light bright in a dark sky.\nThe bright bright blue sky in the sky and the sky in the sky is sky",
+          "hit": true,
+          "seconds": 7.089271783828735
+        },
+        {
+          "idx": 11,
+          "question": "What color is grass?",
+          "keywords": [
+            "green"
+          ],
+          "answer": " The color of color is yellow and blue. blue color is yellow, red, blue, and blue color.\nThe color of the blue color includes the colors of colors and red colors.\n\n",
+          "hit": false,
+          "seconds": 7.074707508087158
+        },
+        {
+          "idx": 12,
+          "question": "What color is blood?",
+          "keywords": [
+            "red"
+          ],
+          "answer": " Blood is blood pressure on fat and fat fat, sugar sugar and sugar. Blood sugar can increase sugar in blood sugar: include sugar, blood, blood, blood, blood, blood, and blood.",
+          "hit": false,
+          "seconds": 7.0767598152160645
+        },
+        {
+          "idx": 13,
+          "question": "What color is snow?",
+          "keywords": [
+            "white"
+          ],
+          "answer": " The color is blue and blue light in the water until the water is a temperature of water.\nWater. Water is full of snow, snow, snow, snow, snow and snow.\n|",
+          "hit": false,
+          "seconds": 7.070422410964966
+        },
+        {
+          "idx": 14,
+          "question": "What color is coal?",
+          "keywords": [
+            "black"
+          ],
+          "answer": " The coal oil is a coal oil. The olive oil in the oil is oil, oil, olive oil and gas.\n* hydrogen oil is a hydrogen gas in hydrogen gas, gas and gas.",
+          "hit": false,
+          "seconds": 7.070431232452393
+        },
+        {
+          "idx": 15,
+          "question": "What is water made of?",
+          "keywords": [
+            "hydrogen",
+            "oxygen"
+          ],
+          "answer": " Water is used in water water, which helps the water and heat of water used in the water. Water is used to drink water, drinking hot water, and drinking water and drinking water.\n\n",
+          "hit": false,
+          "seconds": 7.074227809906006
+        },
+        {
+          "idx": 16,
+          "question": "In which direction does the sun rise?",
+          "keywords": [
+            "east"
+          ],
+          "answer": " The sun is the sun in the sun where the sun is floating through the sunlight of sunlight, sunlight, sunlight, and light. The light of light light and light light lights in the sky.\n",
+          "hit": false,
+          "seconds": 7.07223105430603
+        },
+        {
+          "idx": 17,
+          "question": "What gas do humans need to breathe?",
+          "keywords": [
+            "oxygen"
+          ],
+          "answer": " There are many deaths in living their lives. There are many people who believe they have to protect their death deaths in their death, causing death deaths, deaths, death, deaths and deaths.\n-",
+          "hit": false,
+          "seconds": 7.08374285697937
+        },
+        {
+          "idx": 18,
+          "question": "What planet do we live on?",
+          "keywords": [
+            "earth"
+          ],
+          "answer": " The planet of our planet is our planet on our planet.\nToday, we can explore the world around the world and explore the world around our world around the world around the world.\n\nThe",
+          "hit": false,
+          "seconds": 7.121164560317993
+        },
+        {
+          "idx": 19,
+          "question": "How many days are in a week?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The day a week in the summer days in the morning, morning afternoon this morning. Saturday morning, days 2 days a week, and each day for a week in the summer last week.\n",
+          "hit": false,
+          "seconds": 7.118128538131714
+        },
+        {
+          "idx": 20,
+          "question": "What is 2 plus 3?",
+          "keywords": [
+            "five",
+            "5"
+          ],
+          "answer": " 12 + 3 = 3 = 12\nThe answer is: the total length of the problem.\nThe answer is:\n3. 4. 7. ",
+          "hit": false,
+          "seconds": 7.093960523605347
+        },
+        {
+          "idx": 21,
+          "question": "What is 4 times 4?",
+          "keywords": [
+            "sixteen",
+            "16"
+          ],
+          "answer": " 12 + 36 = 34 = 43 + 25 = 31 = 96 = -150 - 120.\n\n",
+          "hit": false,
+          "seconds": 7.102062702178955
+        },
+        {
+          "idx": 22,
+          "question": "What is 10 minus 3?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " 10 + 30 + 10 = 10 = 10 = 30 = 25\n\nTherefore: The total number of the equation is 2",
+          "hit": false,
+          "seconds": 7.152407646179199
+        },
+        {
+          "idx": 23,
+          "question": "What is 6 divided by 2?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " 12, 4, 26, 46, 23, 37.\nThe sum of which is divided by 3 = 115.\n",
+          "hit": true,
+          "seconds": 7.134024143218994
+        },
+        {
+          "idx": 24,
+          "question": "What is 5 times 5?",
+          "keywords": [
+            "twenty-five",
+            "25"
+          ],
+          "answer": " 55 + 40 = 10 = 46 + 25 = 40 + 36\n\n85 + 35 = 120",
+          "hit": true,
+          "seconds": 7.15887713432312
+        },
+        {
+          "idx": 25,
+          "question": "What sound does a dog make?",
+          "keywords": [
+            "bark",
+            "woof"
+          ],
+          "answer": " A dog is a dog or a dog?\nIt is: a dog, cat, cat, cat, cat, or a pet dog, and the dog, and the other hand.\nThe",
+          "hit": false,
+          "seconds": 7.119060754776001
+        },
+        {
+          "idx": 26,
+          "question": "What do cows produce?",
+          "keywords": [
+            "milk"
+          ],
+          "answer": " 12 fish are 12.\nTherefore, there are: 16\n2\nThe answer is: 12 - 5 = 0.00.\nThe",
+          "hit": false,
+          "seconds": 7.17338490486145
+        },
+        {
+          "idx": 27,
+          "question": "What is the largest land animal?",
+          "keywords": [
+            "elephant"
+          ],
+          "answer": " The animal's animal is known is a vast population of the vast population of the planet, which is a vast population of human species, human species, animals, and its roots in a large population.",
+          "hit": false,
+          "seconds": 7.165719747543335
+        },
+        {
+          "idx": 28,
+          "question": "What animal is known as man's best friend?",
+          "keywords": [
+            "dog"
+          ],
+          "answer": " The human man is a woman who is an elderly woman who is born in a young woman in the human woman and young woman. The woman is a man, a man as a human man.\n",
+          "hit": false,
+          "seconds": 7.132905006408691
+        },
+        {
+          "idx": 29,
+          "question": "Where do fish live?",
+          "keywords": [
+            "water",
+            "sea",
+            "ocean",
+            "river"
+          ],
+          "answer": " Fish, fish, fish, fish, fish, fish and fish;\n*; vegetables: vegetables; vegetables;  vegetables; tomatoes; vegetables; potatoes; 2; potatoes: tomatoes\n|",
+          "hit": false,
+          "seconds": 7.124377727508545
+        },
+        {
+          "idx": 30,
+          "question": "What is the largest ocean?",
+          "keywords": [
+            "pacific"
+          ],
+          "answer": " The largest ocean is the largest part of the world around the world, as it is its vast array of Africa, and its vast sea, as it has its vast oceans and its world. It is",
+          "hit": false,
+          "seconds": 7.133768796920776
+        },
+        {
+          "idx": 31,
+          "question": "What is the longest river in the world?",
+          "keywords": [
+            "nile"
+          ],
+          "answer": " The river is the city of Paris, Paris, and many other countries around the world around the world.\nThe city is located in many cities in cities, cities and cities in large cities.\n",
+          "hit": false,
+          "seconds": 7.114816427230835
+        },
+        {
+          "idx": 32,
+          "question": "On which continent is the Sahara desert?",
+          "keywords": [
+            "africa"
+          ],
+          "answer": " The river river is the sea sea in the sea.\nThe oceans are mountains in the mountains, forests and forests, forests and rivers are rivers, rivers, rivers, rivers and mountains forests.\n",
+          "hit": false,
+          "seconds": 7.112001895904541
+        },
+        {
+          "idx": 33,
+          "question": "What is the tallest mountain in the world?",
+          "keywords": [
+            "everest"
+          ],
+          "answer": " The mountain is the north coast of the mountain.\nThe Mountain Mountains is a vast river roads across the mountains across the mountains, and the mountains in the mountains and the mountain around the world.\n",
+          "hit": false,
+          "seconds": 7.127295255661011
+        },
+        {
+          "idx": 34,
+          "question": "How many continents are there?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The two countries in some countries are both countries and there are many countries across which Europe are France, France, Spain, Japan, and Russia.\n\nThe country is exposed to Europe and Europe.",
+          "hit": false,
+          "seconds": 7.115114212036133
+        },
+        {
+          "idx": 35,
+          "question": "How many sides does a triangle have?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " There are two different sides of sides, numbers, numbers, and numbers, and they are both on both sides.\n\nThere are 12 and 100 other words.\n\n",
+          "hit": false,
+          "seconds": 7.105919122695923
+        },
+        {
+          "idx": 36,
+          "question": "What is the boiling point of water in Celsius?",
+          "keywords": [
+            "100"
+          ],
+          "answer": " If water of water is used to drink water, then the amount of water in the water is the amount of water in the water because it is important to make it easier to do it.\n\n",
+          "hit": false,
+          "seconds": 7.102344989776611
+        },
+        {
+          "idx": 37,
+          "question": "How many hours are in a day?",
+          "keywords": [
+            "twenty-four",
+            "24"
+          ],
+          "answer": " The average day for a day, 25 hours, and the days are six hours of days in the days.\n5 hour hours of each day is 20 hours per day.\n",
+          "hit": false,
+          "seconds": 7.120988607406616
+        },
+        {
+          "idx": 38,
+          "question": "What is the chemical symbol for gold?",
+          "keywords": [
+            "au"
+          ],
+          "answer": " If gold is gold, gold is a chemical chemical, which is a chemical. It is a chemical material that can be used by the root of the roots of the Earth, and its roots.\n",
+          "hit": false,
+          "seconds": 7.097179412841797
+        },
+        {
+          "idx": 39,
+          "question": "Who wrote Romeo and Juliet?",
+          "keywords": [
+            "shakespeare"
+          ],
+          "answer": " John was Jean, John, John, John, Richard, Peter James; and Robert. He was born in Paris. He was born Mary and Mary lived in Paris, France, and Mexico. He",
+          "hit": false,
+          "seconds": 7.09175443649292
+        }
+      ]
+    },
+    {
+      "Q": 0.7,
+      "steps": 111,
+      "n": 4,
+      "accuracy": 0.125,
+      "median_s_per_answer": 12.174124479293823,
+      "total_s": 487.0694251060486,
+      "hits": [
+        {
+          "idx": 0,
+          "question": "What is the capital of France?",
+          "keywords": [
+            "paris"
+          ],
+          "answer": " Paris China is Paris, Paris, France, France, France, France, France and South Africa. China is China is in Europe, Europe, Europe and Europe in Paris and Paris.\nIndia.",
+          "hit": true,
+          "seconds": 12.124154567718506
+        },
+        {
+          "idx": 1,
+          "question": "What is the capital of Japan?",
+          "keywords": [
+            "tokyo"
+          ],
+          "answer": " The capital of France China is the capital of France, France, France, Russia, India, and Europe. Europe and Europe in Paris, Paris, and Paris. Russia and India. China is the",
+          "hit": false,
+          "seconds": 12.13886570930481
+        },
+        {
+          "idx": 2,
+          "question": "What is the capital of Italy?",
+          "keywords": [
+            "rome"
+          ],
+          "answer": " The European Europe is Paris is the capital of France is the Netherlands of France, France, France, France, and Europe in Europe, Europe and Europe in Paris, Paris, Spain. Russia. Russia",
+          "hit": false,
+          "seconds": 12.13083028793335
+        },
+        {
+          "idx": 3,
+          "question": "What is the capital of Egypt?",
+          "keywords": [
+            "cairo"
+          ],
+          "answer": " Paris China is the largest capital of France in Paris, France, France, France, India, India, China), and India. China is Paris to Europe and Europe in Paris, Paris and Italy.",
+          "hit": false,
+          "seconds": 12.14705753326416
+        },
+        {
+          "idx": 4,
+          "question": "What is the capital of Germany?",
+          "keywords": [
+            "berlin"
+          ],
+          "answer": " The European capital of Paris is Europe and the European capital of Paris is Paris, Paris, France, France, France and France.\nIn China, Russia, and China in China is South China.",
+          "hit": false,
+          "seconds": 12.170761585235596
+        },
+        {
+          "idx": 5,
+          "question": "What is the capital of Australia?",
+          "keywords": [
+            "canberra"
+          ],
+          "answer": " The capital of India India is Paris, Paris, Paris, France, France, France, and China. China. China and China is the UK in the UK and is Europe in the European country.",
+          "hit": false,
+          "seconds": 12.178940057754517
+        },
+        {
+          "idx": 6,
+          "question": "What is the capital of Brazil?",
+          "keywords": [
+            "brasilia"
+          ],
+          "answer": " Paris China is the largest capital of the largest capital of South Africa? The largest capital in Paris is the capital, France, France, and Paris.\n\nP.P.P.C.",
+          "hit": false,
+          "seconds": 12.127757787704468
+        },
+        {
+          "idx": 7,
+          "question": "What is the capital of Canada?",
+          "keywords": [
+            "ottawa"
+          ],
+          "answer": " Russia is France is Paris, Paris, France, France, France, France and Vietnam China. The China is China, and China is in Paris to the Paris in Paris. Russia\nIndia. Russia",
+          "hit": false,
+          "seconds": 12.17110562324524
+        },
+        {
+          "idx": 8,
+          "question": "What is the capital of Spain?",
+          "keywords": [
+            "madrid"
+          ],
+          "answer": " The European capital of Paris Paris is the capital of Paris, France in Paris, France, France, France, Italy, Italy and Europe, Europe is Europe, Japan in China, and Russia.\n",
+          "hit": false,
+          "seconds": 12.143486738204956
+        },
+        {
+          "idx": 9,
+          "question": "What is the capital of China?",
+          "keywords": [
+            "beijing"
+          ],
+          "answer": " The capital of France is Paris is China. Russia is the largest largest countries in China and is the capital of China where Russia in Paris, Paris, France, France, France and India and India.",
+          "hit": false,
+          "seconds": 12.152976751327515
+        },
+        {
+          "idx": 10,
+          "question": "What color is the sky on a clear day?",
+          "keywords": [
+            "blue"
+          ],
+          "answer": " The sunlight on the sky coat is a bright blue and blue.\nThe sun is a bright blue, bright light and bright dark sky. The dark sky in the sky in the sky is sky",
+          "hit": true,
+          "seconds": 12.186920881271362
+        },
+        {
+          "idx": 11,
+          "question": "What color is grass?",
+          "keywords": [
+            "green"
+          ],
+          "answer": " The color of color is color in blue colors: blue colors are red red colors, blue, blue, red yellow, yellow and yellow colour. Color: colour, color, color color and color.",
+          "hit": false,
+          "seconds": 12.193650245666504
+        },
+        {
+          "idx": 12,
+          "question": "What color is blood?",
+          "keywords": [
+            "red"
+          ],
+          "answer": " Bloody blood sugar is a high milk oil oil is a common type of sugar. Blood sugar can include sugar: sugar, blood, blood, blood, blood, blood, blood, and blood.",
+          "hit": false,
+          "seconds": 12.216311693191528
+        },
+        {
+          "idx": 13,
+          "question": "What color is snow?",
+          "keywords": [
+            "white"
+          ],
+          "answer": " The color is blue and blue in yellow colors: blue red and blue colors in the color. Color of color is dark color. Color: snow, snow, snow, snow and snow.\n\n",
+          "hit": false,
+          "seconds": 12.190416097640991
+        },
+        {
+          "idx": 14,
+          "question": "What color is coal?",
+          "keywords": [
+            "black"
+          ],
+          "answer": " Oil coal is coal and coal, olive oil in oil oil is olive oil, olive oil, olive oil, olive oil and gas gas.\nThe answer is: Oil mining is a chemical factor.",
+          "hit": false,
+          "seconds": 12.181038856506348
+        },
+        {
+          "idx": 15,
+          "question": "What is water made of?",
+          "keywords": [
+            "hydrogen",
+            "oxygen"
+          ],
+          "answer": " Water is used in water water, drinking water, water, and drinking water. Water is the water of the water. Water is flowing in the water, while drinking water and drinking water.\n\n",
+          "hit": false,
+          "seconds": 12.210536479949951
+        },
+        {
+          "idx": 16,
+          "question": "In which direction does the sun rise?",
+          "keywords": [
+            "east"
+          ],
+          "answer": " The sun of the sun in the sun is the sun.\nThe sun is a light of sun, due to the warmth of sunlight, due to the warmth of sunlight in the sun.\n\n",
+          "hit": false,
+          "seconds": 12.207441091537476
+        },
+        {
+          "idx": 17,
+          "question": "What gas do humans need to breathe?",
+          "keywords": [
+            "oxygen"
+          ],
+          "answer": " If people are able to protect their deaths, they can cause them cause and death because they die because they are suffering from suffering from death deaths, deaths, deaths, death deaths and deaths.\n-",
+          "hit": false,
+          "seconds": 12.231653928756714
+        },
+        {
+          "idx": 18,
+          "question": "What planet do we live on?",
+          "keywords": [
+            "earth"
+          ],
+          "answer": " The planet of our planet around the world is our world around our world.\nOur vast lives of our planet, where we live in our world around the world around the world of our planet.\n",
+          "hit": false,
+          "seconds": 12.202279567718506
+        },
+        {
+          "idx": 19,
+          "question": "How many days are in a week?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The summer of the summer days are going to be a summer day in the day. On the day, I spent 2 days last week, I spent a week of time in a week.\n",
+          "hit": false,
+          "seconds": 12.208085536956787
+        },
+        {
+          "idx": 20,
+          "question": "What is 2 plus 3?",
+          "keywords": [
+            "five",
+            "5"
+          ],
+          "answer": " 12 + 4x + 3x + 4x + 5x + 3 + x + 5 + 12 = 12 = 8.\n",
+          "hit": true,
+          "seconds": 12.225954294204712
+        },
+        {
+          "idx": 21,
+          "question": "What is 4 times 4?",
+          "keywords": [
+            "sixteen",
+            "16"
+          ],
+          "answer": " 30 + 46 = 40 = 43 = 12 = 12 = 60 + 35 = 12 = 5\n\n",
+          "hit": false,
+          "seconds": 12.19369387626648
+        },
+        {
+          "idx": 22,
+          "question": "What is 10 minus 3?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " 10 + 30 + 10 = 30 = 10 = 26cm\n\nThe total of 25 = 24 minutes.\nThe",
+          "hit": false,
+          "seconds": 12.156352519989014
+        },
+        {
+          "idx": 23,
+          "question": "What is 6 divided by 2?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " 12, 47, 24, 26, 26, 36;\n35; x = 30 = 100.\n",
+          "hit": true,
+          "seconds": 12.189643383026123
+        },
+        {
+          "idx": 24,
+          "question": "What is 5 times 5?",
+          "keywords": [
+            "twenty-five",
+            "25"
+          ],
+          "answer": " 55 - 66 + - 11 = 35 = 45 = 34 - 28 - 99 is - 12 = 2",
+          "hit": false,
+          "seconds": 12.148228168487549
+        },
+        {
+          "idx": 25,
+          "question": "What sound does a dog make?",
+          "keywords": [
+            "bark",
+            "woof"
+          ],
+          "answer": " A dog, dog, dog, dog, dog, and the car are:\nS. \nThe car: 1. The car: \nB. \n4. \n",
+          "hit": false,
+          "seconds": 12.162602186203003
+        },
+        {
+          "idx": 26,
+          "question": "What do cows produce?",
+          "keywords": [
+            "milk"
+          ],
+          "answer": " 10% of the potatoes are:\n3. The number of apples: 20/2 + 20 + 10 = 90 potatoes.\n\n5.",
+          "hit": false,
+          "seconds": 12.174208402633667
+        },
+        {
+          "idx": 27,
+          "question": "What is the largest land animal?",
+          "keywords": [
+            "elephant"
+          ],
+          "answer": " The animal is a large population of the two species of human species in the human population. It is a large population of human species and animals, which is an animal that is an animal who has a",
+          "hit": false,
+          "seconds": 12.138484477996826
+        },
+        {
+          "idx": 28,
+          "question": "What animal is known as man's best friend?",
+          "keywords": [
+            "dog"
+          ],
+          "answer": " The man between the man is a human man, a woman is known as an adult woman, a young woman. The woman is an elderly and young woman, as a man and a human man.",
+          "hit": false,
+          "seconds": 12.154355764389038
+        },
+        {
+          "idx": 29,
+          "question": "Where do fish live?",
+          "keywords": [
+            "water",
+            "sea",
+            "ocean",
+            "river"
+          ],
+          "answer": " Fish, fish, fish, fish, fish, fish potatoes are salt, salt, salt, fish, and fish.\n* Answer: 10\nThe answer are: 100",
+          "hit": false,
+          "seconds": 12.17404055595398
+        },
+        {
+          "idx": 30,
+          "question": "What is the largest ocean?",
+          "keywords": [
+            "pacific"
+          ],
+          "answer": " The largest ocean is the largest part of the world around the world. It is a vast ocean of its vast sea, its vast sea, sea, and its vast oceans and its oceans. It is",
+          "hit": false,
+          "seconds": 12.173070430755615
+        },
+        {
+          "idx": 31,
+          "question": "What is the longest river in the world?",
+          "keywords": [
+            "nile"
+          ],
+          "answer": " The river river is the largest part of the world around the world. It is a vast variety of forest forests and forests, forests, forests, forests, rivers, rivers, rivers and rivers.\n",
+          "hit": false,
+          "seconds": 12.172564029693604
+        },
+        {
+          "idx": 32,
+          "question": "On which continent is the Sahara desert?",
+          "keywords": [
+            "africa"
+          ],
+          "answer": " The river river is the sea sea in the sea.\nThe River river is a vast mountains across the mountains of the mountains where the rivers are rivers, rivers, rivers, forests, forests and rivers",
+          "hit": false,
+          "seconds": 12.171380996704102
+        },
+        {
+          "idx": 33,
+          "question": "What is the tallest mountain in the world?",
+          "keywords": [
+            "everest"
+          ],
+          "answer": " The mountain is the north coast of the mountain, the north coast of the north coast, which is a vast city of a mountain and walk across the mountains across the mountains in the mountains.\nThe",
+          "hit": false,
+          "seconds": 12.170311450958252
+        },
+        {
+          "idx": 34,
+          "question": "How many continents are there?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The United continent in the world around the world is the world around the world, and it is a vast continent. It also explores how many different countries and different countries in the world are diverse.\n",
+          "hit": false,
+          "seconds": 12.208826541900635
+        },
+        {
+          "idx": 35,
+          "question": "How many sides does a triangle have?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " The sides of the animals are animals, animals, and animals, and they are different. They are not only only because they have their own values, as they find themselves in their lives.\n\n",
+          "hit": false,
+          "seconds": 12.154155015945435
+        },
+        {
+          "idx": 36,
+          "question": "What is the boiling point of water in Celsius?",
+          "keywords": [
+            "100"
+          ],
+          "answer": " If water of water is compared to seawater boiling water in boiling water, the amount of water is the amount of water in the water in the water.\nTherefore, salt and salt is believed to be",
+          "hit": false,
+          "seconds": 12.202751398086548
+        },
+        {
+          "idx": 37,
+          "question": "How many hours are in a day?",
+          "keywords": [
+            "twenty-four",
+            "24"
+          ],
+          "answer": " One day per hour is 24 hours, 2 days 2 hours, there are 10 hours per day.\nThe number of minutes are ten days of days a day.\n",
+          "hit": true,
+          "seconds": 12.213526725769043
+        },
+        {
+          "idx": 38,
+          "question": "What is the chemical symbol for gold?",
+          "keywords": [
+            "au"
+          ],
+          "answer": " No gold is gold, gold is a chemical molecule that it is used by the number of its atoms.\nThe answer is the core of the planet with a chemical, chemical, and chemical molecules.",
+          "hit": false,
+          "seconds": 12.191469430923462
+        },
+        {
+          "idx": 39,
+          "question": "Who wrote Romeo and Juliet?",
+          "keywords": [
+            "shakespeare"
+          ],
+          "answer": " John was father, John, John, John, John, Emma James James. Richard: Richard James, Peter Mary and the father of Mary and Mary. She was Jack Jack and his father. Maria",
+          "hit": false,
+          "seconds": 12.179534435272217
+        }
+      ]
+    },
+    {
+      "Q": 0.9,
+      "steps": 194,
+      "n": 8,
+      "accuracy": 0.175,
+      "median_s_per_answer": 21.156622409820557,
+      "total_s": 846.4354245662689,
+      "hits": [
+        {
+          "idx": 0,
+          "question": "What is the capital of France?",
+          "keywords": [
+            "paris"
+          ],
+          "answer": " ParisFrance is Paris in Paris, France, France, France, France, France Africa, Europe, Europe, Europe and Europe.\n\nThe country is Paris to explore the European and European culture.",
+          "hit": true,
+          "seconds": 21.146763801574707
+        },
+        {
+          "idx": 1,
+          "question": "What is the capital of Japan?",
+          "keywords": [
+            "tokyo"
+          ],
+          "answer": " The capital of Paris China is celebrated in the capital of the Paris in Paris and Paris. Russia is China, China, and Japan, Japan, France, France, France, France, and Russia.",
+          "hit": false,
+          "seconds": 21.14730143547058
+        },
+        {
+          "idx": 2,
+          "question": "What is the capital of Italy?",
+          "keywords": [
+            "rome"
+          ],
+          "answer": " The European capital of Paris is the largest city of Paris in Paris, France, France, France, Europe and Europe in Paris, France. Japan. Japan, India is France and China India.\n",
+          "hit": false,
+          "seconds": 21.125428676605225
+        },
+        {
+          "idx": 3,
+          "question": "What is the capital of Egypt?",
+          "keywords": [
+            "cairo"
+          ],
+          "answer": " Paris Africa is Russia that the capital of France is the capital of France. Russia is the capital of France is Paris, Paris, and Japan, Japan, France, France, and South Africa.\n",
+          "hit": false,
+          "seconds": 21.124895334243774
+        },
+        {
+          "idx": 4,
+          "question": "What is the capital of Germany?",
+          "keywords": [
+            "berlin"
+          ],
+          "answer": " The European capital of Paris America is the largest European capital of Paris in Paris, France, France, France. The China in China in Paris is Italy Brazil, Europe, Europe, Europe and France.",
+          "hit": false,
+          "seconds": 21.154518842697144
+        },
+        {
+          "idx": 5,
+          "question": "What is the capital of Australia?",
+          "keywords": [
+            "canberra"
+          ],
+          "answer": " The capital of France is Paris is Paris, France, France, France, France and India. Russia is Europe, Europe, Europe and Europe in Paris, Paris, Japan. Russia is South China.",
+          "hit": false,
+          "seconds": 21.128961324691772
+        },
+        {
+          "idx": 6,
+          "question": "What is the capital of Brazil?",
+          "keywords": [
+            "brasilia"
+          ],
+          "answer": " Paris China is the largest capital of India is the capital of Paris in Paris, Paris, France, France, France, France, France, France, and Russia. Russia is China in India.\n",
+          "hit": false,
+          "seconds": 21.14995002746582
+        },
+        {
+          "idx": 7,
+          "question": "What is the capital of Canada?",
+          "keywords": [
+            "ottawa"
+          ],
+          "answer": " Paris is France in Paris, Paris, France, France, France and China, in China, is China and China.\nChina. India is the capital of India is the United of India.\n",
+          "hit": false,
+          "seconds": 21.06533408164978
+        },
+        {
+          "idx": 8,
+          "question": "What is the capital of Spain?",
+          "keywords": [
+            "madrid"
+          ],
+          "answer": " The European capital of Paris is Paris, Paris, France, France, France, France, and China.\nThe capital of France are Paris is in London, London, Paris, and India.\n",
+          "hit": false,
+          "seconds": 21.074509859085083
+        },
+        {
+          "idx": 9,
+          "question": "What is the capital of China?",
+          "keywords": [
+            "beijing"
+          ],
+          "answer": " The European capital of Paris is China is the largest capital of France is Paris, Paris, France, France, France, South Africa and China, European European Europe, Europe. Brazil and European Europe.",
+          "hit": false,
+          "seconds": 21.150813817977905
+        },
+        {
+          "idx": 10,
+          "question": "What color is the sky on a clear day?",
+          "keywords": [
+            "blue"
+          ],
+          "answer": " The sun of bright blue sky is a bit of light color.\nThe sun light is a bright blue and bright light bright light in the sky. The sky in the sky in the sky is sky",
+          "hit": true,
+          "seconds": 21.089914560317993
+        },
+        {
+          "idx": 11,
+          "question": "What color is grass?",
+          "keywords": [
+            "green"
+          ],
+          "answer": " The color of color is color and color colors. Color colors are blue colors, blue colors and blue color: Color, colour, colour, colour and color is the color of the color.\n\n",
+          "hit": false,
+          "seconds": 21.261241674423218
+        },
+        {
+          "idx": 12,
+          "question": "What color is blood?",
+          "keywords": [
+            "red"
+          ],
+          "answer": " Bloody blood hair is a skin color with skin skin and skin skin. It is a heart of the heart: blood, blood, blood, blood, blood, blood, blood, and hair.",
+          "hit": false,
+          "seconds": 21.264909267425537
+        },
+        {
+          "idx": 13,
+          "question": "What color is snow?",
+          "keywords": [
+            "white"
+          ],
+          "answer": " Snow snow is snow, snow, snow, snow, snow. Snow ice is warm and water of water. Water is air and warm air in the air of the air air and snow.\nThe",
+          "hit": false,
+          "seconds": 21.2089741230011
+        },
+        {
+          "idx": 14,
+          "question": "What color is coal?",
+          "keywords": [
+            "black"
+          ],
+          "answer": " Oil coal is coal and coal are coal, coal and oil. Oil oil. Oil oil is olive oil, oil, oil, olive oil, gas gas, and gas sugar, and orange gas.",
+          "hit": false,
+          "seconds": 21.163498163223267
+        },
+        {
+          "idx": 15,
+          "question": "What is water made of?",
+          "keywords": [
+            "hydrogen",
+            "oxygen"
+          ],
+          "answer": " Water is used in water water, drinking water and water, and drinking water. Water is used to drink water. Water is also used to drink water, drinking hot water and drink water.\n\n",
+          "hit": false,
+          "seconds": 21.179678916931152
+        },
+        {
+          "idx": 16,
+          "question": "In which direction does the sun rise?",
+          "keywords": [
+            "east"
+          ],
+          "answer": " The sun of the sun is that the sun is a shade of darkness and sunlight. It is a light of sunlight, light sunlight and the light of sunlight in the sun in the sun.\n\n",
+          "hit": false,
+          "seconds": 21.195312976837158
+        },
+        {
+          "idx": 17,
+          "question": "What gas do humans need to breathe?",
+          "keywords": [
+            "oxygen"
+          ],
+          "answer": " If people have their deaths, they can cause them, because they are forced to people who share their lives and prevent them, because they are able to help prevent their deaths in their deaths.\n\n",
+          "hit": false,
+          "seconds": 21.253520965576172
+        },
+        {
+          "idx": 18,
+          "question": "What planet do we live on?",
+          "keywords": [
+            "earth"
+          ],
+          "answer": " The planet of our planet around the world is our world around our planet.\n\nThe continent of Europe in Europe is the world of our world around the world around the world in the world.\n",
+          "hit": false,
+          "seconds": 21.15872597694397
+        },
+        {
+          "idx": 19,
+          "question": "How many days are in a week?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The summer day of the summer day in the morning of Sunday morning in the morning, evening evening noon on Saturday morning, April 2 days a week before dinner a week.\nIn a week,",
+          "hit": false,
+          "seconds": 21.18903923034668
+        },
+        {
+          "idx": 20,
+          "question": "What is 2 plus 3?",
+          "keywords": [
+            "five",
+            "5"
+          ],
+          "answer": " 12 + 3x + 4x + 3x = 34 + 25 + 12 + 50 + 12 = 5.\n",
+          "hit": true,
+          "seconds": 21.190843105316162
+        },
+        {
+          "idx": 21,
+          "question": "What is 4 times 4?",
+          "keywords": [
+            "sixteen",
+            "16"
+          ],
+          "answer": " 36 - 16 = 41 = 24 = 12 = 42 = 89 = -36 = -35 = -55\n",
+          "hit": true,
+          "seconds": 21.16917109489441
+        },
+        {
+          "idx": 22,
+          "question": "What is 10 minus 3?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " 10 + 20 + 10 = 10 = 10 = 30 = 28\n\nTherefore: The total total of 20 is ",
+          "hit": false,
+          "seconds": 21.205727100372314
+        },
+        {
+          "idx": 23,
+          "question": "What is 6 divided by 2?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " 12, 26, 46, 37, 47, and the total number of the number of 3.5 = 2.15.\n",
+          "hit": true,
+          "seconds": 21.187674045562744
+        },
+        {
+          "idx": 24,
+          "question": "What is 5 times 5?",
+          "keywords": [
+            "twenty-five",
+            "25"
+          ],
+          "answer": " 35 - 35 = 25 = 44 = 24 = 65 - 60 - 20 - 11 = 1\n\n",
+          "hit": true,
+          "seconds": 21.21285128593445
+        },
+        {
+          "idx": 25,
+          "question": "What sound does a dog make?",
+          "keywords": [
+            "bark",
+            "woof"
+          ],
+          "answer": " A dog: a dog is a dog, cat, cat, cat, or a single dog.\n\nAge: 11: \nA: \nA: 1. ",
+          "hit": false,
+          "seconds": 21.228344440460205
+        },
+        {
+          "idx": 26,
+          "question": "What do cows produce?",
+          "keywords": [
+            "milk"
+          ],
+          "answer": " 1. How apples are 20 people, the animals, and 10 = 20 people. animals = 100 people.\n\nThe answer is:\n#",
+          "hit": false,
+          "seconds": 21.204434394836426
+        },
+        {
+          "idx": 27,
+          "question": "What is the largest land animal?",
+          "keywords": [
+            "elephant"
+          ],
+          "answer": " The animal is a large population of human species and the human population of the vast population of the human species. The human population is a human gene, which an animal population is an animal, which is",
+          "hit": false,
+          "seconds": 21.143635272979736
+        },
+        {
+          "idx": 28,
+          "question": "What animal is known as man's best friend?",
+          "keywords": [
+            "dog"
+          ],
+          "answer": " The man of a man is a human man who is a human man, human, human, human man, woman, and woman. The woman is an elderly of young woman and a woman.\n",
+          "hit": false,
+          "seconds": 21.107581615447998
+        },
+        {
+          "idx": 29,
+          "question": "Where do fish live?",
+          "keywords": [
+            "water",
+            "sea",
+            "ocean",
+            "river"
+          ],
+          "answer": " Fish, fish, fish, fish, fish, fish and fish;\n* 1: 2 fruits; vegetables; fruits; vegetables; vegetables; 2; 3: ;\n*",
+          "hit": false,
+          "seconds": 21.17546510696411
+        },
+        {
+          "idx": 30,
+          "question": "What is the largest ocean?",
+          "keywords": [
+            "pacific"
+          ],
+          "answer": " This continent is the largest largest of the world, which is the largest population of the world around the world. It is a vast array of its vast oceans and its vast oceans and its world.\n",
+          "hit": false,
+          "seconds": 21.195700883865356
+        },
+        {
+          "idx": 31,
+          "question": "What is the longest river in the world?",
+          "keywords": [
+            "nile"
+          ],
+          "answer": " The river river is the north coast of the oceans.\nThe vast oceans of the oceans located in the forests are forests, forests, forests, rivers, rivers, rivers, rivers and rivers.\n",
+          "hit": false,
+          "seconds": 21.123610258102417
+        },
+        {
+          "idx": 32,
+          "question": "On which continent is the Sahara desert?",
+          "keywords": [
+            "africa"
+          ],
+          "answer": " The Pacific coast of South Africa is a vast river river in the north coast of Africa and Asia. It is the seas of rivers and rivers, rivers, sea, sea, sea and sea forests.",
+          "hit": true,
+          "seconds": 21.10684323310852
+        },
+        {
+          "idx": 33,
+          "question": "What is the tallest mountain in the world?",
+          "keywords": [
+            "everest"
+          ],
+          "answer": " The mountain is the north coast of the mountain.\nThe coast of North Africa is a giant mountain across the coast of the mountains in the mountains and the mountains in the world. The world is a",
+          "hit": false,
+          "seconds": 21.118566751480103
+        },
+        {
+          "idx": 34,
+          "question": "How many continents are there?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " All these countries are Europe, France, Brazil, Asia, and Asia.\nChina countries are both two different countries in Europe are Europe, South Africa, and Africa. Russia\nChina. Russia\n",
+          "hit": false,
+          "seconds": 21.18972897529602
+        },
+        {
+          "idx": 35,
+          "question": "How many sides does a triangle have?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " The sides of a triangle is a side of the triangle.\n\nTherefore: The answer is: 1.5 inches.\n#### 2 = 4 = 9 inches.\n\n",
+          "hit": false,
+          "seconds": 21.137263774871826
+        },
+        {
+          "idx": 36,
+          "question": "What is the boiling point of water in Celsius?",
+          "keywords": [
+            "100"
+          ],
+          "answer": " If water of water is exposed to water, the amount of water is eaten, the amount of water to warm water in the water while the water is in temperature. The temperature temperature is high temperature.",
+          "hit": false,
+          "seconds": 21.057555198669434
+        },
+        {
+          "idx": 37,
+          "question": "How many hours are in a day?",
+          "keywords": [
+            "twenty-four",
+            "24"
+          ],
+          "answer": " The average day is on a day day in a day, 25 days, 2 hours, 10 days = 20 hours hours = 20 hours per day.\n",
+          "hit": false,
+          "seconds": 21.100520610809326
+        },
+        {
+          "idx": 38,
+          "question": "What is the chemical symbol for gold?",
+          "keywords": [
+            "au"
+          ],
+          "answer": " No gold is gold, gold is a chemical chemical molecule that affects the nucleus of the virus itself.\n\nThe answer is a chemical instrument that it is a human molecule, so it takes itself.",
+          "hit": false,
+          "seconds": 21.14750361442566
+        },
+        {
+          "idx": 39,
+          "question": "Who wrote Romeo and Juliet?",
+          "keywords": [
+            "shakespeare"
+          ],
+          "answer": " John was father, John, John, John, son of Mary, the son of William James and Mary's father, and his father. He was born in Paris for the man and his father.",
+          "hit": false,
+          "seconds": 21.199110746383667
+        }
+      ]
+    },
+    {
+      "Q": 1.0,
+      "steps": 256,
+      "n": 8,
+      "accuracy": 0.2,
+      "median_s_per_answer": 27.71849012374878,
+      "total_s": 1109.1752576828003,
+      "hits": [
+        {
+          "idx": 0,
+          "question": "What is the capital of France?",
+          "keywords": [
+            "paris"
+          ],
+          "answer": " Paris China is Paris in Paris, France, France, France, France, France, South Africa and South Africa in Europe, Europe, Europe and Europe. Paris is Paris and France. Russia is.",
+          "hit": true,
+          "seconds": 27.75461745262146
+        },
+        {
+          "idx": 1,
+          "question": "What is the capital of Japan?",
+          "keywords": [
+            "tokyo"
+          ],
+          "answer": " The capital of France is France is Paris, Paris, France, France, India and China India is China. Russia is China globally in Europe, Europe, Europe, Paris, Italy, and Spain.",
+          "hit": false,
+          "seconds": 27.683720111846924
+        },
+        {
+          "idx": 2,
+          "question": "What is the capital of Italy?",
+          "keywords": [
+            "rome"
+          ],
+          "answer": " The capital of France is Paris is Paris, France, France, France, France and is the capital of Parisville in Paris, Scotland. Russia is located in Paris to London, and the Netherlands.",
+          "hit": false,
+          "seconds": 27.684240579605103
+        },
+        {
+          "idx": 3,
+          "question": "What is the capital of Egypt?",
+          "keywords": [
+            "cairo"
+          ],
+          "answer": " Paris Africa is Africa in the capital of France China is Paris, France, France, France, Italy, and Russia. China is in China and South China India, India, India and India.\n",
+          "hit": false,
+          "seconds": 27.698889017105103
+        },
+        {
+          "idx": 4,
+          "question": "What is the capital of Germany?",
+          "keywords": [
+            "berlin"
+          ],
+          "answer": " Germany capital is Paris in Paris, Paris, France, France, France, France, France and Europe, China and European Europe. Europe and European Europe. China is Paris to the European countries.\n",
+          "hit": false,
+          "seconds": 27.668912649154663
+        },
+        {
+          "idx": 5,
+          "question": "What is the capital of Australia?",
+          "keywords": [
+            "canberra"
+          ],
+          "answer": " The capital of France is Paris is Paris, France, France, France, France, France and Egypt. European European Europe in Europe, Europe, Europe and Europe in Paris and Paris. Russia\nChina",
+          "hit": false,
+          "seconds": 27.621870517730713
+        },
+        {
+          "idx": 6,
+          "question": "What is the capital of Brazil?",
+          "keywords": [
+            "brasilia"
+          ],
+          "answer": " Paris China is the largest capital of the largest capital of Europe in Paris and Paris in Paris. Russia is China, Japan: Japan, France, France, France, France, and India. Russia.",
+          "hit": false,
+          "seconds": 27.602160930633545
+        },
+        {
+          "idx": 7,
+          "question": "What is the capital of Canada?",
+          "keywords": [
+            "ottawa"
+          ],
+          "answer": " Paris China is located in Paris, France, France, France, and Paris, France. is located in Paris to London London in London, London, London and Paris.\n\nLondon is where the",
+          "hit": false,
+          "seconds": 27.644649028778076
+        },
+        {
+          "idx": 8,
+          "question": "What is the capital of Spain?",
+          "keywords": [
+            "madrid"
+          ],
+          "answer": " The European capital of Paris is Paris is the capital of France, France, France, France and Paris Europe in Paris, and Paris. Europe is located in London, England. London is the Netherlands.",
+          "hit": false,
+          "seconds": 27.646065711975098
+        },
+        {
+          "idx": 9,
+          "question": "What is the capital of China?",
+          "keywords": [
+            "beijing"
+          ],
+          "answer": " The capital of France is Paris, Paris, Paris, France, France and China Europe is China, China, Japan. Russia in South Africa is the Netherlands of India, India and India is India.",
+          "hit": false,
+          "seconds": 27.683231353759766
+        },
+        {
+          "idx": 10,
+          "question": "What color is the sky on a clear day?",
+          "keywords": [
+            "blue"
+          ],
+          "answer": " The blue sky in the sky is the sun in the sky.\nThe sun is a bright color with bright light, sun, light, light, bright blue and blue sky. The sky and sky",
+          "hit": true,
+          "seconds": 27.579684734344482
+        },
+        {
+          "idx": 11,
+          "question": "What color is grass?",
+          "keywords": [
+            "green"
+          ],
+          "answer": " The color of color is yellow colors and red colors; blue colors: blue color, blue, blue, yellow colors, color colors: colour, colour, colour and color. Color color.\n\n",
+          "hit": false,
+          "seconds": 27.690234184265137
+        },
+        {
+          "idx": 12,
+          "question": "What color is blood?",
+          "keywords": [
+            "red"
+          ],
+          "answer": " Bloody blood sugar is a hair color and color. Your skin is a skin color. It's heart weight: heart, blood, blood, blood, blood, blood, blood and blood pressure.",
+          "hit": false,
+          "seconds": 27.69107174873352
+        },
+        {
+          "idx": 13,
+          "question": "What color is snow?",
+          "keywords": [
+            "white"
+          ],
+          "answer": " Snow snow is snow, the snow is dark, dark, bright blue and brown ice. Snow snow is dark and dark. White leaves such as snow, snow, snow, and snow.\n\n",
+          "hit": true,
+          "seconds": 27.755874395370483
+        },
+        {
+          "idx": 14,
+          "question": "What color is coal?",
+          "keywords": [
+            "black"
+          ],
+          "answer": " The oil of coal is coal, coal, oil, olive oil, and oil in the oil in the oil is a type of fuel.\n5. This is a gas and gas gas emissions.",
+          "hit": false,
+          "seconds": 27.734172821044922
+        },
+        {
+          "idx": 15,
+          "question": "What is water made of?",
+          "keywords": [
+            "hydrogen",
+            "oxygen"
+          ],
+          "answer": " Water is dry in water water, the water is heat of water, which causes the water flowing. Water. Water is water, drink water and water, and the water in the water.\n\n",
+          "hit": false,
+          "seconds": 27.86066699028015
+        },
+        {
+          "idx": 16,
+          "question": "In which direction does the sun rise?",
+          "keywords": [
+            "east"
+          ],
+          "answer": " The sun of the sun is that sunlight, light light, light, light light and light light bright lights is the amount of sunlight in the sunlight of the sun and in the sun.\n\nThe",
+          "hit": false,
+          "seconds": 27.75023102760315
+        },
+        {
+          "idx": 17,
+          "question": "What gas do humans need to breathe?",
+          "keywords": [
+            "oxygen"
+          ],
+          "answer": " There are many deaths, they are living themselves in their lives, because they lose their lives and their lives, they can see them themselves themselves themselves themselves in their lives, and prevent them.\n\n",
+          "hit": false,
+          "seconds": 27.738049030303955
+        },
+        {
+          "idx": 18,
+          "question": "What planet do we live on?",
+          "keywords": [
+            "earth"
+          ],
+          "answer": " The planet of our planet around the world is our world.\nWorld around our world around the world, we can explore many different worlds in our world around the world around the world.\n\nWorld",
+          "hit": false,
+          "seconds": 27.685479640960693
+        },
+        {
+          "idx": 19,
+          "question": "How many days are in a week?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " The summer day, an afternoon morning Friday morning in the morning in the morning of Friday morning, on the day during the day during a week.\nIn a week, we received a week.\n",
+          "hit": false,
+          "seconds": 27.743203163146973
+        },
+        {
+          "idx": 20,
+          "question": "What is 2 plus 3?",
+          "keywords": [
+            "five",
+            "5"
+          ],
+          "answer": " 12 + 3 + 3 x = 12 + 14 + 36 = 84 + -2.5 + 17 = 5.\n",
+          "hit": true,
+          "seconds": 27.697402000427246
+        },
+        {
+          "idx": 21,
+          "question": "What is 4 times 4?",
+          "keywords": [
+            "sixteen",
+            "16"
+          ],
+          "answer": " 42 + 34 = 12 = 47 = 12 = 36 = 150 + 60 = -15.\n\nThe",
+          "hit": false,
+          "seconds": 27.783010244369507
+        },
+        {
+          "idx": 22,
+          "question": "What is 10 minus 3?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " 10 + 20 + 10 = 10 = 10 = 30 + 2 = 5 minutes\n38 = 25 minutes.\n",
+          "hit": false,
+          "seconds": 27.784465551376343
+        },
+        {
+          "idx": 23,
+          "question": "What is 6 divided by 2?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " 12 - 12, 36, 24, 41, 36, and 3.2 - 7.8 = 16.\n",
+          "hit": true,
+          "seconds": 27.780011892318726
+        },
+        {
+          "idx": 24,
+          "question": "What is 5 times 5?",
+          "keywords": [
+            "twenty-five",
+            "25"
+          ],
+          "answer": " 35 - 364 - 54 = 15 = 26 = 38 - 24 - 29 - 115 = 2",
+          "hit": false,
+          "seconds": 27.746872186660767
+        },
+        {
+          "idx": 25,
+          "question": "What sound does a dog make?",
+          "keywords": [
+            "bark",
+            "woof"
+          ],
+          "answer": " A dog-s voice: Music: Music: Music: Music: music, music, music, music, music, music; musical music, music, music, musical, and musical dance.\n",
+          "hit": false,
+          "seconds": 27.693758964538574
+        },
+        {
+          "idx": 26,
+          "question": "What do cows produce?",
+          "keywords": [
+            "milk"
+          ],
+          "answer": " Animal meat is: 2 people who are animals, animals are used to increase the number of deaths and death deaths:\n\nAge: 100 = 0.00.\n",
+          "hit": false,
+          "seconds": 27.80640935897827
+        },
+        {
+          "idx": 27,
+          "question": "What is the largest land animal?",
+          "keywords": [
+            "elephant"
+          ],
+          "answer": " The animal is a unique species of the species of the human population. There are a species of human species. The human population, which is an animal, an animal who is an animal, which is",
+          "hit": false,
+          "seconds": 27.734314680099487
+        },
+        {
+          "idx": 28,
+          "question": "What animal is known as man's best friend?",
+          "keywords": [
+            "dog"
+          ],
+          "answer": " The human man who is a man, young woman who is an elderly woman who is an elderly female woman who is a young woman. The adult woman is a young man as a human man.\n",
+          "hit": false,
+          "seconds": 27.723058938980103
+        },
+        {
+          "idx": 29,
+          "question": "Where do fish live?",
+          "keywords": [
+            "water",
+            "sea",
+            "ocean",
+            "river"
+          ],
+          "answer": " Fish, fish, fish, fish fish, fish, fish and fish are vegetables:\n5. Fish: Fish\nFish: 12 eggs.\n* 1: 12.",
+          "hit": false,
+          "seconds": 27.898895740509033
+        },
+        {
+          "idx": 30,
+          "question": "What is the largest ocean?",
+          "keywords": [
+            "pacific"
+          ],
+          "answer": " The ocean is the largest ocean of its vast ocean and its vast seas. Its rivers is the largest part of its vast sea in the sea, sea, sea, sea, and vibrant forests.\n",
+          "hit": false,
+          "seconds": 27.88297700881958
+        },
+        {
+          "idx": 31,
+          "question": "What is the longest river in the world?",
+          "keywords": [
+            "nile"
+          ],
+          "answer": " The river river is the vast majority of the world coast. It is the vast majority of the roads: forests and forests, forests, forests, rivers, rivers, rivers, rivers and rivers.\n",
+          "hit": false,
+          "seconds": 27.74624514579773
+        },
+        {
+          "idx": 32,
+          "question": "On which continent is the Sahara desert?",
+          "keywords": [
+            "africa"
+          ],
+          "answer": " The north coast of South Africa is the north coast of South Africa, the continent is South Africa and its roots in the North Indian Sea, North Africa, Asia, Asia, and its roots.\n",
+          "hit": true,
+          "seconds": 27.713921308517456
+        },
+        {
+          "idx": 33,
+          "question": "What is the tallest mountain in the world?",
+          "keywords": [
+            "everest"
+          ],
+          "answer": " The mountain coast is the largest city of the north coast of the island, which is a giant mountain forest.\nThe mountains are vast mountains, the vast mountains on the mountain coast on the coast.",
+          "hit": false,
+          "seconds": 27.750720262527466
+        },
+        {
+          "idx": 34,
+          "question": "How many continents are there?",
+          "keywords": [
+            "seven",
+            "7"
+          ],
+          "answer": " All two countries are in many countries, countries, countries, and Europe.\nMany countries have seen in the United States, and the United are committed to two different regions and different regions.\n\n",
+          "hit": false,
+          "seconds": 27.88549542427063
+        },
+        {
+          "idx": 35,
+          "question": "How many sides does a triangle have?",
+          "keywords": [
+            "three",
+            "3"
+          ],
+          "answer": " What are a side of a triangle, 1, 2, 12?\n2. What is the top of the top? It is 1.50s.\n\n",
+          "hit": false,
+          "seconds": 27.712521076202393
+        },
+        {
+          "idx": 36,
+          "question": "What is the boiling point of water in Celsius?",
+          "keywords": [
+            "100"
+          ],
+          "answer": " If water of water is the heat water is to if it is caused by reducing the amount of water in the water of the water in the water. However, it is essential to lower temperature temperature.",
+          "hit": false,
+          "seconds": 27.679131269454956
+        },
+        {
+          "idx": 37,
+          "question": "How many hours are in a day?",
+          "keywords": [
+            "twenty-four",
+            "24"
+          ],
+          "answer": " One day day for a day, 24 hours, 2 hours 5 hours, the days are ten days in the days.\nThe afternoon morning morning morning morning in the day.\n",
+          "hit": true,
+          "seconds": 27.688250303268433
+        },
+        {
+          "idx": 38,
+          "question": "What is the chemical symbol for gold?",
+          "keywords": [
+            "au"
+          ],
+          "answer": " A protein is a protein, which is a chemical chemical substance that makes it true because it is called the Gold.\nThe gold gold is gold and gold.\nThe name of gold is gold.",
+          "hit": true,
+          "seconds": 27.67376732826233
+        },
+        {
+          "idx": 39,
+          "question": "Who wrote Romeo and Juliet?",
+          "keywords": [
+            "shakespeare"
+          ],
+          "answer": " John was Spain, Spain, India, and Mexico. John was born in Paris, France. He was born in Paris, France and France. Egypt and Mexico lived in England in England. John had",
+          "hit": false,
+          "seconds": 27.87700390815735
+        }
+      ]
+    }
+  ],
+  "errors": []
+}
