@@ -12,7 +12,7 @@ tags:
 
 # hr-diffuse-1-nano
 
-**A 135M-parameter masked discrete diffusion language model on a bidirectional Mamba backbone.**
+**A masked discrete diffusion language model on a bidirectional Mamba backbone. 287.9M measured parameters, 135M-class backbone capacity.**
 
 This is the final release of the first generation of the project. It is a research artifact, trained end to end for about $450 on rented H100s by a self-funded independent researcher. To our knowledge, every published masked-diffusion text model uses a transformer backbone (LLaDA, MDLM, Dream). This model is the same proven objective on a different spine: bidirectional Mamba.
 
@@ -22,7 +22,7 @@ The full development archive, including every failed checkpoint and negative res
 
 ### What it is
 
-- **Architecture:** bidirectional Mamba, 135M parameters, with a timestep-conditioned denoiser and a token head. Tokenizer: `HuggingFaceTB/SmolLM-135M` plus one `[MASK]` token (id 49152).
+- **Architecture:** bidirectional Mamba with a timestep-conditioned denoiser and a token head. Measured parameter count: 287.9M (denoiser 258.1M, embeddings 28.3M, conditioning 1.6M). We label it 135M-class because the two directional stacks store largely redundant knowledge and the backbone was distilled from SmolLM-135M at the same hidden size; its measured failure profile matches that capacity. All parameters are active every forward pass. Tokenizer: `HuggingFaceTB/SmolLM-135M` plus one `[MASK]` token (id 49152).
 - **Objective:** LLaDA/MDLM-style masked diffusion. Corrupt text by replacing a random fraction t of tokens with `[MASK]`, predict the originals with cross-entropy weighted 1/t.
 - **Generation:** MaskGIT-style iterative unmasking. Start fully masked, repeatedly commit the most confident tokens.
 - **Knowledge source:** a backbone distilled from SmolLM-135M over 28B tokens, converted to masked diffusion in 40k steps, then instruction-tuned on 422k pairs (Alpaca + SmolTalk + math) with classifier-free guidance dropout.
@@ -54,6 +54,26 @@ Honest answer: **better at detection, not yet better at generation.**
 
 Conclusion: detection is solved externally at this scale; correction additionally needs a stronger generator. The pair becomes genuinely useful when the base model scales.
 
+### Measured comparison against same-class models
+
+Benchmarked 2026-07-04 on a 40-item factual QA set, a 12-sentence middle-50% infill test, and degeneracy metrics over the QA generations (full harness and raw results in the training repo, `docs/benchmarks.md`).
+
+| Model | QA accuracy | Loop rate | Infill recovery | Seconds per 40-token answer |
+|---|---|---|---|---|
+| hr-diffuse-1-nano (this model) | 15.0% | 7.5% | 14.0% | 13.3 |
+| SmolLM-135M (the AR teacher) | 82.5% | 37.5% | 2.9% | 0.63 |
+| SmolLM-135M-Instruct | 60.0% | 2.5% | 0.0% | 0.62 |
+| GPT-2 (124M) | 20.0% | 90.0% | 0.0% | 0.18 |
+| Pythia-160M | 10.0% | 15.0% | 1.7% | 0.19 |
+
+Read honestly: the model loses raw QA hard to its own teacher (capacity plus a lossy transfer pipeline), roughly matches GPT-2, and beats Pythia-160M despite an order of magnitude less training data. Its structural wins are native infill (every autoregressive baseline scores near zero because the task requires conditioning on both sides of a gap) and loop resistance (7.5% degenerate answers vs 37.5% for its teacher). Latency is its worst axis: 128 denoising steps with classifier-free guidance is 21x slower than the teacher.
+
+An inference-time quality dial (`scripts/generate.py` in the training repo) maps one knob to denoising steps and best-of-N with a verifier: measured 2.2 to 27.7 seconds per answer across the dial, QA moving 7.5% to 20% (noisy and not monotone: the cost axis works perfectly, the accuracy axis is capacity-bound). Practical summary: 15% at production settings, 20% with the dial maxed, about 18% at settings you would actually wait for.
+
+### Architecture note: cheaper bidirectionality
+
+A controlled 3-arm A/B (2000 steps from scratch, identical data and seeds) tested whether the duplicated directional stacks can be shared: full double stack (287.9M, tail CE 6.697) vs one shared stack (225.5M, 6.968) vs shared stack plus per-direction LoRA rank 16 (228.4M, 6.797). The 2.9M LoRA adapters recover 63% of the quality lost to sharing while keeping a 21% parameter cut, making shared+LoRA the best parameters-per-nat variant tested. This is an early-learning probe, not a convergence result; the next run's pilot phase will confirm before adoption. Details: `docs/bidir_ab.md` in the training repo.
+
 ## Files
 
 | File | What it is |
@@ -78,9 +98,9 @@ Conclusion: detection is solved externally at this scale; correction additionall
 
 ## Roadmap
 
-- 350M from scratch with Muon (~$200): measure where self-correction turns on, using three probes established here (planted-error detection rate, remask fire rate, critic AUC).
+- Next run (when funded, roughly $1,500 to $4,000): 1.5B with teacher-enabled distillation from SmolLM2-1.7B, Muon optimizer, and the shared-base plus per-direction LoRA bidirectionality validated above. The run starts with a cheap pilot A/B phase (teacher on vs off, architecture ladder) before committing the budget.
+- The scientific goal is a scaling curve for the four probes established here: planted-error detection rate, remask fire rate, critic AUC, and the slope of the inference-compute dial. All four are measured at this scale and waiting for their second data point.
 - Planning-latent tokens: a compressed continuous plan vector conditioning the discrete diffusion.
-- 1B (~$1,000 to $1,600): the scale where LLaDA reports masked diffusion becomes competitive with same-size autoregressive models.
 
 ## Author
 
