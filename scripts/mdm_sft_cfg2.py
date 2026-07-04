@@ -80,15 +80,27 @@ def build_sft_rows(tokenizer):
         q = rng.choice([f"What is {a} {op} {b}?", f"Calculate {a} {op} {b}.",
                         f"{a} {op} {b} = ?"])
         pairs.append((q, f"{a} {op} {b} = {ans}"))
+    # SmolTalk: HF's SFT mix built for SmolLM-135M/360M — single-turn pairs only,
+    # capped so tokenization stays fast; full-fit rows only (no truncated answers)
+    ds2 = load_dataset("HuggingFaceTB/smoltalk", "all", split="train")
+    st = []
+    for ex in ds2:
+        m = ex["messages"]
+        if len(m) >= 2 and m[0]["role"] == "user" and m[1]["role"] == "assistant":
+            st.append((m[0]["content"], m[1]["content"]))
+    rng.shuffle(st)
+    pairs.extend(st[:350000])
     rng.shuffle(pairs)
-    print(f"pairs: {len(pairs)} (alpaca + 20k synthetic math)", flush=True)
+    print(f"pairs: {len(pairs)} (alpaca + 20k math + {min(len(st),350000)} smoltalk)", flush=True)
     rows, plens, rlens = [], [], []
     for q, out in pairs:
         p = tokenizer.encode(f"Question: {q}\nAnswer:", add_special_tokens=False)
         r = tokenizer.encode(" " + out, add_special_tokens=False)
         if len(p) >= SEQ_LEN - 8:  # need room for at least a stub answer
             continue
-        row = (p + r)[:SEQ_LEN - 1] + [eos]
+        if len(p) + len(r) > SEQ_LEN - 1:
+            continue
+        row = p + r + [eos]
         rlen = len(row)  # content + exactly one EOS; padding beyond is NOT trained
         row = row + [eos] * (SEQ_LEN - len(row))
         rows.append(row)
