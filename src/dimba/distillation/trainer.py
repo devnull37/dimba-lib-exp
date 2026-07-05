@@ -643,11 +643,14 @@ class DistillationTrainer:
                     # student[:, 1:] (reconstructing tokens 1..L-1). Unshifted, the
                     # KD term teaches next-token prediction against the CE loss's
                     # same-token target — two contradictory objectives per position.
+                    # ponytail: causal teacher predicts i+1 so shift; masked/bidir predicts i, no shift.
+                    if self.teacher.is_causal:
+                        s_lg, t_lg = student_logits[:, 1:], teacher_logits[:, :-1]
+                    else:
+                        s_lg, t_lg = student_logits, teacher_logits
                     kd_loss = stage3_kd_loss(
-                        student_logits[:, 1:],
-                        teacher_logits[:, :-1].to(
-                            device=student_logits.device, dtype=student_logits.dtype
-                        ),
+                        s_lg,
+                        t_lg.to(device=student_logits.device, dtype=student_logits.dtype),
                         kd_temp=kd_temp,
                     )
                     loss = loss + kd_weight * kd_loss

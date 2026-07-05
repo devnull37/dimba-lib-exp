@@ -154,8 +154,8 @@ def eval_step(model, tokenizer, step: int, mask_id: int):
     # infill-recovery gate: mask 50% of a held-out sentence, measure recovery
     gt = torch.tensor([tokenizer.encode(GATE_TEXT, add_special_tokens=False)],
                       dtype=torch.long, device=DEVICE)
-    torch.manual_seed(0)
-    m = torch.rand_like(gt, dtype=torch.float) < 0.5
+    g_rng = torch.Generator(device=gt.device).manual_seed(0)
+    m = torch.rand(gt.shape, generator=g_rng, device=gt.device) < 0.5
     corrupted = torch.where(m, mask_id, gt)
     logits = model.predict_token_logits(corrupted, 0.5)
     pred = logits.argmax(dim=-1)

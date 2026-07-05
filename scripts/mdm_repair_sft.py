@@ -1,16 +1,19 @@
-"""SFT for the masked-diffusion model (LLaDA-style instruction tuning).
+"""Repair SFT for the masked-diffusion model (LLaDA-style instruction tuning).
 
-Resumes checkpoints/masked_diffusion/mdm_latest.pt. Each example is a fixed
+Resumes checkpoints/mdm_sft_cfg2/mdm_sft_final.pt. Each example is a fixed
 SEQ_LEN row: [prompt | response | EOS padding]. The prompt is NEVER masked
 (always clean conditioning); the response region — including the EOS padding,
 which is how the model learns to end answers — is masked at ratio t ~ U[T_MIN,1]
-and trained with CE on masked positions, 1/t weighted. No GRPO after: proven
-twice that RL cannot bootstrap without parseable answers.
+and trained with CE on masked positions, 1/t weighted. On top of plain SFT this
+adds: repair token-planting (REPAIR_FRAC of response tokens replaced with wrong
+tokens the model must detect+fix), CFG prompt dropout (P_DROP fraction trained
+with a null prompt, so eval can apply classifier-free guidance at scale
+GUIDANCE), and an unlikelihood penalty (UL_WEIGHT) on visible-neighbor repeats.
 
-Data: tatsu-lab/alpaca (52k, no trust_remote_code), template
-"Question: {instruction}\n{input}\nAnswer: {output}".
+Data: tatsu-lab/alpaca (52k) + 20k synthetic arithmetic + up to 350k
+HuggingFaceTB/smoltalk pairs, template "Question: {instruction}\n{input}\nAnswer: {output}".
 
-Usage: mdm_sft.py [--steps N] [--batch B] [--smoke]
+Usage: mdm_repair_sft.py [--steps N] [--batch B] [--smoke]
 """
 import argparse
 import inspect
@@ -28,8 +31,8 @@ CKPT = "checkpoints/mdm_sft_cfg2/mdm_sft_final.pt"
 OUT_DIR = "checkpoints/mdm_repair"
 REPAIR_FRAC = 0.15  # of response tokens: planted WRONG tokens the model must detect+fix
 P_DROP = 0.1          # fraction of rows trained with a null (fully masked) prompt
-GUIDANCE = 2.5
-UL_WEIGHT = 0.5  # unlikelihood penalty on visible-neighbor repeats        # eval-time CFG scale: uncond + s * (cond - uncond)
+GUIDANCE = 2.5  # eval-time CFG scale: uncond + s * (cond - uncond)
+UL_WEIGHT = 0.5  # unlikelihood penalty on visible-neighbor repeats
 SEQ_LEN = 256
 LR = 2e-5
 WARMUP = 100

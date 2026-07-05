@@ -210,7 +210,9 @@ def ar_generate(model, tok, prompt_text, max_new_tokens=40, temperature=None,
 # ---------------------------------------------------------------------------
 def kw_hit(answer_text, keywords):
     a = answer_text.lower()
-    return any(kw.lower() in a for kw in keywords)
+    # ponytail: \b boundary avoids 'au' matching inside 'because'/'australia' and
+    # digit keywords matching inside larger numbers
+    return any(re.search(r"\b" + re.escape(kw.lower()) + r"\b", a) for kw in keywords)
 
 
 def distinct_n(texts, n):

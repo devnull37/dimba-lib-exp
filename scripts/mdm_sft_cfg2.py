@@ -27,8 +27,8 @@ from dimba import DIMBA
 CKPT = "checkpoints/mdm_sft_cfg/mdm_sft_final.pt"
 OUT_DIR = "checkpoints/mdm_sft_cfg2"
 P_DROP = 0.1          # fraction of rows trained with a null (fully masked) prompt
-GUIDANCE = 2.5
-UL_WEIGHT = 0.5  # unlikelihood penalty on visible-neighbor repeats        # eval-time CFG scale: uncond + s * (cond - uncond)
+GUIDANCE = 2.5        # eval-time CFG scale: uncond + s * (cond - uncond)
+UL_WEIGHT = 0.5       # unlikelihood penalty on visible-neighbor repeats
 SEQ_LEN = 256
 LR = 5e-5
 WARMUP = 100

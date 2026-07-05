@@ -61,10 +61,10 @@ cmd_verify() {
         # (a) Stable size check — wait ~30s and compare
         info "  Checking stable size (sleeping 30s) …"
         local size1
-        size1=$(stat -c%s "$REPO_DIR/$CKPT" 2>/dev/null)
+        size1=$(stat -c%s "$REPO_DIR/$CKPT" 2>/dev/null || stat -f%z "$REPO_DIR/$CKPT" 2>/dev/null)
         sleep 30
         local size2
-        size2=$(stat -c%s "$REPO_DIR/$CKPT" 2>/dev/null)
+        size2=$(stat -c%s "$REPO_DIR/$CKPT" 2>/dev/null || stat -f%z "$REPO_DIR/$CKPT" 2>/dev/null)
         if [[ "$size1" != "$size2" ]]; then
             red "  FAIL: checkpoint size changed ($size1 → $size2) — still being written"
             errors=$((errors + 1))
@@ -111,9 +111,9 @@ cmd_verify() {
         gen_out=$(
             CUDA_VISIBLE_DEVICES="" "$VENV/bin/python3" "$REPO_DIR/scripts/generate.py" \
                 --checkpoint "$REPO_DIR/$CKPT" \
-                --prompt "The quick brown fox jumps over" \
-                --length 32 \
-                --num-steps 20 \
+                "The quick brown fox jumps over" \
+                --gen-len 32 \
+                --steps 20 \
                 2>&1
         )
         local gen_exit=$?

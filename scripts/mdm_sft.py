@@ -1,6 +1,6 @@
 """SFT for the masked-diffusion model (LLaDA-style instruction tuning).
 
-Resumes checkpoints/masked_diffusion/mdm_latest.pt. Each example is a fixed
+Resumes checkpoints/masked_diffusion2/mdm_latest.pt. Each example is a fixed
 SEQ_LEN row: [prompt | response | EOS padding]. The prompt is NEVER masked
 (always clean conditioning); the response region — including the EOS padding,
 which is how the model learns to end answers — is masked at ratio t ~ U[T_MIN,1]

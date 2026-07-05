@@ -1544,13 +1544,14 @@ def main() -> None:
     if args.hf_repo:
         logger.info("HuggingFace upload enabled → %s", args.hf_repo)
 
-    if args.phase in ("distill", "all"):
-        ckpt = run_distill(device, resume=_resume_for("distill"), **hf_kw)
-
     # --save-dir only overrides the single explicitly-selected phase; in
     # --phase all mode each phase keeps its default dir (the handoff paths).
     def _save_dir_for(phase: str, default: str) -> str:
         return args.save_dir if (args.save_dir and args.phase == phase) else default
+
+    if args.phase in ("distill", "all"):
+        ckpt = run_distill(device, resume=_resume_for("distill"),
+                            save_dir=_save_dir_for("distill", "./checkpoints/distill"), **hf_kw)
 
     if args.phase in ("sft", "all"):
         ckpt = run_sft(ckpt, device, resume=_resume_for("sft"),

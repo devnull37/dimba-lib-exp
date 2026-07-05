@@ -266,14 +266,15 @@ def slider_generate(model, tokenizer, mask_id, question, quality=0.5,
         plus best (index) and all_texts.
     """
     eos = tokenizer.eos_token_id
-    steps = int(overrides.get("steps") or steps_for_quality(quality))
-    n = int(overrides.get("n") or n_for_quality(quality))
-    gen_len = int(overrides.get("gen_len") or DEFAULT_GEN_LEN)
-    temperature = float(overrides.get("temperature") or DEFAULT_TEMPERATURE)
-    guidance = float(overrides.get("guidance") or DEFAULT_GUIDANCE)
-    top_k = int(overrides.get("top_k") or DEFAULT_TOP_K)
-    freq_pen = overrides.get("freq_pen")
-    freq_pen = DEFAULT_FREQ_PEN if freq_pen is None else float(freq_pen)
+    # ponytail: `or` treats falsy overrides (e.g. --guidance 0) as unset; use None-check like freq_pen did.
+    ov = lambda k, default: default if overrides.get(k) is None else overrides.get(k)
+    steps = int(ov("steps", steps_for_quality(quality)))
+    n = int(ov("n", n_for_quality(quality)))
+    gen_len = int(ov("gen_len", DEFAULT_GEN_LEN))
+    temperature = float(ov("temperature", DEFAULT_TEMPERATURE))
+    guidance = float(ov("guidance", DEFAULT_GUIDANCE))
+    top_k = int(ov("top_k", DEFAULT_TOP_K))
+    freq_pen = float(ov("freq_pen", DEFAULT_FREQ_PEN))
     seed = overrides.get("seed")
 
     if seed is not None:

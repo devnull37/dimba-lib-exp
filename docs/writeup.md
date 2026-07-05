@@ -1,12 +1,12 @@
-# What a $60 diffusion language model taught me about test-time compute
+# What a $450 diffusion language model taught me about test-time compute
 
 *by Faris Allafi, July 2026, draft*
 
 I'm 14, self-funded, and for the past months I've been building **DIMBA**: a language model that uses a *bidirectional Mamba* backbone with a *diffusion* objective instead of the usual left-to-right transformer. This is the story of how the first version failed for $358, how a pivot to masked diffusion made it work, and how one long day of test-time-compute experiments produced the most interesting finding of the project:
 
-> **At 135M parameters, every inference-time technique that asks the model to judge itself fails, and every technique that imposes an external constraint works.** Self-judgment is the first casualty of small scale.
+> **At 135M-class scale, every inference-time technique that asks the model to judge itself fails, and every technique that imposes an external constraint works.** Self-judgment is the first casualty of small scale.
 
-I measured that six different ways. Everything below is a real, unedited model output. All checkpoints and code are public, including the failures, because negative results are results.
+I measured that six different ways (287.9M measured parameters, 135M-class backbone capacity). Everything below is a real, unedited model output. All checkpoints and code are public, including the failures, because negative results are results.
 
 ## Part 1: The $358 failure (and why it was worth it)
 
@@ -54,7 +54,7 @@ First factually correct answer in the project's history. You can watch the fact 
 Next I scaled SFT: 422k pairs (Alpaca + 350k SmolTalk + 20k math), 15k steps, with CFG dropout. Real wins:
 
 - Richer, more natural sentence shapes from SmolTalk. The sky question got its first correct answer ("bright blue").
-- Math data taught the model the *format* of equations, but not arithmetic. "What is 2+3?" produces equation-shaped output with wrong numbers. Format is learnable at 135M; computation is not.
+- Math data taught the model the *format* of equations, but not arithmetic. "What is 2+3?" produces equation-shaped output with wrong numbers. Format is learnable at 135M-class; computation is not.
 
 And two brutally clean capacity results:
 
@@ -65,7 +65,7 @@ And two brutally clean capacity results:
 > Q: "What is the capital of Japan?" →
 > "The capital of Paris is Paris, Paris, France, France..."
 
-It learned "capital → Paris" as a *drilled association*, not "capital of X → look up X". One fact fit in the weights; the schema didn't. That single output tells you more about what 135M parameters can hold than any benchmark number.
+It learned "capital → Paris" as a *drilled association*, not "capital of X → look up X". One fact fit in the weights; the schema didn't. That single output tells you more about what a 135M-class model can hold than any benchmark number.
 
 ## Part 6: Sampling is training you get for free
 

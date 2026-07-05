@@ -6,10 +6,10 @@ two scan directions get their weights:
   A "double"      (control): the current architecture. Each Mamba2Block owns two
                   independent directional mixers (mamba_fwd + mamba_bwd).
   B "shared":     ONE mixer per block, its Parameter objects reused for both
-                  directions. We literally point block.mamba_bwd at block.mamba_fwd,
-                  so the existing _mix() runs the shared stack on the sequence and
-                  on the reversed sequence and sums them, exactly as the control
-                  merges fwd/bwd -- just with tied weights.
+                  directions. We drop block.mamba_bwd (set to None) and override
+                  _mix() to run block.mamba_fwd on both the sequence and its
+                  reverse, summing them exactly as the control merges fwd/bwd --
+                  so both directions share one weight set.
   C "shared_lora": arm B, plus tiny per-direction LoRA adapters (rank 16, alpha 16)
                   on the mixer's principal projections (in_proj / out_proj). The
                   shared base is used both ways; a separate adapter set specializes
@@ -156,9 +156,9 @@ def build_arm(arm: str):
     elif arm in ("shared", "shared_lora"):
         for blk in blocks:
             assert blk.bidirectional and blk.mamba_bwd is not None
-            # Tie backward -> forward: same Parameter objects. mamba_bwd is now
-            # dead weight (never called after we override _mix), but we also drop
-            # its module so its params don't count / don't get an optimizer entry.
+            # Drop mamba_bwd entirely; the overridden _mix runs mamba_fwd both
+            # directions, so the two scans share one weight set. Setting it None
+            # also keeps its params out of the optimizer.
             blk.mamba_bwd = None
             if arm == "shared_lora":
                 state = _DirState()

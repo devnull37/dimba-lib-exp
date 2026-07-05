@@ -91,10 +91,11 @@ for i in (0, 3, 6):
     prompt = batch[i:i+1, :8]
     for steps_n, samp in ((50, "heun"), (20, "euler")):
         with torch.no_grad():
-            g = sample_from_model_flow(model, prompt, seq_len=SEQ_LEN, num_steps=steps_n,
+            g = sample_from_model_flow(model, prompt, seq_len=SEQ_LEN - 8, num_steps=steps_n,
                                        sampler=samp, temperature=0.3, top_k=50, device=DEVICE)
         out = g[0].tolist()
-        match = sum(a == b for a, b in zip(out, batch[i].tolist())) / SEQ_LEN
+        target = batch[i, 8:].tolist()
+        match = sum(a == b for a, b in zip(out, target)) / len(target)
         print(f"  row{i} [{samp} n={steps_n}] token-match={match:.2f}", flush=True)
         print(f"    {tok.decode([x for x in out if x < 49152])!r}", flush=True)
 

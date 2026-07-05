@@ -223,10 +223,10 @@ def _write_markdown(rows: list[dict], errors: list[dict], wall_total: float):
         interp_lines = [
             trend_phrase,
             (
-                f"The cost dimension does scale as designed: total wall time for Q=1.0 "
-                f"({hi_row['total_s']:.0f} s) is {cost_ratio:.1f}x that of Q=0.1 "
+                f"The cost dimension does scale as designed: total wall time for Q={hi_row['Q']} "
+                f"({hi_row['total_s']:.0f} s) is {cost_ratio:.1f}x that of Q={lo_row['Q']} "
                 f"({lo_row['total_s']:.0f} s), driven by the joint increase in "
-                f"diffusion steps ({lo_row['steps']} at Q=0.1, {hi_row['steps']} at Q=1.0) "
+                f"diffusion steps ({lo_row['steps']} at Q={lo_row['Q']}, {hi_row['steps']} at Q={hi_row['Q']}) "
                 f"and best-of-N candidates (N={lo_row['n']} to N={hi_row['n']})."
             ),
             (
