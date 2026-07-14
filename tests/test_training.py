@@ -4,8 +4,17 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from dimba.training.trainer import DIMBALightningModule, SimpleTrainer
+from dimba.training.trainer import (
+    DIMBALightningModule,
+    SimpleTrainer,
+    VAETrainer,
+    compute_consistency_loss,
+    compute_dimba_losses,
+)
+from dimba.training.optimizers import HybridMuon
 from dimba.data import DummyDataset, collate_fn
+from dimba.models.embeddings import TokenEmbedding
+from dimba.models.vae import TokenVAE
 
 
 class TestDIMBALightningModule:
@@ -65,6 +74,84 @@ class TestDIMBALightningModule:
         assert 'optimizer' in config
         assert 'lr_scheduler' in config
 
+    def test_configure_muon_optimizer(self):
+        module = DIMBALightningModule(
+            vocab_size=100,
+            model_config={
+                'd_model': 32,
+                'd_prompt': 32,
+                'num_diffusion_steps': 10,
+                'num_denoiser_layers': 1,
+                'use_simple_mamba': True,
+            },
+            use_ema=False,
+            optimizer='muon',
+        )
+
+        class DummyTrainer:
+            estimated_stepping_batches = 100
+
+        module.trainer = DummyTrainer()
+        config = module.configure_optimizers()
+
+        assert isinstance(config['optimizer'], HybridMuon)
+        assert not any('token_embed' in name for name in config['optimizer'].muon_parameter_names)
+        assert not any('output_head' in name for name in config['optimizer'].muon_parameter_names)
+
+
+def test_consistency_loss_handles_mixed_valid_deltas_without_filter_shape_bug():
+    from dimba.models.diffusion import DIMBA
+
+    torch.manual_seed(15)
+    model = DIMBA(
+        vocab_size=32,
+        d_model=16,
+        d_prompt=16,
+        num_diffusion_steps=10,
+        num_denoiser_layers=1,
+        d_state=4,
+        use_simple_mamba=True,
+        dropout=0.0,
+    )
+    ids = torch.randint(0, 32, (4, 6))
+    loss = compute_consistency_loss(
+        model,
+        ids,
+        model.token_embed(ids),
+        torch.tensor([0, 1, 5, 9]),
+        delta_min=2,
+        delta_max=4,
+    )
+
+    assert torch.isfinite(loss)
+    loss.backward()
+
+
+def test_consistency_loss_is_zero_when_no_row_has_a_valid_delta():
+    from dimba.models.diffusion import DIMBA
+
+    model = DIMBA(
+        vocab_size=16,
+        d_model=8,
+        d_prompt=8,
+        num_diffusion_steps=8,
+        num_denoiser_layers=1,
+        d_state=2,
+        use_simple_mamba=True,
+        dropout=0.0,
+    )
+    ids = torch.randint(0, 16, (2, 4))
+    loss = compute_consistency_loss(
+        model,
+        ids,
+        model.token_embed(ids),
+        torch.zeros(2, dtype=torch.long),
+        delta_min=2,
+        delta_max=4,
+    )
+
+    torch.testing.assert_close(loss, torch.zeros_like(loss))
+
 
 class TestSimpleTrainer:
     """Test simple training loop."""
@@ -122,6 +209,46 @@ class TestSimpleTrainer:
 
         updated_ema = next(trainer.ema_model.parameters())
         assert not torch.allclose(initial_ema, updated_ema)
+
+
+def test_vae_trainer_flushes_partial_accumulation_and_validates() -> None:
+    rows = [{"input_ids": torch.randint(0, 20, (5,))} for _ in range(5)]
+    loader = DataLoader(rows, batch_size=2)
+    trainer = VAETrainer(
+        vae=TokenVAE(8, 4, num_layers=1, dropout=0.0),
+        token_embed=TokenEmbedding(20, 8),
+        train_dataloader=loader,
+        val_dataloader=loader,
+        device="cpu",
+        num_epochs=1,
+        warmup_steps=1,
+        gradient_accumulation_steps=2,
+    )
+
+    trainer.train()
+
+    assert trainer.global_step == 2
+    metrics = trainer.validate()
+    assert len(metrics) == 3
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is unavailable")
+def test_documented_mps_small_recipe_forward_backward() -> None:
+    from scripts.train_interactive import PRESETS
+    from dimba.models.diffusion import DIMBA
+
+    config = dict(PRESETS["mps-small"]["model"])
+    model = DIMBA(vocab_size=128, **config).to("mps")
+    input_ids = torch.randint(0, 128, (1, 32), device="mps")
+    timesteps = torch.randint(
+        0, model.num_diffusion_steps, (1,), device="mps"
+    )
+    loss, _ = compute_dimba_losses(model, input_ids, timesteps)
+    loss.backward()
+    torch.mps.synchronize()
+
+    assert torch.isfinite(loss.cpu())
 
 
 if __name__ == '__main__':

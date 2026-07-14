@@ -376,6 +376,7 @@ class TeacherWrapper(nn.Module):
             input_ids=input_ids,
             output_hidden_states=True,
             output_attentions=True,
+            use_cache=False,
             return_dict=True,
         )
         if attention_mask is not None:
@@ -410,6 +411,29 @@ class TeacherWrapper(nn.Module):
             hidden_states=hidden_states,
             attentions=tuple(cleaned_attentions),
             logits=logits,
+        )
+
+    def logits_only(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> TeacherOutputs:
+        """Run the Stage-3 teacher without materializing hidden states or attentions."""
+        input_ids = input_ids.to(self._hf_model.device)
+        kwargs: Dict = dict(
+            input_ids=input_ids,
+            output_hidden_states=False,
+            output_attentions=False,
+            use_cache=False,
+            return_dict=True,
+        )
+        if attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask.to(self._hf_model.device)
+        outputs = self._hf_model(**kwargs)
+        return TeacherOutputs(
+            hidden_states=(),
+            attentions=(),
+            logits=getattr(outputs, "logits", None),
         )
 
     # ------------------------------------------------------------------

@@ -25,8 +25,13 @@ import argparse
 import inspect
 import math
 import os
+import shutil
 import sys
 import time
+import warnings
+
+# System-python 3.9 ships LibreSSL; urllib3 warns about it on every run. Harmless.
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import torch
 import torch.nn.functional as F
@@ -42,8 +47,20 @@ from dimba import DIMBA  # noqa: E402
 # --------------------------------------------------------------------------- #
 # Constants (validated defaults; overridable via CLI expert flags).
 # --------------------------------------------------------------------------- #
-DEVICE = "cuda"
-DTYPE = torch.bfloat16
+DEVICE = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
+# bf16 matmuls are CUDA-tuned; fp32 is the safe/fast default elsewhere (MPS included).
+DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+
+def _sync():
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE == "mps":
+        torch.mps.synchronize()
 T_MIN = 0.03                # floor for the fraction-masked t passed to the model
 DEFAULT_GEN_LEN = 40
 DEFAULT_TEMPERATURE = 0.7
@@ -62,14 +79,84 @@ CRITIC_TIE_BAND = 0.02      # gap within this band -> break tie with critic
 # Loading.
 # --------------------------------------------------------------------------- #
 def load_model(path: str = DEFAULT_CKPT):
-    """Load the flagship DIMBA checkpoint. Returns (model, mask_id)."""
-    ck = torch.load(path, map_location="cpu")
+    """Load the flagship DIMBA checkpoint. Returns (model, mask_id).
+
+    Falls back to the HuggingFace release (devnull37/hr-diffuse-1-nano) when
+    the local training checkpoint is absent."""
+    if not os.path.exists(path):
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download("devnull37/hr-diffuse-1-nano", "hr_diffuse_1_nano.pt")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
     cfg, mask_id = dict(ck["config"]), ck["mask_id"]
     sig = set(inspect.signature(DIMBA.__init__).parameters) - {"self"}
     model = DIMBA(**{k: v for k, v in cfg.items() if k in sig})
-    model.load_state_dict(ck["model_state_dict"], strict=False)
+    model.load_state_dict(ck["model_state_dict"], strict=True)
     model = model.to(DEVICE).to(DTYPE).eval()
     return model, mask_id
+
+
+class _MLXModel:
+    """Thin Torch-facing adapter around the device-resident MLX sampler."""
+
+    def __init__(self, torch_model):
+        from dimba.backends.mlx.model import MLXDIMBA
+        import numpy as np
+        self._np = np
+        self._m = MLXDIMBA.from_torch(torch_model)
+
+    def predict_token_logits(self, ids, t):
+        out = self._m.predict_token_logits(ids.cpu().numpy(), float(t))
+        return torch.from_numpy(self._np.array(out))
+
+    def guided_logits(self, ids, mask_id, prompt_len, t, guidance, positions=None):
+        import mlx.core as mx
+        pos = None if positions is None else positions.cpu().numpy()
+        out = self._m.guided_token_logits(
+            ids.cpu().numpy(), mask_id, prompt_len, float(t), guidance, pos
+        )
+        mx.eval(out)
+        return torch.from_numpy(self._np.array(out))
+
+    def masked_generate(
+        self,
+        prompt_ids,
+        mask_id,
+        *,
+        gen_len,
+        steps,
+        temperature,
+        top_k,
+        freq_pen,
+        guidance,
+        seed,
+        on_step,
+    ):
+        callback = None
+        if on_step is not None:
+
+            def callback(ids, still, step, total):
+                on_step(torch.from_numpy(ids), torch.from_numpy(still), step, total)
+
+        out = self._m.sample_masked(
+            prompt_ids.cpu().numpy(),
+            mask_id,
+            gen_len=gen_len,
+            steps=steps,
+            temperature=temperature,
+            top_k=top_k,
+            freq_pen=freq_pen,
+            guidance=guidance,
+            seed=seed,
+            on_step=callback,
+        )
+        return torch.from_numpy(out)
+
+    def gap_score(self, ids, mask_id, eos, prompt_len, groups):
+        return torch.from_numpy(
+            self._m.masked_gap_score(
+                ids.cpu().numpy(), mask_id, eos, prompt_len, groups
+            )
+        )
 
 
 def load_tokenizer():
@@ -78,7 +165,7 @@ def load_tokenizer():
     return AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
 
-def load_critic():
+def load_critic(use_compile=True):
     """Load the trained critic head MLP: Linear(dim,256)+GELU+Linear(256,1)."""
     ck = torch.load(CRITIC_CKPT, map_location="cpu")
     dim = ck["dim"]
@@ -87,23 +174,110 @@ def load_critic():
     )
     state = {k.replace("net.", ""): v for k, v in ck["critic_state_dict"].items()}
     critic.load_state_dict(state)
-    return critic.to(DEVICE).to(DTYPE).eval()
+    critic = critic.to(DEVICE).to(DTYPE).eval()
+    from dimba.utils.compile import maybe_compile_fn
+    return maybe_compile_fn(critic, enable=use_compile,
+                            dynamic=True if DEVICE == "cuda" else None)
 
 
 # --------------------------------------------------------------------------- #
 # Sampler (replicates selfcorrect_test.py: guided_logits + generate).
 # --------------------------------------------------------------------------- #
-@torch.no_grad()
-def guided_logits(model, mask_id, ids, prompt_len, t, guidance):
-    """Classifier-free guidance: lu + guidance * (lc - lu)."""
-    lc = model.predict_token_logits(ids, t).float()
+@torch.inference_mode()
+def guided_logits(model, mask_id, ids, prompt_len, t, guidance, positions=None):
+    """Classifier-free guidance: lu + guidance * (lc - lu).
+
+    The cond and uncond passes are batched into one forward (identical math,
+    one model dispatch instead of two)."""
+    if hasattr(model, "guided_logits"):  # MLX: CFG combined on-GPU
+        return model.guided_logits(ids, mask_id, prompt_len, t, guidance, positions)
     u = ids.clone()
     u[:, :prompt_len] = mask_id
-    lu = model.predict_token_logits(u, t).float()
+    if guidance in (0.0, 1.0):
+        chosen = u if guidance == 0.0 else ids
+        if hasattr(model, "predict_token_features"):
+            features = model.predict_token_features(chosen, t)
+            return model.project_token_features(features, positions=positions).float()
+        return model.predict_token_logits(chosen, t, positions=positions).float()
+    both_ids = torch.cat([ids, u], dim=0)
+    if hasattr(model, "predict_token_features"):
+        # The final head projection is linear. Combine post-normalization/head-
+        # attention features first, then project once: exactly the same CFG logits
+        # with half the vocabulary GEMMs and only unresolved positions materialized.
+        features = model.predict_token_features(both_ids, t)
+        fc, fu = features.chunk(2, dim=0)
+        return model.project_token_features(
+            fu + guidance * (fc - fu), positions=positions
+        ).float()
+    both_positions = torch.cat([positions, positions], dim=0) if positions is not None else None
+    both = model.predict_token_logits(
+        both_ids, t, positions=both_positions
+    ).float()
+    lc, lu = both.chunk(2, dim=0)
     return lu + guidance * (lc - lu)
 
 
-@torch.no_grad()
+def _denoise_step(logits, ids, still, positions, prompt_len, mask_id,
+                  temperature, top_k, freq_pen, n_keep):
+    """One fused denoising step: frequency penalty, temperature, top-k,
+    sampling, confidence-ranked remasking. Pure tensor ops so torch.compile
+    (inductor) can fuse the masking/schedule/penalty math into few kernels.
+
+    ``logits`` contains only the currently unresolved ``positions``; the model
+    still processed the complete bidirectional sequence, but avoids the dominant
+    ``hidden @ vocab`` projection for prompt and committed tokens.
+
+    Returns ``(ids, still, positions)`` for the next step."""
+    B, _, V = logits.shape
+    # Exempt-first frequency penalty over already-committed generated tokens
+    # (vectorized equivalent of the old per-row unique() loop).
+    committed = ~still
+    committed[:, :prompt_len] = False
+    counts = torch.zeros(B, V, device=logits.device, dtype=logits.dtype)
+    counts.scatter_add_(1, ids.masked_fill(~committed, 0),
+                        committed.to(logits.dtype))
+    logits = logits - freq_pen * (counts - 1).clamp(min=0).unsqueeze(1)
+    # Temperature AFTER penalty/guidance, then top-k multinomial sampling.
+    logits = logits / temperature
+    top_values, top_indices = logits.topk(top_k, dim=-1)
+    top_probs = F.softmax(top_values, dim=-1)
+    choice = torch.multinomial(top_probs.reshape(-1, top_k), 1).view(B, -1, 1)
+    sampled = top_indices.gather(-1, choice).squeeze(-1)
+    conf = top_probs.gather(-1, choice).squeeze(-1)
+    ids = ids.scatter(1, positions, sampled)
+    if n_keep > 0:
+        keep_local = conf.topk(n_keep, dim=1, largest=False).indices
+        positions = positions.gather(1, keep_local)
+        still = torch.zeros_like(still).scatter(1, positions, True)
+        ids = ids.scatter(1, positions, torch.full_like(positions, mask_id))
+    else:
+        positions = positions[:, :0]
+        still = torch.zeros_like(still)
+    return ids, still, positions
+
+
+# Compiled lazily on first use so import stays cheap and --no-compile can veto.
+_compiled_step = None
+
+
+def _get_step(use_compile):
+    global _compiled_step
+    if not use_compile:
+        return _denoise_step
+    if _compiled_step is None:
+        from dimba.utils.compile import maybe_compile_fn
+        # dynamic=True lets inductor fuse across the varying still-masked
+        # fraction without a recompile per n_keep; the MPS inductor backend
+        # chokes on explicit dynamic=True (torch 2.8), so let dynamo
+        # auto-detect there. maybe_compile_fn falls back to eager on any
+        # compile or runtime failure, so this is safe on every device.
+        _compiled_step = maybe_compile_fn(
+            _denoise_step, dynamic=True if DEVICE == "cuda" else None
+        )
+    return _compiled_step
+
+
+@torch.inference_mode()
 def generate(
     model,
     mask_id,
@@ -114,44 +288,68 @@ def generate(
     top_k=DEFAULT_TOP_K,
     freq_pen=DEFAULT_FREQ_PEN,
     guidance=DEFAULT_GUIDANCE,
+    on_step=None,
+    use_compile=True,
+    seed=None,
 ):
-    """MaskGIT-style iterative unmasking with a cosine remask schedule."""
+    """MaskGIT-style iterative unmasking with a cosine remask schedule.
+
+    The per-step tensor math (penalty, top-k, sampling, remask) runs through
+    ``torch.compile`` when available (CUDA/MPS/CPU inductor), falling back to
+    eager transparently. ``on_step(ids, still, s, steps)`` is called after
+    every unmasking step (used by --watch to render the denoising live)."""
+    if steps < 1 or gen_len < 1:
+        raise ValueError("steps and gen_len must be positive")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    if seed is not None:
+        torch.manual_seed(int(seed))
+    if hasattr(model, "masked_generate"):
+        return model.masked_generate(
+            prompt_ids,
+            mask_id,
+            gen_len=gen_len,
+            steps=steps,
+            temperature=temperature,
+            top_k=top_k,
+            freq_pen=freq_pen,
+            guidance=guidance,
+            seed=seed,
+            on_step=on_step,
+        )
+
+    step_fn = _get_step(use_compile)
     B, P = prompt_ids.shape
+    device = prompt_ids.device
     ids = torch.cat(
         [
             prompt_ids,
-            torch.full((B, gen_len), mask_id, dtype=torch.long, device=DEVICE),
+            torch.full((B, gen_len), mask_id, dtype=torch.long, device=device),
         ],
         dim=1,
     )
-    still = torch.zeros(B, P + gen_len, dtype=torch.bool, device=DEVICE)
+    still = torch.zeros(B, P + gen_len, dtype=torch.bool, device=device)
     still[:, P:] = True
+    positions = torch.arange(P, P + gen_len, device=device).unsqueeze(0).expand(B, -1)
+    n_active = gen_len
     for s in range(steps):
-        frac = still.float().mean().item()
-        logits = guided_logits(model, mask_id, ids, P, max(frac, T_MIN), guidance)
-        # Exempt-first frequency penalty over already-committed generated tokens.
-        for b in range(B):
-            comm = ids[b, P:][~still[b, P:]]
-            if comm.numel():
-                uniq, cnt = comm.unique(return_counts=True)
-                logits[b, :, uniq] -= freq_pen * (cnt - 1).clamp(min=0).float()
-        # Temperature AFTER penalty/guidance, then top-k multinomial sampling.
-        logits = logits / temperature
-        kth = logits.topk(top_k, dim=-1).values[..., -1:]
-        logits = logits.masked_fill(logits < kth, float("-inf"))
-        probs = F.softmax(logits, dim=-1)
-        sampled = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, -1)
-        conf = probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-        conf = conf.masked_fill(~still, float("inf"))
+        # Python already knows the schedule count; avoid a GPU -> host ``.item()``
+        # synchronization just to recover the masked fraction.
+        frac = n_active / (P + gen_len)
+        logits = guided_logits(
+            model, mask_id, ids, P, max(frac, T_MIN), guidance, positions
+        )
         n_keep = int(gen_len * math.cos(math.pi / 2 * (s + 1) / steps))
-        ids = torch.where(still, sampled, ids)
-        if n_keep > 0:
-            remask = torch.zeros_like(still)
-            remask.scatter_(1, conf.argsort(dim=1)[:, :n_keep], True)
-            remask &= still
-            ids = torch.where(remask, mask_id, ids)
-            still = remask
-        else:
+        ids, still, positions = step_fn(
+            logits, ids, still, positions, P, mask_id,
+            temperature, top_k, freq_pen, n_keep,
+        )
+        n_active = n_keep
+        if on_step:
+            on_step(ids, still, s, steps)
+        if n_keep <= 0:
             break
     return ids
 
@@ -159,32 +357,64 @@ def generate(
 # --------------------------------------------------------------------------- #
 # Verifiers.
 # --------------------------------------------------------------------------- #
-@torch.no_grad()
+@torch.inference_mode()
 def gap_score(model, mask_id, eos, ids, prompt_len, K=4):
     """Guidance-gap verifier (bestofn2.py): mean over generated positions of
     [logp_cond - logp_uncond] for the committed token, with the scored
     positions MASKED via K interleaved leave-k-out passes at t=0.25.
     Higher = better."""
+    if K < 1:
+        raise ValueError("K must be positive")
+    if hasattr(model, "gap_score"):
+        return model.gap_score(ids, mask_id, eos, prompt_len, K)
+
     B, L = ids.shape
+    if prompt_len >= L:
+        return torch.zeros(B, device=ids.device)
     gen = torch.zeros_like(ids, dtype=torch.bool)
     gen[:, prompt_len:] = (ids[:, prompt_len:] != eos) & (ids[:, prompt_len:] != mask_id)
-    pos = torch.arange(L, device=ids.device)[None, :].expand(B, L)
-    tot = torch.zeros(B, device=ids.device)
-    n = torch.zeros(B, device=ids.device)
+    response_positions = torch.arange(prompt_len, L, device=ids.device)
+    width = (response_positions.numel() + K - 1) // K
+    variants, selected_positions, valid_positions, selected_tokens = [], [], [], []
     for r in range(K):
-        m = gen & (pos % K == r)
-        if not m.any():
-            continue
+        positions_r = response_positions[response_positions % K == r]
+        valid_width = torch.arange(width, device=ids.device) < positions_r.numel()
+        if positions_r.numel() < width:
+            positions_r = F.pad(positions_r, (0, width - positions_r.numel()))
+        positions_r = positions_r.unsqueeze(0).expand(B, -1)
+        valid = gen.gather(1, positions_r) & valid_width.unsqueeze(0)
+        m = torch.zeros_like(gen).scatter(1, positions_r, valid)
         x = ids.masked_fill(m, mask_id)
-        lc = F.log_softmax(model.predict_token_logits(x, 0.25).float(), -1)
-        u = x.clone()
-        u[:, :prompt_len] = mask_id
-        lu = F.log_softmax(model.predict_token_logits(u, 0.25).float(), -1)
-        tokp = ids.unsqueeze(-1)
-        gap = (lc.gather(-1, tokp) - lu.gather(-1, tokp)).squeeze(-1)
-        tot += (gap * m).sum(1)
-        n += m.sum(1)
-    return tot / n.clamp(min=1)
+        variants.append(x)
+        selected_positions.append(positions_r)
+        valid_positions.append(valid)
+        selected_tokens.append(ids.gather(1, positions_r))
+
+    conditional = torch.cat(variants, dim=0)
+    positions = torch.cat(selected_positions, dim=0)
+    valid = torch.cat(valid_positions, dim=0)
+    targets = torch.cat(selected_tokens, dim=0)
+    unconditional = conditional.clone()
+    unconditional[:, :prompt_len] = mask_id
+    both_ids = torch.cat((conditional, unconditional), dim=0)
+    both_positions = torch.cat((positions, positions), dim=0)
+
+    if hasattr(model, "predict_token_features"):
+        features = model.predict_token_features(both_ids, 0.25)
+        logits = model.project_token_features(features, positions=both_positions)
+    else:
+        logits = model.predict_token_logits(both_ids, 0.25, positions=both_positions)
+    lc, lu = logits.float().chunk(2, dim=0)
+
+    def chosen_logp(logits):
+        return logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(
+            logits, dim=-1
+        )
+
+    gaps = (chosen_logp(lc) - chosen_logp(lu)) * valid
+    return gaps.view(K, B, width).sum((0, 2)) / valid.view(K, B, width).sum(
+        (0, 2)
+    ).clamp(min=1)
 
 
 @torch.no_grad()
@@ -232,6 +462,30 @@ def n_for_quality(q):
     if q < 0.85:
         return 4
     return 8
+
+
+# --------------------------------------------------------------------------- #
+# Live watch (--watch): redraw the unmasking in place each step.
+# --------------------------------------------------------------------------- #
+def make_watcher(tokenizer, mask_id, prompt_len):
+    """Return an ``on_step`` callback that renders candidate 0's response live,
+    masked positions shown as ░."""
+    state = {"lines": 0}
+
+    def on_step(ids, still, s, steps):
+        toks = ids[0, prompt_len:].tolist()
+        text = "".join(
+            "░" if t >= mask_id else tokenizer.decode([t]) for t in toks
+        ).replace("\n", "¶")
+        out = f"[{s + 1:>3}/{steps}] {text}"
+        width = max(shutil.get_terminal_size().columns, 20)
+        lines = [out[i:i + width] for i in range(0, len(out), width)] or [""]
+        sys.stdout.write("\x1b[1A\x1b[2K" * state["lines"])
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        state["lines"] = len(lines)
+
+    return on_step
 
 
 # --------------------------------------------------------------------------- #
@@ -286,12 +540,15 @@ def slider_generate(model, tokenizer, mask_id, question, quality=0.5,
     )
     P = prompt_ids.shape[1]
 
-    torch.cuda.synchronize()
+    _sync()
     t0 = time.time()
 
     ids = generate(
         model, mask_id, prompt_ids, gen_len=gen_len, steps=steps,
         temperature=temperature, top_k=top_k, freq_pen=freq_pen, guidance=guidance,
+        on_step=overrides.get("on_step"),
+        use_compile=bool(ov("use_compile", True)),
+        seed=seed,
     )
 
     scores = []
@@ -310,7 +567,7 @@ def slider_generate(model, tokenizer, mask_id, question, quality=0.5,
                 cs = critic_score(model, critic, mask_id, eos, ids, P).tolist()
                 best = min(tied, key=lambda i: cs[i])
 
-    torch.cuda.synchronize()
+    _sync()
     seconds = time.time() - t0
 
     text = decode(tokenizer, ids[best], P, mask_id, eos)
@@ -344,25 +601,56 @@ def build_parser():
     p.add_argument("--guidance", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--gen-len", type=int, default=None, dest="gen_len")
+    p.add_argument("--backend", default="auto", choices=["auto", "torch", "mlx"],
+                   help="auto = MLX (Apple GPU) when installed, else torch")
+    p.add_argument("--no-compile", action="store_true",
+                   help="disable torch.compile on the per-step sampler math")
     p.add_argument("--critic", action="store_true",
                    help="load the critic head to break near-ties in gap")
     p.add_argument("--show-all", action="store_true",
                    help="print all candidates with scores")
+    p.add_argument("--watch", action="store_true",
+                   help="render the diffusion live: masked positions (░) fill in "
+                        "step by step (candidate 0)")
     return p
 
 
 def main(argv=None):
+    global DEVICE, DTYPE
     args = build_parser().parse_args(argv)
 
+    backend = args.backend
+    if backend == "auto":
+        try:
+            import mlx.core  # noqa: F401
+            backend = "mlx"
+        except ImportError:
+            backend = "torch"
+    if backend == "mlx":
+        if args.critic:
+            sys.exit("--critic uses torch model internals; use --backend torch")
+        # MLX does the model math on the Apple GPU; keep the (cheap) sampler-loop
+        # tensors on CPU and load the torch model in fp32 for weight conversion.
+        DEVICE, DTYPE = "cpu", torch.float32
+
     model, mask_id = load_model(args.checkpoint)
+    if backend == "mlx":
+        model = _MLXModel(model)
     tokenizer = load_tokenizer()
-    critic = load_critic() if args.critic else None
+    critic = load_critic(use_compile=not args.no_compile) if args.critic else None
 
     overrides = {}
     for k in ("steps", "n", "temperature", "guidance", "seed", "gen_len"):
         v = getattr(args, k)
         if v is not None:
             overrides[k] = v
+    # MLX keeps only tiny glue tensors on CPU; compile latency isn't worth it.
+    if args.no_compile or backend == "mlx":
+        overrides["use_compile"] = False
+    if args.watch:
+        P = len(tokenizer.encode(f"Question: {args.question}\nAnswer:",
+                                 add_special_tokens=False))
+        overrides["on_step"] = make_watcher(tokenizer, mask_id, P)
 
     out = slider_generate(
         model, tokenizer, mask_id, args.question,

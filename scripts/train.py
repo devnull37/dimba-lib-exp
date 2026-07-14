@@ -174,8 +174,10 @@ def main():
         model_config=model_config,
         learning_rate=float(training_config.get('learning_rate', 2e-5)),
         warmup_steps=int(training_config.get('warmup_steps', 500)),
+        weight_decay=float(training_config.get('weight_decay', 0.01)),
         ema_decay=float(training_config.get('ema_decay', 0.9999)),
         use_ema=training_config.get('use_ema', True),
+        optimizer=str(training_config.get('optimizer', 'adamw')),
     )
 
     # Callbacks

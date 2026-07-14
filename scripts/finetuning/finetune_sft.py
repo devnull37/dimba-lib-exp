@@ -53,6 +53,7 @@ if str(SRC_DIR) not in sys.path:
 
 from dimba.models.diffusion import DIMBA
 from dimba.tokenizers.simple import SimpleCharacterTokenizer
+from dimba.utils.checkpointing import atomic_torch_save
 
 
 RESPONSE_SENTINEL = "<|DIMBA_RESPONSE|>"
@@ -1048,7 +1049,7 @@ def save_checkpoint(
             },
         ),
     }
-    torch.save(payload, path)
+    atomic_torch_save(payload, path)
 
 
 def save_tokenizer(tokenizer: Any, output_dir: Path) -> Optional[Path]:
@@ -1257,6 +1258,7 @@ def main() -> None:
         [p for p in model.parameters() if p.requires_grad],
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
+        fused=device.type == "cuda",
     )
 
     updates_per_epoch = math.ceil(len(dataloader) / args.grad_accumulation_steps)
@@ -1271,12 +1273,16 @@ def main() -> None:
 
     use_autocast = device.type == "cuda" and args.precision in {"fp16", "bf16"}
     autocast_dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.precision == "fp16"))
+    scaler_enabled = device.type == "cuda" and args.precision == "fp16"
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
+    else:  # PyTorch 2.0 compatibility
+        scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
-    running_loss = 0.0
-    running_tokens = 0
+    running_loss = torch.zeros((), device=device)
+    running_tokens = torch.zeros((), device=device)
     log_counter = 0
 
     stop_training = False
@@ -1322,15 +1328,21 @@ def main() -> None:
                     labels=labels,
                     ignore_index=args.ignore_index,
                 )
-                loss = loss / args.grad_accumulation_steps
+                group_start = (
+                    batch_idx // args.grad_accumulation_steps
+                ) * args.grad_accumulation_steps
+                group_size = min(
+                    args.grad_accumulation_steps, len(dataloader) - group_start
+                )
+                loss = loss / group_size
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            running_loss += loss.detach().float().item()
-            running_tokens += int(token_count.item())
+            running_loss += loss.detach().float()
+            running_tokens += token_count.detach().float()
 
             is_update_step = ((batch_idx + 1) % args.grad_accumulation_steps == 0) or (
                 (batch_idx + 1) == len(dataloader)
@@ -1353,16 +1365,19 @@ def main() -> None:
                 log_counter += 1
 
                 if global_step % max(1, args.log_every) == 0:
-                    mean_loss = running_loss / max(1, log_counter)
+                    loss_sum, response_tokens = torch.stack(
+                        (running_loss, running_tokens)
+                    ).cpu().tolist()
+                    mean_loss = loss_sum / max(1, log_counter)
                     lr = optimizer.param_groups[0]["lr"]
                     print(
                         f"step={global_step}/{total_update_steps} "
                         f"loss={mean_loss:.6f} "
                         f"lr={lr:.3e} "
-                        f"response_tokens={running_tokens}"
+                        f"response_tokens={int(response_tokens)}"
                     )
-                    running_loss = 0.0
-                    running_tokens = 0
+                    running_loss.zero_()
+                    running_tokens.zero_()
                     log_counter = 0
 
                 if args.max_steps > 0 and global_step >= args.max_steps:
@@ -1396,7 +1411,7 @@ def main() -> None:
             adapter_dir.mkdir(parents=True, exist_ok=True)
             adapter_path = adapter_dir / "adapter_model.pt"
             adapter_meta_path = adapter_dir / "adapter_config.json"
-            torch.save({"state_dict": lora_state}, adapter_path)
+            atomic_torch_save({"state_dict": lora_state}, adapter_path)
             with adapter_meta_path.open("w", encoding="utf-8") as f:
                 json.dump(
                     {

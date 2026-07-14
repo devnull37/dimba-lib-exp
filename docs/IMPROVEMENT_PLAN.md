@@ -1,6 +1,17 @@
 # DIMBA Improvement Plan
 
-> Status: proposed roadmap, 2026-05-27. Author of plan: research synthesis for DimbaLabs.
+> **Historical roadmap snapshot (2026-05-27).** The findings below describe the pre-overhaul
+> tree and are intentionally preserved as the rationale for v2; they are not claims about the
+> current code. For current implementation truth, launch commands, and benchmark gates, use
+> [OVERHAUL_STATUS.md](OVERHAUL_STATUS.md) and
+> [PERFORMANCE_AND_SCALING.md](PERFORMANCE_AND_SCALING.md).
+
+Current mapping: the Phase-1 correctness work, genuine Mamba-2 path, bidirectional denoiser,
+objectives, masked base/SFT path, post-training foundations, MLX inference, native masked DDP,
+Muon pilot, and H100 benchmark harness are implemented. Consistency distillation quality,
+cross-attention conditioning, a trained/calibrated VAE, quantization polish, and real target-H100
+measurements remain experimental or pending. In particular, the “Mamba-1” and Python-loop findings
+in the table below were bugs in the old snapshot and have been fixed.
 > Scope: turn DIMBA from a faithfully-implemented *concept* into an empirically validated, competitive diffusion LM.
 
 ## Context — why this plan exists

@@ -13,7 +13,9 @@ import os
 from ..models.diffusion import DIMBA
 from ..models.vae import TokenVAE
 from ..diffusion.sampling import sample_timesteps, sample_from_model
-from ..utils.checkpointing import ProgressiveCheckpointManager
+from ..utils.checkpointing import ProgressiveCheckpointManager, atomic_torch_save
+from .fused_ce import output_head_cross_entropy
+from .optimizers import build_optimizer
 
 
 def compute_consistency_loss(
@@ -41,6 +43,8 @@ def compute_consistency_loss(
     Returns:
         consistency_loss: MSE between predictions at t and t-delta
     """
+    if delta_min < 0 or delta_max < delta_min:
+        raise ValueError("expected 0 <= delta_min <= delta_max")
     device = t_early.device
     batch_size = input_ids.shape[0]
 
@@ -52,28 +56,12 @@ def compute_consistency_loss(
         max_possible_delta
     )
 
-    # Only process items where we can have a valid delta
+    # Vectorized per-row integer sampling. The former list comprehension called
+    # ``eff.item()`` once per sample, synchronizing CUDA for every row.
     valid_mask = effective_max_delta >= delta_min
-    if not valid_mask.any():
-        return torch.tensor(0.0, device=device)
-
-    # Filter to valid items
-    t_early = t_early[valid_mask]
-    effective_max_delta = effective_max_delta[valid_mask]
-    input_ids = input_ids[valid_mask]
-    x_0 = x_0[valid_mask]
-
-    # Sample delta timesteps within valid range for each item
-    delta = torch.stack([
-        torch.randint(
-            delta_min,
-            min(int(eff.item()) + 1, delta_max + 1),
-            (1,),
-            device=device
-        ).squeeze(0)
-        for eff in effective_max_delta
-    ])
-    delta = torch.min(delta, effective_max_delta.long())
+    span = (effective_max_delta - delta_min + 1).clamp(min=1)
+    delta = delta_min + torch.floor(torch.rand(batch_size, device=device) * span).long()
+    delta = torch.where(valid_mask, delta, torch.zeros_like(delta))
 
     # Compute t_late
     t_late = t_early - delta
@@ -102,9 +90,35 @@ def compute_consistency_loss(
 
     # Compute weighted MSE
     diff = (z_pred_early - z_pred_late.detach()) * weights
-    consistency_loss = (diff ** 2).mean()
+    diff = diff * valid_mask[:, None, None]
+    values_per_sample = diff.shape[1] * diff.shape[2]
+    consistency_loss = diff.square().sum() / (
+        valid_mask.sum().clamp(min=1) * values_per_sample
+    )
 
     return consistency_loss
+
+
+def _run_dimba_loss_forward(
+    model: DIMBA,
+    input_ids: torch.Tensor,
+    t: torch.Tensor,
+    prompt_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Run the possibly self-conditioned student pass used by the loss."""
+    if getattr(model, "self_conditioning", False) and bool(torch.rand(()) < 0.5):
+        shared_noise = torch.randn(
+            input_ids.shape[0], input_ids.shape[1], model.d_latent, device=input_ids.device
+        )
+        with torch.no_grad():
+            _, _, info_sc = model(input_ids, t, noise=shared_noise, prompt_mask=prompt_mask)
+        x_self_cond = info_sc["z0_hat"].detach()
+        x_pred, _noise, info = model(
+            input_ids, t, noise=shared_noise, prompt_mask=prompt_mask, x_self_cond=x_self_cond
+        )
+    else:
+        x_pred, _noise, info = model(input_ids, t, prompt_mask=prompt_mask)
+    return x_pred, info
 
 
 def compute_dimba_losses(
@@ -118,6 +132,8 @@ def compute_dimba_losses(
     ce_time_fade: bool = False,
     prompt_mask: Optional[torch.Tensor] = None,
     loss_mask: Optional[torch.Tensor] = None,
+    fused_ce_mode: str = "auto",
+    _forward_output: Optional[Tuple[torch.Tensor, Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute the DIMBA training loss.
 
@@ -137,22 +153,12 @@ def compute_dimba_losses(
     Returns:
         ``(loss, parts)`` where ``parts`` holds detached scalar components.
     """
-    # Self-conditioning (Chen et al., 2022): with prob 0.5, feed the model its own
-    # *detached* x0 estimate from a no-grad pre-pass. Both passes MUST share the same
-    # noise (hence the same x_t) for the estimate to be consistent. No-op when
-    # self_conditioning is off -> existing behavior is unchanged.
-    if getattr(model, "self_conditioning", False) and bool(torch.rand(()) < 0.5):
-        shared_noise = torch.randn(
-            input_ids.shape[0], input_ids.shape[1], model.d_latent, device=input_ids.device
-        )
-        with torch.no_grad():
-            _, _, info_sc = model(input_ids, t, noise=shared_noise, prompt_mask=prompt_mask)
-        x_self_cond = info_sc["z0_hat"].detach()
-        x_pred, _noise, info = model(
-            input_ids, t, noise=shared_noise, prompt_mask=prompt_mask, x_self_cond=x_self_cond
-        )
+    # Stage-3 teacher KD consumes the same predicted x0. It can supply the already
+    # computed forward here to avoid running the entire Mamba stack twice.
+    if _forward_output is None:
+        x_pred, info = _run_dimba_loss_forward(model, input_ids, t, prompt_mask)
     else:
-        x_pred, _noise, info = model(input_ids, t, prompt_mask=prompt_mask)
+        x_pred, info = _forward_output
     diffuse_mask = info.get("diffuse_mask")
 
     # --- diffusion regression (min-SNR weighted), in latent space ---
@@ -205,23 +211,49 @@ def compute_dimba_losses(
     diff_loss = (per_sample * weight).mean()
 
     # --- cross-entropy / rounding anchor ---
-    logits = model.output_head(x_pred)
-    B, L, V = logits.shape
-    ce_per = F.cross_entropy(
-        logits.reshape(-1, V), input_ids.reshape(-1), reduction="none"
-    ).view(B, L)
-    if eff is not None:
-        m = eff.to(ce_per.dtype)
-        ce_sample = (ce_per * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+    if eff is None and not ce_time_fade:
+        # Uniform reduction: Liger can fuse projection + CE without [B,L,V].
+        ce_loss = output_head_cross_entropy(
+            model,
+            x_pred,
+            input_ids,
+            reduction="mean",
+            mode=fused_ce_mode,
+            uniform_reduction=True,
+        )
     else:
-        ce_sample = ce_per.mean(dim=1)
-    if ce_time_fade:
-        # At high noise the CE-optimal output is the unigram distribution, so a
-        # full-strength anchor there actively teaches token-frequency spam
-        # exactly where generation starts. Fade it out with noise level.
-        t_fade = (t.float() / (model.num_diffusion_steps - 1)).clamp(0.0, 1.0)
-        ce_sample = ce_sample * (1.0 - t_fade)
-    ce_loss = ce_sample.mean()
+        # Non-uniform sample/mask weights require exact unreduced gradients. Select
+        # active tokens before native projection; upstream Liger cannot do this yet.
+        batch, length = input_ids.shape
+        active = None if eff is None else eff != 0
+        ce_per = output_head_cross_entropy(
+            model,
+            x_pred,
+            input_ids,
+            active_mask=active,
+            reduction="none",
+            mode=fused_ce_mode,
+            uniform_reduction=False,
+        )
+        ce_per_fp32 = ce_per.float()
+        if eff is not None:
+            weights = eff.float()
+            sample_ids = torch.arange(batch, device=input_ids.device)[:, None].expand(
+                batch, length
+            )
+            selected_samples = sample_ids[active]
+            selected_weights = weights[active]
+            ce_sums = torch.zeros(batch, device=ce_per.device, dtype=torch.float32)
+            ce_sums.scatter_add_(0, selected_samples, ce_per_fp32 * selected_weights)
+            ce_sample = ce_sums / weights.sum(dim=1).clamp(min=1.0)
+        else:
+            ce_sample = ce_per_fp32.view(batch, length).mean(dim=1)
+        if ce_time_fade:
+            # At high noise the CE-optimal output is the unigram distribution, so a
+            # full-strength anchor there actively teaches token-frequency spam.
+            t_fade = (t.float() / (model.num_diffusion_steps - 1)).clamp(0.0, 1.0)
+            ce_sample = ce_sample * (1.0 - t_fade)
+        ce_loss = ce_sample.mean()
 
     loss = model.recon_loss_weight * diff_loss + ce_loss_weight * ce_loss
     parts = {"diff_loss": diff_loss.detach(), "ce_loss": ce_loss.detach()}
@@ -314,6 +346,7 @@ class DIMBALightningModule(pl.LightningModule):
         progressive_milestones: List of parameter count milestones for progressive checkpointing
         progressive_save_dir: Directory for progressive checkpoints
         enable_progressive_checkpoints: Whether to enable progressive checkpointing
+        optimizer: ``"adamw"`` (default) or the Muon + AdamW hybrid
     """
 
     def __init__(
@@ -333,12 +366,14 @@ class DIMBALightningModule(pl.LightningModule):
         consistency_delta_max: int = 200,
         ce_loss_weight: float = 1.0,
         min_snr_gamma: float = 5.0,
+        fused_ce_mode: str = "auto",
         timestep_sampling: str = "uniform",
         antithetic_t: bool = False,
         exclude_zero_t: bool = False,
         progressive_milestones: Optional[List[int]] = None,
         progressive_save_dir: str = "./progressive_checkpoints",
         enable_progressive_checkpoints: bool = False,
+        optimizer: str = "adamw",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -347,6 +382,7 @@ class DIMBALightningModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.warmup_steps = warmup_steps
         self.weight_decay = weight_decay
+        self.optimizer_name = optimizer.lower()
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.ema_update_interval = max(1, int(ema_update_interval))
@@ -361,6 +397,7 @@ class DIMBALightningModule(pl.LightningModule):
         # Loss weights for the cross-entropy anchor and min-SNR weighting.
         self.ce_loss_weight = ce_loss_weight
         self.min_snr_gamma = min_snr_gamma
+        self.fused_ce_mode = fused_ce_mode
 
         # Progressive checkpointing
         self.progressive_checkpoint_manager = None
@@ -416,11 +453,13 @@ class DIMBALightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer and scheduler."""
-        optimizer = AdamW(
-            self.model.parameters(),
+        optimizer = build_optimizer(
+            self.model,
+            name=self.optimizer_name,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.999),
+            fused=self.device.type == "cuda",
         )
 
         # Linear warmup -> cosine decay to zero over the whole run.
@@ -474,6 +513,7 @@ class DIMBALightningModule(pl.LightningModule):
             min_snr_gamma=self.min_snr_gamma,
             prompt_mask=prompt_mask,
             loss_mask=batch.get("attention_mask"),
+            fused_ce_mode=self.fused_ce_mode,
         )
 
         # CDLM consistency loss: align the model's clean-latent predictions across timesteps.
@@ -519,14 +559,25 @@ class DIMBALightningModule(pl.LightningModule):
                 print(f"   Path: {checkpoint_path}")
 
         # Logging
-        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
+        # Per-step distributed reductions serialize every rank. Rank-zero's local
+        # minibatch is an unbiased progress signal; validation remains globally reduced.
+        self.log("train/loss", loss, prog_bar=True, sync_dist=False)
         for _name, _val in loss_parts.items():
-            self.log(f"train/{_name}", _val, sync_dist=True)
-        self.log("train/learning_rate", self.optimizers().param_groups[0]["lr"], sync_dist=True)
+            self.log(f"train/{_name}", _val, sync_dist=False)
+        self.log(
+            "train/learning_rate",
+            self.optimizers().param_groups[0]["lr"],
+            sync_dist=False,
+        )
         if self.use_consistency_training:
-            self.log("train/consistency_loss", consistency_loss, prog_bar=False, sync_dist=True)
+            self.log(
+                "train/consistency_loss",
+                consistency_loss,
+                prog_bar=False,
+                sync_dist=False,
+            )
 
-        self.train_loss = loss.item()
+        self.train_loss = loss.detach()
         self.num_training_steps += 1
 
         return loss
@@ -558,6 +609,7 @@ class DIMBALightningModule(pl.LightningModule):
             min_snr_gamma=self.min_snr_gamma,
             prompt_mask=batch.get("prompt_mask"),
             loss_mask=batch.get("attention_mask"),
+            fused_ce_mode=self.fused_ce_mode,
         )
 
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
@@ -579,6 +631,7 @@ class DIMBALightningModule(pl.LightningModule):
                 t,
                 ce_loss_weight=self.ce_loss_weight,
                 min_snr_gamma=self.min_snr_gamma,
+                fused_ce_mode=self.fused_ce_mode,
                 prompt_mask=batch.get("prompt_mask"),
                 loss_mask=batch.get("attention_mask"),
             )
@@ -650,6 +703,8 @@ class SimpleTrainer:
         progressive_milestones: List of parameter count milestones (default: None)
         progressive_save_dir: Directory for progressive checkpoints (default: "./progressive_checkpoints")
         enable_progressive_checkpoints: Enable progressive checkpointing (default: False)
+        weight_decay: Optimizer weight decay (default: 0.01)
+        optimizer: ``"adamw"`` (default) or the Muon + AdamW hybrid
     """
 
     def __init__(
@@ -668,10 +723,14 @@ class SimpleTrainer:
         consistency_delta_max: int = 200,
         ce_loss_weight: float = 1.0,
         min_snr_gamma: float = 5.0,
+        fused_ce_mode: str = "auto",
         progressive_milestones: Optional[List[int]] = None,
         progressive_save_dir: str = "./progressive_checkpoints",
         enable_progressive_checkpoints: bool = False,
+        weight_decay: float = 0.01,
+        optimizer: str = "adamw",
     ):
+        device = torch.device(device)
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
@@ -679,6 +738,8 @@ class SimpleTrainer:
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
         self.warmup_steps = warmup_steps
+        self.weight_decay = weight_decay
+        self.optimizer_name = optimizer.lower()
         self.ema_decay = ema_decay
 
         # CDLM parameters
@@ -690,6 +751,7 @@ class SimpleTrainer:
         # Loss weights for the cross-entropy anchor and min-SNR weighting.
         self.ce_loss_weight = ce_loss_weight
         self.min_snr_gamma = min_snr_gamma
+        self.fused_ce_mode = fused_ce_mode
 
         # Progressive checkpointing
         self.progressive_checkpoint_manager = None
@@ -706,10 +768,12 @@ class SimpleTrainer:
         self._copy_model_weights()
 
         # Optimizer
-        self.optimizer = AdamW(
-            model.parameters(),
+        self.optimizer = build_optimizer(
+            model,
+            name=self.optimizer_name,
             lr=learning_rate,
-            weight_decay=0.01,
+            weight_decay=weight_decay,
+            fused=device.type == "cuda",
         )
 
         # Loss
@@ -735,9 +799,7 @@ class SimpleTrainer:
 
         for epoch in range(self.num_epochs):
             self.model.train()
-            epoch_loss = 0.0
-            epoch_denoise_loss = 0.0
-            epoch_consistency_loss = 0.0
+            epoch_metrics = torch.zeros(3, device=self.device)
 
             for batch_idx, batch in enumerate(self.train_dataloader):
                 # Learning rate warmup
@@ -747,21 +809,31 @@ class SimpleTrainer:
                         param_group["lr"] = lr
 
                 # Forward pass
-                input_ids = batch["input_ids"].to(self.device)
+                input_ids = batch["input_ids"].to(
+                    self.device, non_blocking=self.device.type == "cuda"
+                )
                 batch_size = input_ids.shape[0]
                 t = sample_timesteps(batch_size, self.model.num_diffusion_steps, torch.device(self.device))
 
                 _attn_mask = batch.get("attention_mask")
                 if _attn_mask is not None:
-                    _attn_mask = _attn_mask.to(self.device)
+                    _attn_mask = _attn_mask.to(
+                        self.device, non_blocking=self.device.type == "cuda"
+                    )
+                _prompt_mask = batch.get("prompt_mask")
+                if _prompt_mask is not None:
+                    _prompt_mask = _prompt_mask.to(
+                        self.device, non_blocking=self.device.type == "cuda"
+                    )
                 loss, _parts = compute_dimba_losses(
                     self.model,
                     input_ids,
                     t,
                     ce_loss_weight=self.ce_loss_weight,
                     min_snr_gamma=self.min_snr_gamma,
-                    prompt_mask=batch.get("prompt_mask"),
+                    prompt_mask=_prompt_mask,
                     loss_mask=_attn_mask,
+                    fused_ce_mode=self.fused_ce_mode,
                 )
                 denoise_loss = _parts["diff_loss"]
 
@@ -778,7 +850,6 @@ class SimpleTrainer:
                         delta_max=self.consistency_delta_max,
                     )
                     loss = loss + self.consistency_loss_weight * consistency_loss
-                    epoch_consistency_loss += consistency_loss.item()
 
                 # Backward
                 self.optimizer.zero_grad()
@@ -789,8 +860,10 @@ class SimpleTrainer:
                 # Update EMA
                 self._update_ema()
 
-                epoch_loss += loss.item()
-                epoch_denoise_loss += denoise_loss.item()
+                batch_metrics = torch.stack(
+                    (loss.detach(), denoise_loss.detach(), consistency_loss.detach())
+                ).float()
+                epoch_metrics += batch_metrics
                 self.global_step += 1
 
                 # Check for progressive checkpoint milestones
@@ -804,7 +877,7 @@ class SimpleTrainer:
                             milestone=milestone,
                             metadata={
                                 "epoch": epoch,
-                                "train_loss": loss.item(),
+                                "train_loss": batch_metrics[0].item(),
                                 "use_consistency_training": self.use_consistency_training,
                             },
                         )
@@ -816,20 +889,26 @@ class SimpleTrainer:
                         print(f"   Path: {checkpoint_path}")
 
                 if batch_idx % 100 == 0:
+                    current_loss, current_denoise, current_consistency = (
+                        batch_metrics.cpu().tolist()
+                    )
                     log_msg = (
                         f"Epoch {epoch + 1}/{self.num_epochs} | "
                         f"Step {batch_idx}/{len(self.train_dataloader)} | "
-                        f"Loss: {loss.item():.4f}"
+                        f"Loss: {current_loss:.4f}"
                     )
                     if self.use_consistency_training:
-                        log_msg += f" (Denoise: {denoise_loss.item():.4f}, Consistency: {consistency_loss.item():.4f})"
+                        log_msg += (
+                            f" (Denoise: {current_denoise:.4f}, "
+                            f"Consistency: {current_consistency:.4f})"
+                        )
                     print(log_msg)
 
-            avg_epoch_loss = epoch_loss / len(self.train_dataloader)
-            avg_denoise_loss = epoch_denoise_loss / len(self.train_dataloader)
+            avg_epoch_loss, avg_denoise_loss, avg_consistency_loss = (
+                epoch_metrics.div(len(self.train_dataloader)).cpu().tolist()
+            )
             print(f"Epoch {epoch + 1} | Avg Loss: {avg_epoch_loss:.4f} | Denoise: {avg_denoise_loss:.4f}", end="")
             if self.use_consistency_training:
-                avg_consistency_loss = epoch_consistency_loss / len(self.train_dataloader)
                 print(f" | Consistency: {avg_consistency_loss:.4f}")
             else:
                 print()
@@ -842,11 +921,13 @@ class SimpleTrainer:
     def validate(self):
         """Run validation."""
         self.model.eval()
-        val_loss = 0.0
+        val_loss = torch.zeros((), device=self.device)
 
         with torch.no_grad():
             for batch in self.val_dataloader:
-                input_ids = batch["input_ids"].to(self.device)
+                input_ids = batch["input_ids"].to(
+                    self.device, non_blocking=self.device.type == "cuda"
+                )
                 batch_size = input_ids.shape[0]
                 # Sample across the full schedule (a fixed midpoint hides high-noise /
                 # generative failure) -- matches DIMBALightningModule.validation_step.
@@ -854,19 +935,27 @@ class SimpleTrainer:
 
                 _attn_mask = batch.get("attention_mask")
                 if _attn_mask is not None:
-                    _attn_mask = _attn_mask.to(self.device)
+                    _attn_mask = _attn_mask.to(
+                        self.device, non_blocking=self.device.type == "cuda"
+                    )
+                _prompt_mask = batch.get("prompt_mask")
+                if _prompt_mask is not None:
+                    _prompt_mask = _prompt_mask.to(
+                        self.device, non_blocking=self.device.type == "cuda"
+                    )
                 loss, _ = compute_dimba_losses(
                     self.model,
                     input_ids,
                     t,
                     ce_loss_weight=self.ce_loss_weight,
                     min_snr_gamma=self.min_snr_gamma,
-                    prompt_mask=batch.get("prompt_mask"),
+                    prompt_mask=_prompt_mask,
                     loss_mask=_attn_mask,
+                    fused_ce_mode=self.fused_ce_mode,
                 )
-                val_loss += loss.item()
+                val_loss += loss.detach()
 
-        return val_loss / len(self.val_dataloader)
+        return (val_loss / len(self.val_dataloader)).item()
 
 
 class VAELightningModule(pl.LightningModule):
@@ -980,12 +1069,16 @@ class VAELightningModule(pl.LightningModule):
         loss, loss_dict = self.vae.compute_loss(x_0, x_recon, mu, logvar)
 
         # Logging
-        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("train/recon_loss", loss_dict["recon"], sync_dist=True)
-        self.log("train/kl_loss", loss_dict["kl"], sync_dist=True)
-        self.log("train/learning_rate", self.optimizers().param_groups[0]["lr"], sync_dist=True)
+        self.log("train/loss", loss, prog_bar=True, sync_dist=False)
+        self.log("train/recon_loss", loss_dict["recon"], sync_dist=False)
+        self.log("train/kl_loss", loss_dict["kl"], sync_dist=False)
+        self.log(
+            "train/learning_rate",
+            self.optimizers().param_groups[0]["lr"],
+            sync_dist=False,
+        )
 
-        self.train_loss = loss.item()
+        self.train_loss = loss.detach()
         self.num_training_steps += 1
 
         return loss
@@ -1017,18 +1110,17 @@ class VAELightningModule(pl.LightningModule):
 
     def save_checkpoint(self, path: str):
         """Save VAE checkpoint."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         checkpoint = {
             "vae_state_dict": self.vae.state_dict(),
             "token_embed_state_dict": self.token_embed.state_dict(),
             "hparams": self.hparams,
         }
-        torch.save(checkpoint, path)
+        atomic_torch_save(checkpoint, path)
 
     @classmethod
     def load_checkpoint(cls, path: str, **override_params):
         """Load VAE checkpoint."""
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         hparams = checkpoint.get("hparams", {})
         hparams.update(override_params)
 
@@ -1071,6 +1163,7 @@ class VAETrainer:
         gradient_accumulation_steps: int = 1,
         use_amp: bool = False,
     ):
+        device = torch.device(device)
         self.vae = vae.to(device)
         self.token_embed = token_embed.to(device)
         self.token_embed.requires_grad_(False)  # Freeze token embeddings during VAE training
@@ -1084,13 +1177,18 @@ class VAETrainer:
         self.kl_weight = kl_weight
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.use_amp = use_amp
-        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        amp_enabled = use_amp and device.type == "cuda"
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            self.scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+        else:  # PyTorch 2.0 compatibility
+            self.scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
         # Optimizer - only optimize VAE parameters
         self.optimizer = AdamW(
             self.vae.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay,
+            fused=device.type == "cuda",
         )
 
         # Tracking
@@ -1103,9 +1201,7 @@ class VAETrainer:
 
         for epoch in range(self.num_epochs):
             self.vae.train()
-            epoch_loss = 0.0
-            epoch_recon_loss = 0.0
-            epoch_kl_loss = 0.0
+            epoch_metrics = torch.zeros(3, device=self.device)
             self.optimizer.zero_grad()
 
             for batch_idx, batch in enumerate(self.train_dataloader):
@@ -1116,9 +1212,14 @@ class VAETrainer:
                         param_group["lr"] = lr
 
                 # Forward pass
-                input_ids = batch["input_ids"].to(self.device)
+                input_ids = batch["input_ids"].to(
+                    self.device, non_blocking=self.device.type == "cuda"
+                )
 
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.autocast(
+                    device_type="cuda",
+                    enabled=self.use_amp and self.device.type == "cuda",
+                ):
                     # Get embeddings (no grad for token_embed)
                     with torch.no_grad():
                         x_0 = self.token_embed(input_ids)
@@ -1130,12 +1231,21 @@ class VAETrainer:
 
                     # Compute loss
                     loss, loss_dict = self.vae.compute_loss(x_0, x_recon, mu, logvar)
-                    loss = loss / self.gradient_accumulation_steps
+                    group_start = (
+                        batch_idx // self.gradient_accumulation_steps
+                    ) * self.gradient_accumulation_steps
+                    group_size = min(
+                        self.gradient_accumulation_steps,
+                        len(self.train_dataloader) - group_start,
+                    )
+                    scaled_loss = loss / group_size
 
                 # Backward
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(scaled_loss).backward()
 
-                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (
+                    batch_idx + 1 == len(self.train_dataloader)
+                ):
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.vae.parameters(), 1.0)
                     self.scaler.step(self.optimizer)
@@ -1143,22 +1253,28 @@ class VAETrainer:
                     self.optimizer.zero_grad()
                     self.global_step += 1
 
-                epoch_loss += loss.item() * self.gradient_accumulation_steps
-                epoch_recon_loss += loss_dict["recon"].item()
-                epoch_kl_loss += loss_dict["kl"].item()
+                batch_metrics = torch.stack(
+                    (
+                        loss.detach(),
+                        loss_dict["recon"].detach(),
+                        loss_dict["kl"].detach(),
+                    )
+                ).float()
+                epoch_metrics += batch_metrics
 
                 if batch_idx % 100 == 0:
+                    current_loss, current_recon, current_kl = batch_metrics.cpu().tolist()
                     print(
                         f"Epoch {epoch + 1}/{self.num_epochs} | "
                         f"Step {batch_idx}/{len(self.train_dataloader)} | "
-                        f"Loss: {loss.item() * self.gradient_accumulation_steps:.4f} | "
-                        f"Recon: {loss_dict['recon'].item():.4f} | "
-                        f"KL: {loss_dict['kl'].item():.4f}"
+                        f"Loss: {current_loss:.4f} | "
+                        f"Recon: {current_recon:.4f} | "
+                        f"KL: {current_kl:.4f}"
                     )
 
-            avg_epoch_loss = epoch_loss / len(self.train_dataloader)
-            avg_recon_loss = epoch_recon_loss / len(self.train_dataloader)
-            avg_kl_loss = epoch_kl_loss / len(self.train_dataloader)
+            avg_epoch_loss, avg_recon_loss, avg_kl_loss = (
+                epoch_metrics.div(len(self.train_dataloader)).cpu().tolist()
+            )
             print(
                 f"Epoch {epoch + 1} | "
                 f"Avg Loss: {avg_epoch_loss:.4f} | "
@@ -1168,8 +1284,11 @@ class VAETrainer:
 
             # Validation
             if self.val_dataloader is not None:
-                val_loss = self.validate()
-                print(f"Validation Loss: {val_loss:.4f}")
+                val_loss, val_recon, val_kl = self.validate()
+                print(
+                    f"Validation Loss: {val_loss:.4f} | "
+                    f"Recon: {val_recon:.4f} | KL: {val_kl:.4f}"
+                )
 
                 # Save best model
                 if val_loss < self.best_val_loss:
@@ -1179,13 +1298,13 @@ class VAETrainer:
     def validate(self):
         """Run validation."""
         self.vae.eval()
-        val_loss = 0.0
-        val_recon = 0.0
-        val_kl = 0.0
+        metrics = torch.zeros(3, device=self.device)
 
         with torch.no_grad():
             for batch in self.val_dataloader:
-                input_ids = batch["input_ids"].to(self.device)
+                input_ids = batch["input_ids"].to(
+                    self.device, non_blocking=self.device.type == "cuda"
+                )
 
                 # Get embeddings
                 x_0 = self.token_embed(input_ids)
@@ -1197,16 +1316,15 @@ class VAETrainer:
 
                 # Compute loss
                 loss, loss_dict = self.vae.compute_loss(x_0, x_recon, mu, logvar)
-                val_loss += loss.item()
-                val_recon += loss_dict["recon"].item()
-                val_kl += loss_dict["kl"].item()
+                metrics += torch.stack(
+                    (loss.detach(), loss_dict["recon"].detach(), loss_dict["kl"].detach())
+                ).float()
 
         n = len(self.val_dataloader)
-        return val_loss / n, val_recon / n, val_kl / n
+        return tuple(metrics.div(n).cpu().tolist())
 
     def save_checkpoint(self, path: str):
         """Save VAE checkpoint."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         checkpoint = {
             "vae_state_dict": self.vae.state_dict(),
             "config": {
@@ -1218,7 +1336,7 @@ class VAETrainer:
             },
             "training_step": self.global_step,
         }
-        torch.save(checkpoint, path)
+        atomic_torch_save(checkpoint, path)
         print(f"Saved checkpoint to {path}")
 
     @staticmethod
@@ -1230,7 +1348,7 @@ class VAETrainer:
             config: Configuration dictionary
             step: Training step
         """
-        checkpoint = torch.load(path, map_location=map_location)
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
         config = checkpoint["config"]
 
         vae = TokenVAE(**config)

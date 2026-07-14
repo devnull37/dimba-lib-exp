@@ -1,16 +1,18 @@
 """SFT for the masked-diffusion model (LLaDA-style instruction tuning).
 
-Resumes checkpoints/masked_diffusion/mdm_latest.pt. Each example is a fixed
+Starts from checkpoints/mdm_sft_cfg/mdm_sft_final.pt. Each example is a fixed
 SEQ_LEN row: [prompt | response | EOS padding]. The prompt is NEVER masked
-(always clean conditioning); the response region — including the EOS padding,
-which is how the model learns to end answers — is masked at ratio t ~ U[T_MIN,1]
-and trained with CE on masked positions, 1/t weighted. No GRPO after: proven
-twice that RL cannot bootstrap without parseable answers.
+(always clean conditioning); the response plus its first EOS (not the pad tail)
+is masked at ratio t ~ U[T_MIN,1]
+and trained with CE on masked positions, 1/t weighted. Run the documented
+quality gate before preference optimization; no RL method can bootstrap useful
+rewards from an incoherent base.
 
 Data: tatsu-lab/alpaca (52k, no trust_remote_code), template
 "Question: {instruction}\n{input}\nAnswer: {output}".
 
-Usage: mdm_sft.py [--steps N] [--batch B] [--smoke]
+Multi-GPU: ``torchrun --standalone --nproc-per-node=8 scripts/mdm_sft_cfg2.py``.
+``--batch`` is per GPU; effective batch is batch * processes * accumulation.
 """
 import argparse
 import inspect
@@ -23,6 +25,24 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
 from dimba import DIMBA
+from dimba.training.distributed import (
+    backward_sync_context,
+    cycling_batches,
+    init_distributed,
+    make_sampler,
+    rank_zero_torch_cache,
+    reduce_metrics,
+    restore_training_state,
+    save_training_checkpoint,
+    seed_process,
+    wrap_ddp,
+)
+from dimba.training.masked import (
+    MaskedDiffusionObjective,
+    freeze_masked_only_unused_parameters,
+)
+from dimba.training.optimizers import HybridMuon, build_optimizer
+from dimba.utils.backends import configure_cuda_training, require_fast_cuda_mamba2
 
 CKPT = "checkpoints/mdm_sft_cfg/mdm_sft_final.pt"
 OUT_DIR = "checkpoints/mdm_sft_cfg2"
@@ -113,51 +133,7 @@ def build_sft_rows(tokenizer):
     return SFTRows(rows, plens, rlens)
 
 
-def sft_loss(model, rows, plens, rlens, mask_id: int):
-    B, L = rows.shape
-    t = torch.rand(B, device=rows.device) * (1.0 - T_MIN) + T_MIN
-    pos = torch.arange(L, device=rows.device)[None, :]
-    # response + first EOS only; v1 trained the whole EOS pad tail and the
-    # model collapsed to predicting EOS everywhere (empty answers)
-    resp = (pos >= plens[:, None]) & (pos < rlens[:, None])
-    mask = (torch.rand(B, L, device=rows.device) < t[:, None]) & resp
-    none_masked = ~mask.any(dim=1)
-    if none_masked.any():
-        first_resp = plens.clamp(max=L - 1)
-        mask[none_masked, first_resp[none_masked]] = True
-    corrupted = torch.where(mask, mask_id, rows)
-    # CFG prompt dropout: null-condition P_DROP of rows by masking their prompt
-    drop = torch.rand(B, device=rows.device) < P_DROP
-    corrupted = torch.where(drop[:, None] & (pos < plens[:, None]), mask_id,
-                            corrupted)
-
-    logits = model.predict_token_logits(corrupted, t)
-    V = logits.shape[-1]
-    ce = F.cross_entropy(logits.reshape(-1, V), rows.reshape(-1),
-                         reduction="none").view(B, L)
-    m = mask.float()
-    ce_masked = (ce * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-    loss = (ce_masked / t).mean()
-
-    # unlikelihood: at masked positions, push down prob of the visible left/right
-    # neighbor token (unless it IS the target) — attacks "Paris Paris" bigram loops
-    logp = F.log_softmax(logits, dim=-1)
-    ul = torch.zeros(B, L, device=rows.device)
-    for shift in (-1, 1):
-        nb = torch.roll(corrupted, shifts=shift, dims=1)
-        valid = mask & (nb != mask_id) & (nb != rows)
-        if shift == -1:
-            valid[:, -1] = False
-        else:
-            valid[:, 0] = False
-        p_nb = logp.gather(-1, nb.unsqueeze(-1)).squeeze(-1).exp()
-        ul = ul + torch.where(valid, -torch.log((1 - p_nb).clamp(min=1e-4)), torch.zeros_like(ul))
-    ul_loss = (ul * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-    loss = loss + UL_WEIGHT * ul_loss.mean()
-    return loss, {"ce_masked": ce_masked.mean(), "ul": ul_loss.mean(), "t_mean": t.mean()}
-
-
-@torch.no_grad()
+@torch.inference_mode()
 def maskgit_generate(model, prompt_ids, gen_len, mask_id,
                      steps=32, temperature=0.7, top_k=50, guidance=0.0):
     device = prompt_ids.device
@@ -165,44 +141,50 @@ def maskgit_generate(model, prompt_ids, gen_len, mask_id,
     ids = torch.cat([prompt_ids,
                      torch.full((B, gen_len), mask_id, dtype=torch.long,
                                 device=device)], dim=1)
-    still_masked = torch.zeros(B, P + gen_len, dtype=torch.bool, device=device)
-    still_masked[:, P:] = True
+    positions = torch.arange(P, P + gen_len, device=device).unsqueeze(0).expand(B, -1)
+    n_active = gen_len
     for s in range(steps):
-        frac = still_masked.float().mean().item()
-        logits = model.predict_token_logits(ids, max(frac, T_MIN)).float()
-        if guidance:
+        t = max(n_active / (P + gen_len), T_MIN)
+        if guidance not in (0.0, 1.0):
             null_ids = ids.clone()
             null_ids[:, :P] = mask_id
-            lu = model.predict_token_logits(null_ids, max(frac, T_MIN)).float()
-            logits = lu + guidance * (logits - lu)
+            features = model.predict_token_features(torch.cat((ids, null_ids), dim=0), t)
+            conditional, unconditional = features.chunk(2, dim=0)
+            features = unconditional + guidance * (conditional - unconditional)
+        else:
+            # Historical g0 means conditional generation with CFG disabled.
+            features = model.predict_token_features(ids, t)
+        logits = model.project_token_features(features, positions=positions).float()
         logits = logits / temperature
         if top_k:
-            kth = logits.topk(top_k, dim=-1).values[..., -1:]
-            logits = logits.masked_fill(logits < kth, float("-inf"))
-        probs = F.softmax(logits, dim=-1)
-        sampled = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, -1)
-        conf = probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-        conf = conf.masked_fill(~still_masked, float("inf"))
+            top_values, top_indices = logits.topk(top_k, dim=-1)
+        else:
+            top_values = logits
+            top_indices = torch.arange(logits.shape[-1], device=device).view(1, 1, -1)
+        probs = F.softmax(top_values, dim=-1)
+        choice = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).view(B, -1, 1)
+        sampled = top_indices.expand(B, n_active, -1).gather(-1, choice).squeeze(-1)
+        confidence = probs.gather(-1, choice).squeeze(-1)
+        ids = ids.scatter(1, positions, sampled)
         n_keep = int(gen_len * math.cos(math.pi / 2 * (s + 1) / steps))
-        ids = torch.where(still_masked, sampled, ids)
         if n_keep > 0:
-            remask = torch.zeros_like(still_masked)
-            remask.scatter_(1, conf.argsort(dim=1)[:, :n_keep], True)
-            remask &= still_masked
-            ids = torch.where(remask, mask_id, ids)
-            still_masked = remask
+            keep_local = confidence.topk(n_keep, dim=1, largest=False).indices
+            positions = positions.gather(1, keep_local)
+            ids = ids.scatter(1, positions, torch.full_like(positions, mask_id))
         else:
             break
+        n_active = n_keep
     return ids
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_step(model, tokenizer, step: int, mask_id: int):
     model.eval()
+    device = next(model.parameters()).device
     eos = tokenizer.eos_token_id
     for p in EVAL_PROMPTS:
         ids = torch.tensor([tokenizer.encode(p, add_special_tokens=False)],
-                           dtype=torch.long, device=DEVICE)
+                           dtype=torch.long, device=device)
         for gtag, gs in (("g0", 0.0), (f"g{GUIDANCE}", GUIDANCE)):
             g = maskgit_generate(model, ids, gen_len=48, mask_id=mask_id,
                                  guidance=gs)
@@ -214,79 +196,263 @@ def eval_step(model, tokenizer, step: int, mask_id: int):
     model.train()
 
 
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=15000)
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=64, help="microbatch per GPU")
+    ap.add_argument("--accumulate", type=int, default=1, help="gradient accumulation steps")
+    ap.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
+    ap.add_argument("--output-dir", default=OUT_DIR, help="checkpoint/cache directory")
+    ap.add_argument("--resume", help="exact training checkpoint to resume")
+    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=DEVICE)
+    ap.add_argument("--workers", type=int, default=2, help="data-loader workers per process")
+    ap.add_argument("--local-rank", "--local_rank", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--smoke", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.batch < 1 or args.accumulate < 1 or args.workers < 0:
+        ap.error("--batch and --accumulate must be positive; --workers cannot be negative")
+    return args
+
+
+def _run(args, context):
     if args.smoke:
-        args.steps, args.batch = 20, 8
+        args.steps, args.batch, args.accumulate = 20, 8, 1
+
+    seed_process(args.seed, context)
+    configure_cuda_training(context.device)
+    if context.is_main:
+        global_batch = args.batch * args.accumulate * context.world_size
+        print(
+            f"distributed={context.enabled} world_size={context.world_size} "
+            f"device={context.device} per_gpu_batch={args.batch} "
+            f"accumulate={args.accumulate} global_batch={global_batch}",
+            flush=True,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M")
 
-    ck = torch.load(CKPT, map_location="cpu")
+    source_checkpoint = args.resume or CKPT
+    ck = torch.load(source_checkpoint, map_location="cpu", weights_only=False)
     cfg, sd, mask_id = dict(ck["config"]), ck["model_state_dict"], ck["mask_id"]
     sig = set(inspect.signature(DIMBA.__init__).parameters) - {"self"}
     model = DIMBA(**{k: v for k, v in cfg.items() if k in sig})
-    miss, unexp = model.load_state_dict(sd, strict=False)
-    print(f"loaded {CKPT}: vocab={cfg['vocab_size']} mask_id={mask_id} "
-          f"missing={len(miss)} unexpected={len(unexp)}", flush=True)
-    assert not miss, f"missing keys: {miss[:5]}"
-    model = model.to(DEVICE).to(torch.bfloat16)
-    del ck, sd
+    miss, unexp = model.load_state_dict(sd, strict=True)
+    if context.is_main:
+        print(f"loaded {source_checkpoint}: vocab={cfg['vocab_size']} mask_id={mask_id} "
+              f"missing={len(miss)} unexpected={len(unexp)}", flush=True)
+    assert not miss and not unexp
+    require_fast_cuda_mamba2(model, context.device)
+    frozen = freeze_masked_only_unused_parameters(model)
+    if context.is_main:
+        print(f"masked-only freeze: {len(frozen)} unused prompt-encoder tensors", flush=True)
+    dtype = torch.bfloat16 if context.device.type == "cuda" else torch.float32
+    model = model.to(device=context.device, dtype=dtype)
+    del sd
 
-    data = build_sft_rows(tokenizer)
-    loader = DataLoader(data, batch_size=args.batch, shuffle=True,
-                        num_workers=2, pin_memory=True, drop_last=True)
+    def build_cached_rows():
+        rows = build_sft_rows(tokenizer)
+        return rows.rows, rows.plens, rows.rlens
 
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
+    data_id = f"sft_rows_v2_{SEQ_LEN}"
+    cached_rows = rank_zero_torch_cache(
+        f"{args.output_dir}/data/{data_id}.pt",
+        context,
+        build_cached_rows,
+    )
+    data = SFTRows(*cached_rows)
+    sampler = make_sampler(data, context, seed=args.seed)
+    loader = DataLoader(
+        data,
+        batch_size=args.batch,
+        sampler=sampler,
+        num_workers=args.workers,
+        pin_memory=context.device.type == "cuda",
+        drop_last=True,
+        persistent_workers=args.workers > 0,
+        generator=torch.Generator().manual_seed(args.seed + context.rank),
+    )
+    if len(loader) == 0:
+        raise ValueError("Dataset shard is smaller than one per-GPU batch")
+
+    objective = MaskedDiffusionObjective(
+        model,
+        mask_id,
+        t_min=T_MIN,
+        prompt_dropout=P_DROP,
+        neighbor_unlikelihood_weight=UL_WEIGHT,
+    )
+    train_objective = wrap_ddp(objective, context)
+
+    opt = build_optimizer(
+        model,
+        name=args.optimizer,
+        lr=LR,
+        weight_decay=0.0,
+        fused=context.device.type == "cuda",
+    )
+    if context.is_main and isinstance(opt, HybridMuon):
+        print(
+            f"Muon split: {len(opt.muon_parameter_names)} hidden matrices; "
+            f"{len(opt.adamw_parameter_names)} tensors on AdamW",
+            flush=True,
+        )
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / WARMUP) *
         (0.5 * (1 + math.cos(min(s, args.steps) / args.steps * math.pi)) * 0.9 + 0.1))
 
-    if not args.smoke:
-        import os
-        os.makedirs(OUT_DIR, exist_ok=True)
-        print("baseline (mdm pretrained, before SFT):", flush=True)
-        eval_step(model, tokenizer, 0, mask_id)
+    step = epoch = batch_in_epoch = 0
+    run_signature = {
+        "data_id": data_id,
+        "sequence_length": SEQ_LEN,
+        "learning_rate": LR,
+        "warmup": WARMUP,
+        "t_min": T_MIN,
+        "prompt_dropout": P_DROP,
+        "neighbor_unlikelihood_weight": UL_WEIGHT,
+        "masked_prompt_encoder_frozen": True,
+        "device_type": context.device.type,
+    }
+    if args.resume:
+        expected = {
+            "optimizer_name": args.optimizer,
+            "per_gpu_batch": args.batch,
+            "grad_accum": args.accumulate,
+            "planned_steps": args.steps,
+            "world_size": context.world_size,
+            "seed": args.seed,
+            "run_signature": run_signature,
+        }
+        mismatches = {
+            key: (ck.get(key), value) for key, value in expected.items() if ck.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"Exact resume configuration mismatch: {mismatches}")
+        step, epoch, batch_in_epoch = restore_training_state(
+            ck,
+            context=context,
+            optimizer=opt,
+            scheduler=sched,
+        )
+        if context.is_main:
+            print(
+                f"resumed step={step} epoch={epoch} batch_in_epoch={batch_in_epoch}",
+                flush=True,
+            )
+    del ck
 
-    model.train()
-    step, t0, it = 0, time.time(), iter(loader)
+    if not args.smoke and not args.resume:
+        context.barrier()
+        if context.is_main:
+            print("baseline (mdm pretrained, before SFT):", flush=True)
+            eval_step(model, tokenizer, 0, mask_id)
+        context.barrier()
+
+    train_objective.train()
+    start_step, t0 = step, time.time()
+    batches = cycling_batches(
+        loader,
+        sampler,
+        epoch=epoch,
+        batch_in_epoch=batch_in_epoch,
+    )
+    checkpoint_extra = {
+        "config": cfg,
+        "mask_id": mask_id,
+        "optimizer_name": args.optimizer,
+        "per_gpu_batch": args.batch,
+        "grad_accum": args.accumulate,
+        "planned_steps": args.steps,
+        "seed": args.seed,
+        "run_signature": run_signature,
+    }
     while step < args.steps:
-        try:
-            rows, plens, rlens = next(it)
-        except StopIteration:
-            it = iter(loader)
-            rows, plens, rlens = next(it)
-        rows = rows.to(DEVICE, non_blocking=True)
-        plens = plens.to(DEVICE, non_blocking=True)
-        rlens = rlens.to(DEVICE, non_blocking=True)
-        loss, parts = sft_loss(model, rows, plens, rlens, mask_id)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        metric_sums = {}
+        for microstep in range(args.accumulate):
+            batch, epoch, batch_in_epoch = next(batches)
+            rows, plens, rlens = (
+                tensor.to(context.device, non_blocking=True) for tensor in batch
+            )
+            with backward_sync_context(
+                train_objective, sync=microstep == args.accumulate - 1
+            ):
+                loss, parts = train_objective(rows, plens, rlens)
+                (loss / args.accumulate).backward()
+            current = {"loss": loss.detach(), **parts}
+            for key, value in current.items():
+                metric_sums[key] = metric_sums.get(key, 0) + value.detach()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
         step += 1
         if step % 100 == 0 or step == 1:
-            ps = {k: f"{v.item():.4f}" for k, v in parts.items()}
-            print(f"step {step}/{args.steps} loss={loss.item():.4f} {ps} "
-                  f"lr={sched.get_last_lr()[0]:.2e} ({time.time() - t0:.0f}s)",
-                  flush=True)
+            metrics = reduce_metrics(
+                {key: value / args.accumulate for key, value in metric_sums.items()},
+                context,
+            )
+            if context.is_main:
+                ps = {
+                    key: f"{value.item():.4f}"
+                    for key, value in metrics.items()
+                    if key != "loss"
+                }
+                tokens = (
+                    (step - start_step)
+                    * args.batch
+                    * args.accumulate
+                    * context.world_size
+                    * SEQ_LEN
+                )
+                tok_s = tokens / max(time.time() - t0, 1e-6)
+                print(f"step {step}/{args.steps} loss={metrics['loss'].item():.4f} {ps} "
+                      f"lr={sched.get_last_lr()[0]:.2e} {tok_s / 1e3:.0f}k tok/s "
+                      f"({time.time() - t0:.0f}s)", flush=True)
         if not args.smoke and step % EVAL_EVERY == 0:
-            torch.save({"model_state_dict": model.state_dict(), "config": cfg,
-                        "mask_id": mask_id},
-                       f"{OUT_DIR}/mdm_sft_latest.pt")
-            eval_step(model, tokenizer, step, mask_id)
+            context.barrier()
+            if context.is_main:
+                eval_step(model, tokenizer, step, mask_id)
+            context.barrier()
+            save_training_checkpoint(
+                f"{args.output_dir}/mdm_sft_latest.pt",
+                context=context,
+                model=model,
+                optimizer=opt,
+                scheduler=sched,
+                step=step,
+                epoch=epoch,
+                batch_in_epoch=batch_in_epoch,
+                extra=checkpoint_extra,
+            )
 
     if args.smoke:
-        eval_step(model, tokenizer, step, mask_id)
+        context.barrier()
+        if context.is_main:
+            eval_step(model, tokenizer, step, mask_id)
+        context.barrier()
     else:
-        torch.save({"model_state_dict": model.state_dict(), "config": cfg,
-                    "mask_id": mask_id},
-                   f"{OUT_DIR}/mdm_sft_final.pt")
-    print("MDM_SFT_DONE", flush=True)
+        save_training_checkpoint(
+            f"{args.output_dir}/mdm_sft_final.pt",
+            context=context,
+            model=model,
+            optimizer=opt,
+            scheduler=sched,
+            step=step,
+            epoch=epoch,
+            batch_in_epoch=batch_in_epoch,
+            extra=checkpoint_extra,
+        )
+    if context.is_main:
+        print("MDM_SFT_DONE", flush=True)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    context = init_distributed(args.device)
+    try:
+        _run(args, context)
+    finally:
+        context.close()
 
 
 if __name__ == "__main__":

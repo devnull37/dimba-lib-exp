@@ -4,8 +4,8 @@ Resumes checkpoints/masked_diffusion/mdm_latest.pt. Each example is a fixed
 SEQ_LEN row: [prompt | response | EOS padding]. The prompt is NEVER masked
 (always clean conditioning); the response region — including the EOS padding,
 which is how the model learns to end answers — is masked at ratio t ~ U[T_MIN,1]
-and trained with CE on masked positions, 1/t weighted. No GRPO after: proven
-twice that RL cannot bootstrap without parseable answers.
+and trained with CE on masked positions, 1/t weighted. Run GRPO only after the
+SFT checkpoint passes the parseability and held-out quality gates.
 
 Data: tatsu-lab/alpaca (52k, no trust_remote_code), template
 "Question: {instruction}\n{input}\nAnswer: {output}".

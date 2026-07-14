@@ -1,6 +1,13 @@
-# CDLM (Consistency Diffusion Language Model) Training
+# CDLM consistency training (experimental legacy path)
 
-This document describes the CDLM training implementation for DIMBA, enabling up to 14x faster inference without sacrificing quality.
+> **Status:** mechanism implemented, DIMBA speed/quality payoff unvalidated. The “up to 14×”
+> figure belongs to the upstream consistency-diffusion target; it is not a DIMBA measurement.
+> The next production run is gated on the corrected base objective in
+> [NEXT_RUN_PLAN.md](NEXT_RUN_PLAN.md), not on this optional loss.
+
+This document describes DIMBA's legacy consistency-loss experiment. It may reduce the number of
+network evaluations after successful training, but no current DIMBA checkpoint has demonstrated
+an accuracy-preserving end-to-end speedup from it.
 
 ## Overview
 
@@ -24,11 +31,11 @@ In addition to standard training:
 
 ### Why This Works for DIMBA
 
-Since DIMBA uses Mamba-2 SSM layers instead of attention:
+The intended fit with DIMBA is:
 - ✅ No KV caching issues (Mamba-2 is O(L), not O(L²))
 - ✅ No need for block-wise masking
 - ✅ Can do full-sequence consistency across all timesteps
-- ✅ More efficient than transformer-based CDLM
+- no KV cache is involved, but efficiency and quality still require measurement
 
 ## Configuration
 
@@ -91,7 +98,7 @@ trainer = SimpleTrainer(
 trainer.train()
 ```
 
-## Hyperparameter Recommendations
+## Historical experiment settings
 
 | Parameter | Default | Range | Notes |
 |-----------|---------|-------|-------|
@@ -110,16 +117,18 @@ train/consistency_loss: 0.0891
 
 The consistency loss should decrease over time as the model learns to make consistent predictions across timesteps.
 
-## Inference Speedup
+## Inference claim boundary
 
-Models trained with CDLM can use fewer inference steps:
+The original target was to reduce 1,000 denoising steps to roughly 70-100:
 
-| Model | Standard Steps | CDLM Steps | Speedup |
+| Illustrative target | Standard steps | Consistency steps | Arithmetic NFE ratio |
 |-------|---------------|------------|---------|
 | Small | 1000 | ~100 | ~10x |
 | Large | 1000 | ~70 | ~14x |
 
-The exact speedup depends on the consistency loss weight and training duration.
+These are arithmetic NFE ratios, not measured DIMBA latency or quality. A valid result must compare
+the same trained checkpoint family at a fixed quality threshold and report wall time, p50/p95, and
+the exact sampler. Until then, do not advertise 10-14× for DIMBA.
 
 ## Implementation Details
 
@@ -133,7 +142,7 @@ The exact speedup depends on the consistency loss weight and training duration.
 ### Code Changes
 
 The implementation adds:
-- `_compute_consistency_loss()` method in `DIMBALightningModule`
+- `compute_consistency_loss()` in `dimba.training.trainer`
 - Consistency loss calculation in `training_step()`
 - Configuration parameters in `config.yaml`
 - New `train_cdlm.py` script with CLI support

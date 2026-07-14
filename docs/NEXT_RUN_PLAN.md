@@ -1,236 +1,219 @@
-# DIMBA — Next-Run Plan (token budget + FFN schedule + go/no-go gates)
+# DIMBA next-run plan
 
-**Status:** post-mortem of run #1 complete. Run #1 (Stage-3 co-adaptation on ~1B
-tokens with the FFN **frozen the whole time** → SFT → GRPO) produced an incoherent
-model. Two independent root causes:
+**Status (2026-07-13):** the definitive post-mortem is
+[ROOT_CAUSE_BUDGET28.md](ROOT_CAUSE_BUDGET28.md). The failed run was not a 1B-token,
+FFN-frozen run: it completed roughly **28B Stage-3 tokens** and both frozen and unfrozen
+phases. More tokens alone are not the repair.
 
-1. **Token-starved base** — ~1B co-adaptation tokens. The inherited SmolLM FFN
-   encodes ~600B tokens of knowledge, but the *new* Mamba-mixer ↔ FFN interface
-   never matured on only 1B tokens.
-2. **FFN never adapted in the base** — Stage 3 ran `freeze_ffn=True` for its entire
-   duration; the original plan's later low-LR FFN-unfreeze stage (“Finetune #2”) was
-   dropped. (SFT later trained the FFN, but on limited instruction data, after the
-   base was already weak.)
+## What actually failed
 
-GRPO accuracy stayed ~0 because there was nothing coherent to optimize.
+The budget28 model reconstructs unseen English with 98-100% accuracy from noise levels through
+approximately `t=0.9`, yet collapses at exactly `t=1.0`, the pure-noise starting point of every
+free generation. The model learned a strong conditional denoiser; the objective left a high-noise
+dead zone and the sampler faithfully amplified its first unigram-like estimate.
 
-This plan fixes the recipe and gates the scale-up on measured coherence.
+The primary mechanism was:
 
-> **Hardware:** see the main agent's recommendation. (Token budgets below are
-> hardware-agnostic; wall-clock estimates assume the run-#1 throughput of ~1B
-> co-adaptation tokens in ~5–6 h on the fast CUDA Mamba-2 kernel.)
+1. min-SNR weighting reduced the diffusion gradient near `t=1` to roughly zero;
+2. full-strength CE at the same timesteps taught the marginal token distribution;
+3. logit-normal timestep sampling alone undersampled the endpoint.
 
----
+A secondary problem was that Stage 3 set `kd_weight=0`, disconnecting the causal teacher for almost
+the entire run. The original 500+500 alignment steps were also short. These issues matter, but they
+do not overturn the controlled experiment that isolated the high-noise cliff.
 
-## 1. What the literature actually used (evidence for the budget)
+## Corrected Stage-3 contract
 
-DIMBA is an **attention→Mamba conversion that inherits the teacher's FFN /
-embeddings / head**. The right reference class is *cross-architecture distillation /
-conversion*, **not** from-scratch pretraining. Token counts actually used by that
-reference class:
+Every fresh or repair Stage-3 run now has all of the following:
 
-| Work | Conversion | Distillation tokens | Notes |
-|---|---|---|---|
-| **MOHAWK / Phi-Mamba** (Bick et al., NeurIPS 2024, [arXiv:2408.10189](https://arxiv.org/abs/2408.10189)) | Phi-1.5 (1.5B) attn → Mamba-2 | **3B total** (80M stage-1 + 160M stage-2 + **2.76B stage-3**), C4, seq 2048 | <1% of the 315B tokens used for from-scratch Mamba/Mamba-2. Hybrid-Phi-Mamba-1.5B: **5B**. |
-| **The Mamba in the Llama** (Wang et al., NeurIPS 2024, [arXiv:2408.15237](https://arxiv.org/abs/2408.15237)) | Zephyr/Llama-3-8B attn → Mamba (hybrid) | **~20B total** | A variant trained on only **3B tokens** already beats Mamba-7B trained from scratch on 1.2T. 50–175× fewer tokens than from-scratch (1.2T–3.7T). |
-| **Llamba** (Bick et al., 2025, [arXiv:2502.14458](https://arxiv.org/abs/2502.14458)) | Llama-3 → pure Mamba-2, MOHAWK | **Llamba-1B: 8B · Llamba-3B: 10B · Llamba-8B: 12B** | fineweb-edu (matrix+hidden) + OpenHermes-2.5 (KD, 4×200M). <0.1% of from-scratch data. **Smaller model → more tokens/param** (1B got 8 tok/param; 8B got 1.5). |
-| **Data-Efficient Transformer-to-Mamba** ([arXiv:2510.19266](https://arxiv.org/abs/2510.19266)) | any Transformer → Mamba, attention bridge | **2B–4B**, two-stage | data-efficiency-focused. |
+| Control | Current value | Reason |
+|---|---:|---|
+| high-noise SNR floor | `0.5` | preserves regression pressure near pure noise |
+| CE time fade | `CE * (1 - t)` | stops teaching unigram output at high noise |
+| KD time fade | `KD * (1 - t)` | keeps per-sample clean teacher targets away from pure noise |
+| timestep distribution | 50% uniform + 50% logit-normal | covers both `t≈1` and the useful middle |
+| Stage 3a teacher KD | `1.0` | keeps inherited causal knowledge connected while the mixer beds in |
+| Stage 3b teacher KD | `0.3` | retains teacher structure during low-LR whole-model adaptation |
+| Stage 3a FFN | frozen, LR `2e-4` | adapt the new mixer to inherited features |
+| Stage 3b FFN | unfrozen, LR `3e-5` | co-adapt without washing out inherited knowledge |
+| optimizer | AdamW default | Muon remains a named A/B pilot |
 
-**Teacher / from-scratch anchors:**
+The causal teacher and bidirectional student are aligned on the same target token: teacher logits
+at position `i` are compared with student logits at `i+1`. The teacher stays resident whenever a
+Stage-3 KD weight is positive. Tests assert the nonzero 1.0→0.3 recipe, causal shift, SNR/CE controls,
+and mixed timestep draws. Exact checkpoints record the phase dictionary, so resuming under a zero-KD
+or different objective is rejected.
 
-- **SmolLM-135M** (our teacher) trained on **600B tokens** (600k steps, 64×H100) over
-  Cosmo-Corpus = Cosmopedia-v2 (28B) + Python-Edu (4B) + FineWeb-Edu (220B)
-  ([SmolLM blog](https://huggingface.co/blog/smollm)). At 600B/135M ≈ **~4,400
-  tokens/param** — i.e. ~220× past Chinchilla.
-- **Chinchilla** compute-optimal ≈ **20 tokens/param** (Hoffmann et al. 2022,
-  [arXiv:2203.15556](https://arxiv.org/abs/2203.15556)). For 135M that's only ~2.7B
-  tokens **from scratch**.
-- Modern small-model practice trains **far past Chinchilla** for inference efficiency
-  (e.g. Llama-3-70B ≈ ~200 tok/param ≈ 10× Chinchilla; SmolLM-135M ≈ 220×).
+Muon routes eligible hidden 2-D matrices through match-RMS Muon and leaves embeddings, vocabulary
+heads, norms, biases, vectors, and SSM state parameters on AdamW. A controlled 2,000-step masked
+continuation ended at CE 5.453 vs 5.470 for AdamW, but that is not a continuous Stage-3
+time-to-quality result. Keep separate AdamW and Muon pilot directories; promote Muon only if it wins
+the same held-out gate in less wall time.
 
-### Reasoning: how much does *DIMBA* need?
+## Validation ladder
 
-- **Chinchilla is the wrong frame** here. It's a from-scratch compute-optimal law; we
-  *inherit* a 600B-token FFN/embeddings/head. Its ~2.7B-for-135M number is a floor for
-  the wrong question. The conversion reference class is the relevant anchor.
-- **Conversion floor ≈ 3–20B tokens, WITH the FFN co-adapting end-to-end.** Every
-  cited conversion (MOHAWK 3–5B, Llamba 8–12B, Mamba-in-Llama 20B) trains the whole
-  model (mixer **and** FFN/output) in its final stage and recovers most teacher
-  quality. None freezes the FFN for the entire run.
-- **DIMBA is strictly harder than those.** On top of attn→Mamba it *also* changes:
-  (a) the **objective** — autoregressive next-token → **diffusion / flow-matching**;
-  (b) the **direction** — causal → **bidirectional**. Diffusion dilutes the per-token
-  learning signal (each token is trained at many noise levels; the effective gradient
-  per *unique* token is a fraction of AR's). So DIMBA should need **more** tokens than
-  a pure AR attn→Mamba swap, not fewer.
-- **Run #1 was undertrained for two compounding reasons:** 1B is below even the
-  MOHAWK 3B floor, *and* the FFN was frozen the whole time (the cited conversions
-  never do this). The incoherence is fully explained — we don't need to suspect the
-  architecture yet.
+Do not jump from a green loss curve to SFT. Free generation and the high-noise recovery ladder are
+blocking gates.
 
-**Budget conclusion (with ranges, because this is a novel diffusion-Mamba
-conversion — see §6):**
+### R0 — contract smoke
 
-- **Floor to re-bed the new mixer into inherited knowledge:** ~**5–10B** tokens
-  (conversion band 3–20B, padded upward for diffusion signal-dilution).
-- **Practical sweet spot to mature the new architecture:** ~**20–50B** tokens.
-- **Full-exploit upper bracket (the user's 50–100B guess):** plausible as a
-  **ceiling**, but likely diminishing returns. **Verdict: refine the 50–100B guess
-  down.** The evidence says the *target* is ~20–50B, with 50–100B justified only if
-  the 5B and 20B gates keep improving monotonically. The minimum needed merely to
-  *test the hypothesis* is ~5–10B.
+Before renting a long run, rerun the tiny overfit/partial-noise checks on the exact commit and CUDA
+stack. Require:
 
-> **Data-uniqueness caveat (important):** the current Stage-3 stream caches
-> `n_cache=400_000` docs ≈ ~290M **unique** tokens. At 1B that's ~3.4 epochs (fine);
-> at 5B it's ~17 epochs and at 20B+ it's pathological repetition. **For any budget
-> >~1B, raise `n_cache` (or stream a larger FineWeb slice — `sample-10BT` has 10B
-> unique tokens)** so token *count* is backed by token *diversity*. Repeating 290M
-> tokens 17× is not 5B of learning.
+- finite forward/backward under the fixed loss;
+- nonzero samples from both timestep-mixture components;
+- near-perfect recovery below `t=1` after overfit;
+- free generation from `t=1` that is no longer unigram soup.
 
----
+This verifies the mechanism, not general language quality.
 
-## 2. The fix: FFN frozen → unfrozen co-adaptation schedule
+### R1 — recover the 28B checkpoint first
 
-Stage 3 is now **two phases** (parameterized in `scripts/train_4090.py`):
+The existing checkpoint contains a strong denoiser below the dead zone. The cheapest informative
+run is a **1B-token unfrozen repair** with the fixed objective and KD 0.3:
 
-| Phase | FFN | LR | Share of co-adapt tokens | Purpose |
-|---|---|---|---|---|
-| **3a** | **FROZEN** | `STAGE3_FROZEN_LR = 2e-4` | ~60–70% | MOHAWK-faithful: only the Mamba mixer trains, learning to emit activations the inherited FFN already consumes. |
-| **3b** | **UNFROZEN** (“Finetune #2”) | `STAGE3_UNFROZEN_LR = 3e-5` | ~30–40% | The dropped step. FFN co-adapts to the now-matured mixer at **low** LR (~1/7 of 3a) so the inherited 600B-token knowledge is **not washed out**. |
-
-Knobs (one or two numbers to change per scale):
-
-```python
-STAGE3_FROZEN_TOKENS   = 3_000_000_000   # 3B  (phase 3a)
-STAGE3_UNFROZEN_TOKENS = 2_000_000_000   # 2B  (phase 3b)   → default total ≈ 5B
-STAGE3_FROZEN_LR   = 2e-4
-STAGE3_UNFROZEN_LR = 3e-5
+```bash
+python3 scripts/train_h100.py --preset repair1b --phase distill \
+  --checkpoint checkpoints/distill/final.pt --resume --weights-only-resume \
+  --stage3-optimizer adamw \
+  --save-dir checkpoints/h100-budget28-repair1b-adamw
 ```
 
-- Either knob set to `0` **skips** that phase (e.g. `STAGE3_FROZEN_TOKENS=0` →
-  pure unfrozen continuation of an already-co-adapted base — see §4).
-- Steps are derived from tokens via `_steps_for_tokens()` (16,384 tok/step on the
-  CUDA kernel = `PRETRAIN_BATCH × PRETRAIN_SEQ_LEN`).
-- `run_distill` runs phases in order, **checkpoints after 3a** so a crash in 3b
-  doesn't lose the frozen base, and logs the realized token total.
+`--weights-only-resume` is intentionally explicit because the old final checkpoint cannot restore
+optimizer/RNG/data progress. It skips Stage 1/2, restarts the one unfrozen repair phase from the old
+weights, and writes new exact checkpoints. Short runs save at quarter points (long runs remain
+capped at 25,000-step cadence), so inspect the first checkpoint before spending the whole budget.
 
-**Verified in tests** (`tests/test_distillation.py`):
-`test_stage3_unfrozen_ffn_receives_gradients` — with `freeze_ffn=False` the FFN params
-are trainable **and actually change** after optimisation. `test_stage3_frozen_ffn_stays_frozen`
-— with `freeze_ffn=True` the FFN is left **exactly unchanged** while the mixer still
-trains. (Full suite: 366 passed.)
+At each quarter point, record on fixed seeds/prompts:
 
-### Secondary base-quality fix: timestep sampling
+- the partial-noise recovery ladder at `t={0.8,0.9,0.95,0.99,1.0}`;
+- free-generation grammar, repetition, topic stability, and prompt relevance;
+- teacher-scored sample perplexity and held-out fixed-loss components;
+- exact sampler settings and checkpoint hash.
 
-Stage-3 previously sampled timesteps with a plain uniform `randint`, **bypassing** the
-model's configured `flow_logit_normal=True` (SD3/FLUX logit-normal) schedule — a
-footgun explicitly flagged in `FlowMatchingSchedule.sample_timesteps`'s own docstring.
-Uniform sampling starves the **mid-noise** band where token content is actually
-decided. Fixed in `src/dimba/distillation/trainer.py::_stage3_step`: when the model is
-flow-matching + logit-normal, Stage 3 now draws logit-normal **integer** timesteps via
-the existing, tested `noise_schedule.sample_timesteps(..., mode="logit_normal")`
-(falls back to the old uniform behaviour otherwise, so nothing else changes).
+**GO:** the `t=1` cliff closes and free samples become locally coherent without degrading the
+already-strong `t≤0.9` recovery. **NO-GO:** `t=1` remains near random or lower-noise recovery
+regresses. Stop; do not spend another 5-50B tokens and do not start SFT.
 
-> Known lower-priority follow-up (not changed, to stay conservative): SFT and GRPO
-> still sample timesteps uniformly (`sample_timesteps` in `diffusion/sampling.py`).
-> The base is where coherence is won, so the Stage-3 fix is the high-value one.
+### R2 — fresh recipe validation
 
----
+Only after R1 shows the objective can repair pure-noise generation, run a fresh conversion:
 
-## 3. Per-stage token budget + go/no-go gates (the validation ladder)
+```bash
+python3 scripts/train_h100.py --preset validation --phase distill \
+  --stage3-optimizer adamw \
+  --save-dir checkpoints/h100-validation-adamw
+```
 
-The model is always 135M params. The “stages” below are **escalating token budgets**
-with a **gate** between each — cheap → expensive, stop early if a gate fails. Run them
-in order; do not skip a gate.
+The `validation` preset is roughly 1B tokens (700M frozen + 300M unfrozen). It tests whether the
+full teacher-guided recipe learns the endpoint from a fresh initialization. It is not evidence that
+1B is a final training budget.
 
-| Stage | Co-adapt tokens (3a frozen / 3b unfrozen) | ~Steps (CUDA batch) | ~Cost | **GO/NO-GO gate** |
-|---|---|---|---|---|
-| **S0 — Smoke / plumbing** | **135M** (100M / 35M) | ~8.2k | ~1–2 GPU-h | Loss decreases monotonically; no NaN/Inf; FFN receives gradients in 3b; output is not pure-repeat garbage. *Plumbing only, not a quality gate.* |
-| **S1 — Validation (= run-#1 budget)** | **1B** (700M / 300M) | ~61k | ~5–6 GPU-h | **Clearly better than run #1 at equal budget** — less degenerate repetition, lower held-out diffusion loss / perplexity. Isolates “did the recipe fix help?” |
-| **S2 — Scale-test (DECISION gate)** | **5B** (3B / 2B) — *current default* | ~305k | ~25–30 GPU-h | **Coherent ≥30-token continuations** on held-out prompts (grammatical, on-topic, low repetition) **AND** held-out perplexity within ~1.3–1.5× the SmolLM-135M teacher on the same set (relative signal — DIMBA is bidirectional-diffusion, exact PPL parity is *not* expected) **AND** `eval_vs_smollm.py` shows DIMBA non-trivially close to teacher. |
-| **S3 — Full run (post-gate)** | **20–50B** (~60–70% frozen / ~30–40% unfrozen); up to ~100B only if gates keep improving | ~1.2–3.0M | days | Proceed to SFT → GRPO. |
+Run the Muon arm separately only after AdamW establishes the baseline:
 
-**Gate logic:**
-- **S0 fail** → pipeline bug; fix before spending tokens.
-- **S1 fail** (no better than run #1) → the recipe change isn't the lever; re-examine
-  surgery / init / loss before scaling.
-- **S2 GO** → the undertraining hypothesis is confirmed; commit to S3.
-- **S2 NO-GO** (5B still incoherent) → the problem is **not just tokens**. Do **not**
-  burn the big run. Investigate: bidirectional-diffusion objective scale, latent/VAE
-  calibration, principled init, or `use_flow_matching` schedule. (See `RESEARCH_DIRECTIONS.md`.)
+```bash
+python3 scripts/train_h100.py --preset validation --phase distill \
+  --stage3-optimizer muon \
+  --save-dir checkpoints/h100-validation-muon
+```
 
-Don't bother enumerating SFT/GRPO budgets until S2 is GO — the coherence-gate guards
-in `run_sft`/`run_grpo` now warn that those phases can't rescue an incoherent base.
+Compare wall-clock time to the same recovery/coherence gate, not loss at an arbitrary step.
 
----
+### R3 — scale decision
 
-## 4. Validation-FIRST step (do this before the big run) — CONFIRMED
+If R2 passes, `--preset scale` runs roughly 5B tokens (3B frozen + 2B unfrozen). Require coherent
+30+ token continuations, low repetition, no `t=1` cliff, and a non-trivial teacher-relative held-out
+score before considering 20-50B. A 50B `full` run is a post-gate option, not the default answer to
+the budget28 failure.
 
-The recommendation on the table — **continue the EXISTING base for ~5–10B more tokens
-with the FFN unfrozen** — is the right cheap test of the undertraining hypothesis.
-**Confirmed, with a refinement to make it even cheaper to read:**
+SFT and GRPO cannot repair an incoherent base. The H100 launcher requires a human-recorded
+`--quality-gate-passed` before either phase and rejects `--phase all`.
 
-1. **Resume the existing run-#1 base checkpoint** (it already had its frozen phase, so
-   skip 3a):
-   ```python
-   STAGE3_FROZEN_TOKENS   = 0
-   STAGE3_UNFROZEN_TOKENS  = 8_000_000_000   # 5–10B, FFN unfrozen, low LR
-   ```
-   ```bash
-   python scripts/train_4090.py --phase distill --resume checkpoints/distill/final.pt
-   ```
-   (Also raise `n_cache` so 8B isn't ~27 epochs of 290M tokens — see §1 caveat.)
-2. **Read coherence early, at the ~2–3B mark.** If continuations are *clearly
-   improving* (less repetition, more on-topic), continue to the full 5–10B. If they're
-   **flat**, stop — the issue isn't tokens, and you've spent ~3B instead of 10B
-   discovering it.
-3. If the continuation reaches coherence → you've de-risked the big run and can go
-   straight to S3 with confidence. If it improves but plateaus short of the S2 gate →
-   the budget needs to go higher (20–50B) and/or data diversity needs raising.
+## Production launch and resume rules
 
-This is the single most informative ~$ you can spend: it discriminates
-**“undertrained” vs “architecturally broken”** before committing compute.
+CUDA training fails closed unless every live mixer is `mamba_ssm.Mamba2` and
+`causal-conv1d` imports. The continuous launcher remains one-phase-at-a-time, but Stage 3 supports
+single-node one-process-per-GPU DDP. Alignment runs once on rank 0, teachers are replicated and
+frozen, and the complete diffusion + KD objective is DDP-wrapped.
 
----
+Resume an exact Stage-3 checkpoint with the same preset, optimizer, topology, backend, batch, data
+revision, and save directory:
 
-## 5. Concrete recommended numbers (summary)
+```bash
+python3 scripts/train_h100.py --preset validation --phase distill \
+  --stage3-optimizer adamw \
+  --checkpoint checkpoints/h100-validation-adamw/distill_latest.pt --resume \
+  --save-dir checkpoints/h100-validation-adamw
+```
 
-- **Immediate:** validation continuation, **5–10B unfrozen tokens** on the existing
-  base (§4), early coherence read at ~2–3B.
-- **If/when doing a fresh run:** default config = **S2 scale-test, 5B** (3B frozen +
-  2B unfrozen). This is the gate that decides the big run.
-- **Full run (after S2 GO):** **20–50B** (target), 50–100B only if gates keep
-  improving. Frozen:unfrozen ≈ 60–70 : 30–40.
-- **LRs:** frozen 2e-4, unfrozen 3e-5.
-- **Data:** raise `n_cache` / use a larger FineWeb slice for any budget >~1B.
+For eight H100s, use the same command under `torchrun`:
 
----
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/train_h100.py \
+  --preset validation --phase distill --stage3-optimizer adamw \
+  --checkpoint checkpoints/h100-validation-8gpu/distill_latest.pt --resume \
+  --save-dir checkpoints/h100-validation-8gpu
+```
 
-## 6. Confidence & what I'm unsure about (honest)
+Omit `--checkpoint --resume` for a fresh run. Batch 64 is per GPU; the launcher divides resolved
+optimizer steps by world size to preserve the preset's global token budget. Exact resume requires
+the same world size. SFT and GRPO remain single-process.
 
-- **Medium-high confidence** that run #1's incoherence is *undertraining + frozen FFN*,
-  not a fundamental architecture flaw: the budget was below the conversion floor on
-  two axes, and the literature is consistent.
-- **Medium confidence** on the absolute numbers. The 5–10B floor and 20–50B target are
-  **extrapolations** from AR attn→Mamba conversions (3–20B), adjusted upward by
-  judgement for the diffusion + bidirectional objective change. **No published work
-  converts a Transformer into a *diffusion* Mamba LM**, so there is no direct anchor —
-  the diffusion signal-dilution factor (how much more than AR) is a genuine unknown. It
-  could be ~1.5× (→ target ~15–30B) or ~3× (→ target ~40–60B). The gated ladder exists
-  precisely to measure this instead of guessing.
-- **Lower confidence** on the exact frozen:unfrozen split (60–70/30–40) and the
-  unfrozen LR (3e-5). These are reasoned defaults (low-LR continued-pretraining
-  practice), not measured optima; worth a small sweep at S2 if budget allows.
-- **Caveat I can't rule out:** if S2 (5B) is still incoherent, the cause may be on the
-  objective/latent side (bidirectional diffusion, VAE/latent scale, init) rather than
-  tokens. The S2 NO-GO branch covers this.
+This restores model, optimizer, Python/CPU/CUDA RNG, phase/step, pinned revisions, and the cumulative
+3a→3b stream cursor. A trajectory mismatch, including KD/loss/timestep settings, fails closed.
 
----
+After a recorded base gate:
 
-### Change log (code backing this plan)
-- `scripts/train_4090.py` — token-budget knobs + `_steps_for_tokens`/`_coadapt_stages`;
-  two-phase Stage 3 (frozen→unfrozen) with intermediate checkpointing; coherence-gate
-  warnings in `run_sft`/`run_grpo`.
-- `src/dimba/distillation/trainer.py` — logit-normal Stage-3 timestep sampling for
-  flow-matching models.
-- `tests/test_distillation.py` — FFN-trains-when-unfrozen / FFN-frozen-stays-frozen tests.
+```bash
+python3 scripts/train_h100.py --preset validation --phase sft \
+  --checkpoint checkpoints/h100-validation-adamw/final.pt \
+  --quality-gate-passed --save-dir checkpoints/h100-validation-adamw-sft
+
+python3 scripts/train_h100.py --preset validation --phase grpo \
+  --checkpoint checkpoints/h100-validation-adamw-sft/final.pt \
+  --quality-gate-passed --save-dir checkpoints/h100-validation-adamw-grpo
+```
+
+SFT/GRPO do not implement exact continuation. Restart an interrupted post-training phase from its
+input weights; do not label that a resume.
+
+To stop Stage 3 safely, write `{"stop": true}` to `training_state_override.json`, wait for a fresh
+`distill_latest.pt` and process exit, then stop the host. See [BABYSIT_LOOP.md](BABYSIT_LOOP.md).
+
+## Multi-GPU tracks
+
+Continuous Stage 3 uses the H100 command above. Canonical **masked** base and SFT training also use
+one DDP process per CUDA GPU:
+
+```bash
+PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
+  scripts/masked_diffusion_finetune.py \
+  --device cuda --batch 8 --accumulate 1 --optimizer adamw \
+  --output-dir checkpoints/masked-base-adamw
+
+PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
+  scripts/mdm_sft_cfg2.py \
+  --device cuda --batch 8 --accumulate 1 --optimizer adamw \
+  --output-dir checkpoints/masked-sft-adamw
+```
+
+`--batch` is per GPU; global batch is `batch × world_size × accumulate`. Rank 0 builds the shared
+cache and writes atomic checkpoints; failures are broadcast so peers do not deadlock. Exact resume
+requires the same world size and run signature. Use a distinct `--output-dir` for each optimizer
+arm. Single-node DDP is tested. Standard multi-node
+`torchrun` is plausible but not yet validated for this repo and additionally requires a filesystem
+visible at the same cache/checkpoint path on every node.
+
+## Kernel and performance gate
+
+Use the official Mamba-2 and causal-convolution kernels. Liger fused linear CE is enabled only for
+uniform reductions where its backward is exact; weighted masked/response losses use selected native
+projection. No bespoke CUDA kernel should be added or promoted without the trained-checkpoint H100
+p50/p95/HBM/parity gate in [PERFORMANCE_AND_SCALING.md](PERFORMANCE_AND_SCALING.md).
+
+## Evidence hierarchy
+
+1. [ROOT_CAUSE_BUDGET28.md](ROOT_CAUSE_BUDGET28.md) — definitive controlled post-mortem.
+2. This file — current launch/gate decision.
+3. [PERFORMANCE_AND_SCALING.md](PERFORMANCE_AND_SCALING.md) — optimization and benchmark truth.
+4. Historical model cards/write-ups — preserve old results, but do not override the current recipe.

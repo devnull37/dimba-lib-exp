@@ -25,7 +25,7 @@ from dimba.diffusion.corruption import (
     HybridCorruption,
     _mask_prob,
 )
-from dimba.diffusion.masked_sampling import masked_diffusion_sample
+from dimba.diffusion.masked_sampling import _max_softmax_confidence, masked_diffusion_sample
 
 
 def _toy_alphas_cumprod(num_steps: int = 100) -> torch.Tensor:
@@ -211,6 +211,23 @@ class TestHybridCorruption:
 
 
 class TestMaskedDiffusionSample:
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_low_precision_confidence_ranking_matches_float32(self, dtype):
+        torch.manual_seed(17)
+        logits = (torch.randn(8, 128, 1000) * 4).to(dtype)
+
+        confidence, predicted = _max_softmax_confidence(logits)
+        expected_confidence, expected_predicted = torch.softmax(
+            logits.float(), dim=-1
+        ).max(dim=-1)
+
+        assert torch.equal(predicted, expected_predicted)
+        assert torch.equal(
+            confidence.topk(32, dim=1).indices,
+            expected_confidence.topk(32, dim=1).indices,
+        )
+        torch.testing.assert_close(confidence, expected_confidence, rtol=1e-5, atol=1e-7)
+
     def _make_predict_logits(self, vocab):
         """A deterministic toy model: confidently predicts a fixed target id."""
         target = 7
@@ -298,6 +315,30 @@ class TestMaskedDiffusionSample:
         )
         assert (out != mask_id).all()
         assert (out == target).all()
+
+    def test_selected_projection_only_requests_unresolved_positions(self):
+        vocab, mask_id, target = 20, 19, 7
+        requested = []
+
+        def predict_logits(ids, t, positions=None):
+            assert positions is not None
+            requested.append(positions.shape[1])
+            logits = torch.zeros(ids.shape[0], positions.shape[1], vocab)
+            logits[..., target] = 10.0
+            return logits
+
+        prompt = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        out = masked_diffusion_sample(
+            predict_logits=predict_logits,
+            prompt_ids=prompt,
+            gen_len=10,
+            mask_token_id=mask_id,
+            num_steps=5,
+        )
+
+        assert (out == target).all()
+        assert requested == [10, 8, 6, 4, 2]
+        assert sum(requested) < len(requested) * (prompt.shape[1] + 10)
 
 
 if __name__ == "__main__":

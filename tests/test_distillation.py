@@ -12,6 +12,7 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -25,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 # Import individual submodules directly so the missing trainer.py does not
 # prevent the bulk of tests from running.
 # ---------------------------------------------------------------------------
-from dimba.distillation.teacher import TeacherOutputs
+from dimba.distillation.teacher import TeacherOutputs, TeacherWrapper
 from dimba.distillation.projectors import Projector, HeadAligner, LayerMap
 from dimba.distillation.losses import stage1_matrix_loss, stage2_hidden_loss, stage3_kd_loss
 from dimba.distillation.surgery import build_student_from_teacher
@@ -48,6 +49,40 @@ _LS = 2       # student layers
 _L = 8        # sequence length
 _B = 2        # batch size
 _FFN_HIDDEN = 128  # teacher FFN intermediate size
+
+
+class TestTeacherWrapper:
+    def test_logits_only_disables_alignment_outputs_and_cache(self) -> None:
+        class FakeHF(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.anchor = nn.Parameter(torch.zeros(()))
+                self.kwargs = None
+
+            @property
+            def device(self) -> torch.device:
+                return self.anchor.device
+
+            def forward(self, **kwargs):
+                self.kwargs = kwargs
+                ids = kwargs["input_ids"]
+                return SimpleNamespace(logits=torch.randn(*ids.shape, 13))
+
+        wrapper = TeacherWrapper.__new__(TeacherWrapper)
+        nn.Module.__init__(wrapper)
+        wrapper._hf_model = FakeHF()
+        ids = torch.randint(0, 13, (2, 4))
+        mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+
+        outputs = wrapper.logits_only(ids, attention_mask=mask)
+
+        assert outputs.hidden_states == ()
+        assert outputs.attentions == ()
+        assert outputs.logits.shape == (2, 4, 13)
+        assert wrapper._hf_model.kwargs["output_hidden_states"] is False
+        assert wrapper._hf_model.kwargs["output_attentions"] is False
+        assert wrapper._hf_model.kwargs["use_cache"] is False
+        assert torch.equal(wrapper._hf_model.kwargs["attention_mask"], mask)
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +791,72 @@ class TestStage3KdLoss:
         with pytest.raises(ValueError):
             stage3_kd_loss(s, t)
 
+    def test_padding_mask_excludes_masked_positions(self) -> None:
+        """Changing logits at padding positions must not change teacher KD."""
+        torch.manual_seed(205)
+        student = torch.randn(2, 4, 11)
+        teacher = torch.randn(2, 4, 11)
+        mask = torch.tensor([[1, 1, 0, 0], [1, 0, 0, 0]], dtype=torch.bool)
+
+        expected = stage3_kd_loss(student, teacher, loss_mask=mask)
+        student_changed = student.clone()
+        teacher_changed = teacher.clone()
+        student_changed[~mask] = torch.randn_like(student_changed[~mask]) * 100.0
+        teacher_changed[~mask] = torch.randn_like(teacher_changed[~mask]) * 100.0
+        actual = stage3_kd_loss(student_changed, teacher_changed, loss_mask=mask)
+
+        assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+    def test_padding_mask_shape_is_checked(self) -> None:
+        with pytest.raises(ValueError, match="loss_mask must have shape"):
+            stage3_kd_loss(
+                torch.randn(2, 4, 11),
+                torch.randn(2, 4, 11),
+                loss_mask=torch.ones(2, 3),
+            )
+
+    def test_sample_weights_fade_without_renormalizing(self) -> None:
+        torch.manual_seed(206)
+        student = torch.randn(2, 4, 11)
+        teacher = torch.randn(2, 4, 11)
+        first_only = stage3_kd_loss(
+            student, teacher, sample_weight=torch.tensor([1.0, 0.0])
+        )
+        first = stage3_kd_loss(student[:1], teacher[:1])
+        assert torch.allclose(first_only, first * 0.5, atol=1e-6, rtol=1e-6)
+
+    def test_chunked_kd_matches_value_and_gradient(self) -> None:
+        torch.manual_seed(207)
+        teacher = torch.randn(3, 4, 11)
+        mask = torch.tensor(
+            [[1, 1, 1, 0], [1, 0, 0, 0], [1, 1, 0, 0]], dtype=torch.bool
+        )
+        fade = torch.tensor([1.0, 0.5, 0.1])
+        dense_student = torch.randn(3, 4, 11, requires_grad=True)
+        chunked_student = dense_student.detach().clone().requires_grad_(True)
+
+        dense = stage3_kd_loss(
+            dense_student,
+            teacher,
+            loss_mask=mask,
+            sample_weight=fade,
+            chunk_size=32,
+        )
+        chunked = stage3_kd_loss(
+            chunked_student,
+            teacher,
+            loss_mask=mask,
+            sample_weight=fade,
+            chunk_size=1,
+        )
+        dense.backward()
+        chunked.backward()
+
+        assert torch.allclose(chunked, dense, atol=1e-6, rtol=1e-6)
+        assert torch.allclose(
+            chunked_student.grad, dense_student.grad, atol=1e-6, rtol=1e-6
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_student_from_teacher
@@ -1275,6 +1376,230 @@ class TestDistillationTrainer:
         assert changed, "FFN params should change after an unfrozen stage3 (gradients flowed)"
         for p in ffn_params:
             assert torch.isfinite(p).all()
+
+    def test_stage3_can_opt_into_hybrid_muon(
+        self, tiny_student_with_ffn: DIMBA, stub_teacher: StubTeacher
+    ) -> None:
+        from dimba.distillation.trainer import DistillationConfig, DistillationTrainer
+        from dimba.training.optimizers import HybridMuon
+
+        cfg = DistillationConfig(
+            teacher_model="stub",
+            teacher_type="causal",
+            stages=[
+                {
+                    "name": "stage3",
+                    "steps": 1,
+                    "lr": 1e-4,
+                    "optimizer": "muon",
+                    "weight_decay": 0.0,
+                }
+            ],
+        )
+        trainer = DistillationTrainer(tiny_student_with_ffn, stub_teacher, cfg)
+        trainer.run_stage(cfg.stages[0], self._make_tiny_dataloader(_VOCAB, _L, 2))
+
+        assert isinstance(trainer.optimizer, HybridMuon)
+        assert trainer.optimizer.muon_parameter_names
+        assert trainer.optimizer.adamw_parameter_names
+
+    def test_stage3_forwards_high_noise_repair_to_loss(
+        self,
+        tiny_student_with_ffn: DIMBA,
+        stub_teacher: StubTeacher,
+        monkeypatch,
+    ) -> None:
+        import dimba.distillation.trainer as trainer_module
+
+        captured = {}
+        original = trainer_module.compute_dimba_losses
+
+        def recording_loss(*args, **kwargs):
+            captured.update(kwargs)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(trainer_module, "compute_dimba_losses", recording_loss)
+        stage = {
+            "name": "stage3",
+            "steps": 1,
+            "lr": 1e-4,
+            "snr_floor": 0.5,
+            "ce_time_fade": True,
+        }
+        cfg = trainer_module.DistillationConfig(
+            teacher_model="stub",
+            teacher_type="causal",
+            stages=[stage],
+        )
+        trainer = trainer_module.DistillationTrainer(
+            tiny_student_with_ffn, stub_teacher, cfg
+        )
+        trainer.run_stage(stage, self._make_tiny_dataloader(_VOCAB, _L, 2))
+
+        assert captured["snr_floor"] == pytest.approx(0.5)
+        assert captured["ce_time_fade"] is True
+
+    def test_stage3_uses_uniform_logit_normal_mixture(
+        self,
+        tiny_student_with_ffn: DIMBA,
+        stub_teacher: StubTeacher,
+        monkeypatch,
+    ) -> None:
+        import dimba.distillation.trainer as trainer_module
+
+        model = tiny_student_with_ffn
+        model.use_flow_matching = True
+        model.flow_schedule = SimpleNamespace(logit_normal_sampling=True)
+        captured = {}
+
+        monkeypatch.setattr(
+            model.noise_schedule,
+            "sample_timesteps",
+            lambda batch, device, mode: torch.full(
+                (batch,), 7, dtype=torch.long, device=device
+            ),
+        )
+        monkeypatch.setattr(
+            trainer_module.torch,
+            "randint",
+            lambda low, high, size, device=None: torch.full(
+                size, 18, dtype=torch.long, device=device
+            ),
+        )
+        monkeypatch.setattr(
+            trainer_module.torch,
+            "rand",
+            lambda size, device=None: torch.tensor(
+                [0.1, 0.9, 0.2, 0.8], device=device
+            ),
+        )
+
+        def recording_loss(model_arg, _ids, timesteps, **_kwargs):
+            captured["timesteps"] = timesteps.detach().clone()
+            return model_arg.null_cond.sum() * 0.0, {}
+
+        monkeypatch.setattr(trainer_module, "compute_dimba_losses", recording_loss)
+        monkeypatch.setattr(
+            trainer_module,
+            "_run_dimba_loss_forward",
+            lambda model_arg, ids, _timesteps: (
+                torch.zeros(ids.shape[0], ids.shape[1], model_arg.d_model),
+                {},
+            ),
+        )
+        cfg = trainer_module.DistillationConfig(
+            teacher_model="stub",
+            teacher_type="causal",
+            stages=[],
+        )
+        trainer = trainer_module.DistillationTrainer(model, stub_teacher, cfg)
+        trainer._stage3_step(
+            torch.randint(0, _VOCAB, (4, _L)),
+            ce_loss_weight=1.0,
+            min_snr_gamma=5.0,
+            snr_floor=0.5,
+            ce_time_fade=True,
+            kd_weight=0.0,
+            kd_temp=2.0,
+        )
+
+        assert captured["timesteps"].tolist() == [18, 7, 18, 7]
+
+    def test_stage3_kd_stays_live_and_causally_aligned(
+        self,
+        tiny_student_with_ffn: DIMBA,
+        stub_teacher: StubTeacher,
+        monkeypatch,
+    ) -> None:
+        import dimba.distillation.trainer as trainer_module
+
+        model = tiny_student_with_ffn
+        batch, length = 2, 5
+        student_logits = torch.arange(
+            batch * length * _VOCAB, dtype=torch.float32
+        ).reshape(batch, length, _VOCAB)
+        teacher_logits = student_logits + 1000.0
+        captured = {}
+
+        def fake_base_loss(model_arg, _ids, timestep, **_kwargs):
+            captured["base_timestep"] = timestep.clone()
+            return model_arg.null_cond.sum() * 0.0, {}
+
+        student_features = torch.randn(batch, length, model.d_model)
+
+        def fake_forward(_ids, timestep, **_kwargs):
+            captured["kd_timestep"] = timestep.clone()
+            captured["student_forwards"] = captured.get("student_forwards", 0) + 1
+            return student_features, torch.empty(0), {}
+
+        monkeypatch.setattr(trainer_module, "compute_dimba_losses", fake_base_loss)
+        monkeypatch.setattr(model, "forward", fake_forward)
+        monkeypatch.setattr(model.output_head, "forward", lambda features: student_logits)
+        padding_mask = torch.tensor(
+            [[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]], dtype=torch.bool
+        )
+
+        def fake_logits_only(_ids, attention_mask=None):
+            captured["teacher_attention_mask"] = attention_mask
+            return TeacherOutputs((), (), teacher_logits)
+
+        monkeypatch.setattr(stub_teacher, "logits_only", fake_logits_only, raising=False)
+        monkeypatch.setattr(
+            stub_teacher,
+            "forward",
+            lambda _ids: (_ for _ in ()).throw(AssertionError("full teacher path used")),
+        )
+
+        def recording_kd(
+            student,
+            teacher,
+            kd_temp,
+            loss_mask=None,
+            sample_weight=None,
+            chunk_size=16,
+        ):
+            captured.update(
+                student=student,
+                teacher=teacher,
+                temperature=kd_temp,
+                loss_mask=loss_mask,
+                sample_weight=sample_weight,
+            )
+            return model.null_cond.sum() * 0.0 + 2.0
+
+        monkeypatch.setattr(trainer_module, "stage3_kd_loss", recording_kd)
+        trainer = trainer_module.DistillationTrainer(
+            model,
+            stub_teacher,
+            trainer_module.DistillationConfig(
+                teacher_model="stub",
+                teacher_type="causal",
+                share_vocab=True,
+                stages=[],
+            ),
+        )
+        loss = trainer._stage3_step(
+            torch.randint(0, _VOCAB, (batch, length)),
+            ce_loss_weight=1.0,
+            min_snr_gamma=5.0,
+            kd_weight=0.3,
+            kd_temp=2.5,
+            kd_time_fade=True,
+            loss_mask=padding_mask,
+        )
+
+        assert torch.equal(captured["student"], student_logits[:, 1:])
+        assert torch.equal(captured["teacher"], teacher_logits[:, :-1])
+        assert captured["temperature"] == pytest.approx(2.5)
+        assert torch.equal(captured["kd_timestep"], captured["base_timestep"])
+        assert captured["student_forwards"] == 1
+        assert torch.equal(captured["teacher_attention_mask"], padding_mask)
+        assert torch.equal(captured["loss_mask"], padding_mask[:, 1:])
+        expected_fade = 1.0 - captured["base_timestep"].float() / (
+            model.num_diffusion_steps - 1
+        )
+        assert torch.allclose(captured["sample_weight"], expected_fade)
+        assert loss.item() == pytest.approx(0.6)
 
     def test_stage3_frozen_ffn_stays_frozen(
         self, tiny_student_with_ffn: DIMBA, stub_teacher: StubTeacher

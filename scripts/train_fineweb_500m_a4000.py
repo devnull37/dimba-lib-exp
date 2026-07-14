@@ -147,10 +147,12 @@ def main() -> None:
         model_config=cfg["model"],
         learning_rate=float(train_cfg["learning_rate"]),
         warmup_steps=int(train_cfg["warmup_steps"]),
+        weight_decay=float(train_cfg.get("weight_decay", 0.01)),
         ema_decay=float(train_cfg["ema_decay"]),
         use_ema=bool(train_cfg["use_ema"]),
         ema_device=str(train_cfg.get("ema_device", "cpu")),
         ema_update_interval=int(train_cfg.get("ema_update_interval", 1)),
+        optimizer=str(train_cfg.get("optimizer", "adamw")),
     )
 
     total_params = sum(p.numel() for p in lightning_module.model.parameters())

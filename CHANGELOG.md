@@ -7,9 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The v2 overhaul focuses on correctness, modern diffusion-LM capabilities, and
-CPU/GPU performance. Items below are in progress on the `feature/dimba-v2-overhaul`
-branch and describe the direction at a high level.
+The merged v2 overhaul and the 2026-07-13 next-run pass focus on correctness,
+modern diffusion-LM capabilities, exact run recovery, and measured CPU/GPU efficiency.
 
 ### Added
 
@@ -26,19 +25,38 @@ branch and describe the direction at a high level.
   pipeline.
 - **Performance backends**: pluggable denoiser backends so the optimized
   `mamba-ssm` kernels are used when available (GPU) while the pure-PyTorch
-  `SimpleMamba2` remains the default CPU-friendly fallback.
+  `TorchMamba2` remains the weight-compatible CPU/MPS fallback. `SimpleMamba2`
+  is retained only as an explicit lightweight/reference implementation.
 - **Infrastructure**: a CPU inference benchmark (`scripts/benchmark.py`),
   smoke/import test suites, GitHub Actions CI (Python 3.10 and 3.12, CPU only),
   pre-commit hooks (black, isort, trailing-whitespace, end-of-file-fixer), and
   this changelog.
+- **Hybrid Muon/AdamW optimizer**: native PyTorch Muon when available and a compatible
+  Moonlight-style fallback, with semantic parameter routing and checkpoint/scheduler support.
+- **Native masked DDP**: one process per GPU, no-sync gradient accumulation, non-duplicating
+  sharding, rank-zero shared caches/checkpoints, reduced log metrics, and exact same-topology
+  resume for `masked_diffusion_finetune.py` and `mdm_sft_cfg2.py`.
+- **Masked training objective**: vectorized corruption and exact selected-response-token
+  vocabulary projection rather than full `[batch, sequence, vocab]` materialization.
+- **CUDA benchmark gate**: full masked inference, DDIM, DPM-Solver++(2M), continuous fused CE,
+  and masked CE forward/backward cases with p50/p95, HBM, throughput, parity, environment, and
+  source-tree provenance in `scripts/benchmark_h100.py`.
+- **Optional Liger fused CE** for exact uniform continuous reductions; weighted and masked
+  objectives retain native selected-token math.
 
 ### Changed
 
-- Sampling is being consolidated around correct, schedule-consistent update rules
-  for both ancestral and DDIM-style accelerated inference, with configurable
-  step counts and guidance.
-- Conditioning, latent-projection, and timestep-embedding interfaces are being
-  unified so continuous, latent, and discrete modes share a single denoiser path.
+- Sampling is consolidated around schedule-consistent DDIM, DPM-Solver++(2M), flow,
+  and masked updates with device-resident schedules/trajectories, batched CFG, selected
+  vocabulary projection, batched verification, and no redundant final forward.
+- CUDA production launchers are Mamba-2 only and fail closed unless every live mixer is
+  `mamba_ssm.Mamba2` and `causal-conv1d` is available. CPU/MPS keep the weight-compatible
+  TorchMamba2 fallback; Mamba-1 is never selected.
+- AdamW remains the production default; Muon is an explicit A/B pilot.
+- Checkpoints use atomic replacement. Continuous Stage 3 records exact optimizer/RNG/phase/data
+  cursor/backend state; masked DDP records per-rank RNG/data state and world size.
+- MLX masked generation keeps the trajectory on Apple GPU, batches CFG, selects unresolved
+  positions before vocabulary projection, and converts to host once.
 
 ### Fixed
 
@@ -47,6 +65,11 @@ branch and describe the direction at a high level.
   terminal-SNR handling and per-step variance computation.
 - More robust logit post-processing during sampling (temperature, top-k / top-p)
   to avoid NaNs from fully-masked distributions.
+- Prompt/response scope in continuous GRPO generation now uses the shared clean-prefix sampler
+  rather than a private reverse loop.
+- Rank-zero cache/checkpoint failures are broadcast so DDP peers raise instead of deadlocking.
+- Stage-3 3b continues from the cumulative 3a data cursor; partial accumulation groups use their
+  true divisor; training metric logging no longer forces a CUDA synchronization every microbatch.
 
 ## [0.1.0] - 2025-01-24
 

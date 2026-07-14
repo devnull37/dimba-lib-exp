@@ -38,9 +38,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .preference import elbo_sequence_logprob, antithetic_timesteps
+from .preference import elbo_sequence_logprob, sample_elbo_trajectories
 from .rewards import CompositeReward, NumericAnswerReward, ExactMatchReward, RegexMatchReward, LengthPenaltyReward, Reward
 from ..inference.block_cot import block_sample_from_model
+from ..utils.checkpointing import atomic_torch_save
 
 logger = logging.getLogger(__name__)
 
@@ -116,55 +117,26 @@ def _compute_elbo_logprob(
     model: nn.Module,
     input_ids: torch.Tensor,
     response_mask: torch.Tensor,
-    mc_samples: int,
-    antithetic: bool,
-    generator: Optional[torch.Generator] = None,
+    *,
+    timesteps: torch.Tensor,
+    noises: torch.Tensor,
     prompt_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """ELBO-surrogate log-prob for response positions of *input_ids*. Returns [B].
-
-    Bug 3 fix: when prompt_mask is supplied, a custom logits_fn is built that
-    passes it into model.forward so that (a) prompt tokens are kept clean during
-    diffusion and (b) pooled conditioning is built from the prompt prefix only.
-    Without this, model(input_ids, t, return_latent_info=True) with prompt_mask=None
-    noises the entire sequence (including the prompt) and uses no conditioning.
-    """
-    B = input_ids.shape[0]
-    T = model.num_diffusion_steps
-    total_lp = torch.zeros(B, device=input_ids.device)
-
-    if prompt_mask is not None:
-        # Capture prompt_mask in a closure for the logits_fn signature required
-        # by elbo_sequence_logprob: (model, input_ids, t) -> logits.
-        _pm = prompt_mask
-        def _logits_fn(m: nn.Module, ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            x_pred, _, _ = m(ids, t, prompt_mask=_pm, return_latent_info=True)
-            return m.output_head(x_pred, embedding_weight=m.token_embed.get_weight())
-    else:
-        _logits_fn = None  # elbo_sequence_logprob uses its default forward
-
-    if antithetic and mc_samples < 2:
-        antithetic = False  # can't do antithetic pairs with fewer than 2 samples
-    draws = mc_samples // 2 if antithetic else mc_samples
-    draws = max(1, draws)
-    for _ in range(draws):
-        if antithetic:
-            t, t_ant = antithetic_timesteps(B, T, device=input_ids.device, generator=generator)
-            for tt in (t, t_ant):
-                lp = elbo_sequence_logprob(model, input_ids, input_ids, response_mask,
-                                           timesteps=tt, num_mc_samples=1,
-                                           logits_fn=_logits_fn,
-                                           generator=generator)
-                total_lp = total_lp + lp
-        else:
-            lp = elbo_sequence_logprob(model, input_ids, input_ids, response_mask,
-                                       timesteps=None, num_mc_samples=1,
-                                       logits_fn=_logits_fn,
-                                       generator=generator)
-            total_lp = total_lp + lp
-
-    n_total = draws * (2 if antithetic else 1)
-    return total_lp / n_total
+    """Score shared, non-clean trajectories at selected response positions."""
+    was_training = model.training
+    model.eval()
+    try:
+        return elbo_sequence_logprob(
+            model,
+            input_ids,
+            input_ids,
+            response_mask,
+            timesteps=timesteps,
+            prompt_mask=prompt_mask,
+            noises=noises,
+        )
+    finally:
+        model.train(was_training)
 
 
 def _group_advantages(rewards: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -249,6 +221,12 @@ class GRPOTrainer:
         self.reward_fn = reward_fn
         self.tok = tokenizer
         self.cfg = config or GRPOConfig()
+        if self.cfg.group_size < 2:
+            raise ValueError("GRPO group_size must be >= 2")
+        if self.cfg.mc_samples < 1:
+            raise ValueError("GRPO mc_samples must be >= 1")
+        if self.cfg.antithetic and self.cfg.mc_samples % 2:
+            raise ValueError("GRPO antithetic sampling requires an even mc_samples")
 
         self.ref_model = ref_model if ref_model is not None else copy.deepcopy(model)
         for p in self.ref_model.parameters():
@@ -309,9 +287,11 @@ class GRPOTrainer:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _generate_group(
-        self, prompt_ids: torch.Tensor
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate G completions per prompt.
+        """Generate G completions per prompt, batching only equal-length prefixes.
 
         Returns:
             full_ids     [B*G, L]
@@ -322,48 +302,61 @@ class GRPOTrainer:
         B = prompt_ids.shape[0]
         G = self.cfg.group_size
         device = prompt_ids.device
+        if B == 0:
+            raise ValueError("GRPO generation requires at least one prompt")
+        if prompt_lens is None:
+            prompt_lens = torch.full((B,), prompt_ids.shape[1], dtype=torch.long)
+        lengths = prompt_lens.detach().cpu().tolist()
+        invalid_length = any(
+            length <= 0 or length > prompt_ids.shape[1] for length in lengths
+        )
+        if len(lengths) != B or invalid_length:
+            raise ValueError("prompt lengths must be within the padded prompt width")
 
-        full_list, resp_list, count_list, true_lens_list = [], [], [], []
-        for _ in range(G):
-            out = block_sample_from_model(
-                self.model,
-                prompt_ids,
-                self.cfg.block_size,
-                self.cfg.max_think_blocks,
-                self.cfg.response_len,
-                think_start_id=self.cfg.think_start_id,
-                think_end_id=self.cfg.think_end_id,
-                eos_id=self.cfg.eos_id,
-                adaptive_stop=self.cfg.adaptive_stop,
-                num_steps=self.cfg.num_diffusion_steps_inference,
-                sampler=self.cfg.sampler,
-            )
-            f = out["full_ids"]
-            # Record the true pre-pad column count for every row in this call.
-            # f.shape[1] is the exact sequence length before padding, independent
-            # of any token id values (including id 0) inside the sequence.
-            true_lens_list.append(
-                torch.full((B,), f.shape[1], dtype=torch.long, device=device)
-            )
-            full_list.append(f)
-            resp_list.append(out["response"])
-            # Bug 6 fix: block_sample_from_model returns n_think_blocks as a scalar
-            # int (adaptive_stop breaks globally for the whole batch via
-            # _is_degenerate in block_cot, not per-row).  The old isinstance branch
-            # claiming per-row tensor tracking was dead and documented a guarantee
-            # that does not exist.  Broadcast the scalar across the B rows of this
-            # call to form the [B] count tensor.
-            n_think = out["n_think_blocks"]
-            count_list.append(
-                torch.full((B,), int(n_think), dtype=torch.long, device=device)
-            )
+        full_rows: List[Optional[torch.Tensor]] = [None] * (B * G)
+        response_rows: List[Optional[torch.Tensor]] = [None] * (B * G)
+        think_values = [0] * (B * G)
+        true_len_values = [0] * (B * G)
 
-        max_len = max(f.shape[1] for f in full_list)
-        padded = [F.pad(f, (0, max_len - f.shape[1])) for f in full_list]
-        full_ids = torch.stack(padded, dim=1).reshape(B * G, max_len)
-        response_ids = torch.stack(resp_list, dim=1).reshape(B * G, self.cfg.response_len)
-        think_counts = torch.stack(count_list, dim=1).reshape(B * G)
-        true_lens = torch.stack(true_lens_list, dim=1).reshape(B * G)
+        for prompt_len in sorted(set(lengths)):
+            original_rows = [i for i, length in enumerate(lengths) if length == prompt_len]
+            row_indices = torch.tensor(original_rows, dtype=torch.long, device=device)
+            clean_prompts = prompt_ids.index_select(0, row_indices)[:, :prompt_len]
+            for generation_idx in range(G):
+                out = block_sample_from_model(
+                    self.model,
+                    clean_prompts,
+                    self.cfg.block_size,
+                    self.cfg.max_think_blocks,
+                    self.cfg.response_len,
+                    think_start_id=self.cfg.think_start_id,
+                    think_end_id=self.cfg.think_end_id,
+                    eos_id=self.cfg.eos_id,
+                    adaptive_stop=self.cfg.adaptive_stop,
+                    num_steps=self.cfg.num_diffusion_steps_inference,
+                    sampler=self.cfg.sampler,
+                )
+                generated = out["full_ids"]
+                responses = out["response"]
+                n_think = int(out["n_think_blocks"])
+                for local_idx, original_idx in enumerate(original_rows):
+                    slot = original_idx * G + generation_idx
+                    full_rows[slot] = generated[local_idx]
+                    response_rows[slot] = responses[local_idx]
+                    think_values[slot] = n_think
+                    true_len_values[slot] = generated.shape[1]
+
+        if any(row is None for row in full_rows) or any(row is None for row in response_rows):
+            raise RuntimeError("GRPO generation did not fill every prompt/group slot")
+        completed_full_rows = [row for row in full_rows if row is not None]
+        completed_response_rows = [row for row in response_rows if row is not None]
+        max_len = max(row.shape[0] for row in completed_full_rows)
+        full_ids = torch.stack(
+            [F.pad(row, (0, max_len - row.shape[0])) for row in completed_full_rows]
+        )
+        response_ids = torch.stack(completed_response_rows)
+        think_counts = torch.tensor(think_values, dtype=torch.long, device=device)
+        true_lens = torch.tensor(true_len_values, dtype=torch.long, device=device)
         return full_ids, response_ids, think_counts, true_lens
 
     # ------------------------------------------------------------------
@@ -468,15 +461,26 @@ class GRPOTrainer:
         # Stash references so _score_completions can see them
         self._references = reference_strs or [None] * B
 
-        # Tokenize prompts → [B, 128]
-        prompt_ids = torch.zeros(B, 128, dtype=torch.long, device=device)
-        for i, ps in enumerate(prompt_strs):
-            enc = self._encode(ps)[:128]
-            prompt_ids[i, :len(enc)] = torch.tensor(enc, dtype=torch.long)
+        # Tokenize and retain true lengths so padding never enters conditioning.
+        encoded_prompts = [self._encode(prompt)[:128] for prompt in prompt_strs]
+        if any(not prompt for prompt in encoded_prompts):
+            raise ValueError("GRPO prompts must contain at least one token")
+        prompt_lens = torch.tensor(
+            [len(prompt) for prompt in encoded_prompts], dtype=torch.long
+        )
+        prompt_ids = torch.zeros(
+            B, int(prompt_lens.max()), dtype=torch.long, device=device
+        )
+        for i, encoded in enumerate(encoded_prompts):
+            prompt_ids[i, : len(encoded)] = torch.tensor(
+                encoded, dtype=torch.long, device=device
+            )
 
         # ── 1. Generate ────────────────────────────────────────────────────────
         self.model.eval()
-        full_ids, response_ids, think_counts, true_lens = self._generate_group(prompt_ids)
+        full_ids, response_ids, think_counts, true_lens = self._generate_group(
+            prompt_ids, prompt_lens
+        )
 
         # ── 2. Score (+ Long2Short bonus) ─────────────────────────────────────
         # raw_rewards: correctness signal before Long2Short shaping
@@ -519,15 +523,27 @@ class GRPOTrainer:
         _col = torch.arange(full_ids.shape[1], device=full_ids.device).unsqueeze(0)
         prompt_mask = (_col < _prompt_start)                          # bool [B*G, L]
 
+        score_timesteps, score_noises = sample_elbo_trajectories(
+            self.model, full_ids, cfg.mc_samples, cfg.antithetic
+        )
         policy_lp = _compute_elbo_logprob(
-            self.model, full_ids, response_mask, cfg.mc_samples, cfg.antithetic,
+            self.model,
+            full_ids,
+            response_mask,
+            timesteps=score_timesteps,
+            noises=score_noises,
             prompt_mask=prompt_mask,
         )
         with torch.no_grad():
             ref_lp = _compute_elbo_logprob(
-                self.ref_model, full_ids, response_mask, cfg.mc_samples, cfg.antithetic,
+                self.ref_model,
+                full_ids,
+                response_mask,
+                timesteps=score_timesteps,
+                noises=score_noises,
                 prompt_mask=prompt_mask,
             )
+        del score_noises
 
         # Per-token normalisation (VibeThinker: 1/|y_i| in the loss)
         policy_lp_norm = policy_lp / response_len
@@ -608,23 +624,25 @@ class GRPOTrainer:
         os.makedirs(self.cfg.save_dir, exist_ok=True)
         path = path or os.path.join(self.cfg.save_dir, f"grpo_step{self.step}.pt")
         _base_model = getattr(self.model, "_orig_mod", self.model)
-        # Pin the backend: DIMBA.config omits force_torch_mixer so a CUDA checkpoint
-        # reloads on the fast kernel, but if this model runs on the pure-PyTorch
-        # TorchMamba2 backend the next loader must rebuild on it to load the weights.
         cfg_dict = dict(getattr(_base_model, "config", None) or {})
         try:
-            if type(_base_model.denoiser.blocks[0].mamba_fwd).__name__ == "TorchMamba2":
-                cfg_dict["force_torch_mixer"] = True
+            live_backend = type(_base_model.denoiser.blocks[0].mamba_fwd).__name__
         except Exception:  # noqa: BLE001 — never let a probe break checkpointing
-            pass
-        torch.save({
-            "model_state_dict": _base_model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "step": self.step,
-            "grpo_config": asdict(self.cfg),
-            "config": cfg_dict or None,  # real DIMBA model config (+ backend pin)
-        }, path)
+            live_backend = None
+        atomic_torch_save(
+            {
+                "model_state_dict": _base_model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "step": self.step,
+                "grpo_config": asdict(self.cfg),
+                # Backend-neutral constructor config: TorchMamba2 and native
+                # Mamba2 checkpoints intentionally migrate across platforms.
+                "config": cfg_dict or None,
+                "model_backend": live_backend,
+            },
+            path,
+        )
         logger.info("saved → %s", path)
         return path
 
@@ -639,22 +657,17 @@ class GRPOTrainer:
                 scheduler/step would pin the whole pass at the LR floor. When False
                 (a genuine --resume), the full training state is restored to continue.
         """
-        ckpt = torch.load(path, map_location="cpu")
-        msd = ckpt["model_state_dict"]
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        msd = dict(ckpt["model_state_dict"])
         # Weight-tied head: output_head.embedding_weight is a VIEW of the token
-        # embedding, not an independent parameter. A checkpoint saved from a model
-        # that materialised it (e.g. an SFT final.pt loaded via --checkpoint
-        # --resume) would inject an unexpected key and crash a strict load. Drop it
-        # and load non-strict — mirrors the distill/SFT loaders (train_4090.py).
+        # embedding, not an independent parameter. Drop a legacy materialized copy;
+        # every other key must still match exactly.
         msd.pop("output_head.embedding_weight", None)
-        # Tolerate torch.compile prefix differences between the saving and loading model.
-        try:
-            self.model.load_state_dict(msd, strict=False)
-        except RuntimeError:
-            from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
-            consume_prefix_in_state_dict_if_present(msd, "_orig_mod.")
-            target = getattr(self.model, "_orig_mod", self.model)
-            target.load_state_dict(msd, strict=False)
+        from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
+
+        consume_prefix_in_state_dict_if_present(msd, "_orig_mod.")
+        target = getattr(self.model, "_orig_mod", self.model)
+        target.load_state_dict(msd, strict=True)
         if weights_only:
             logger.info("loaded weights <- %s (fresh optimizer/scheduler for new pass)", path)
             return

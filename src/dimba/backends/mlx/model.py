@@ -29,6 +29,7 @@ config has ``use_flow_matching=True``.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -313,9 +314,11 @@ class MLXDIMBA:
         return self
 
     # ------------------------------------------------------------------ pieces
-    def _timestep_emb(self, t_idx: int):
+    def _timestep_emb(self, t_idx):
+        """t_idx: int schedule index, or a pre-gathered PE row (mx.array) —
+        the latter lets mx.compile trace one graph across timesteps."""
         p = self.p
-        pe = p["ts_pe"][t_idx]                                   # [128]
+        pe = p["ts_pe"][t_idx] if isinstance(t_idx, int) else t_idx  # [128]
         h = _linear(pe, p["ts_w0"], p["ts_b0"])
         h = mlx_nn.silu(h)
         h = _linear(h, p["ts_w2"], p["ts_b2"])                  # [512]
@@ -432,11 +435,8 @@ class MLXDIMBA:
         x = x + _linear(ff, blk["ff2_w"], blk["ff2_b"])
         return x
 
-    def _decode_logits(self, z):
-        """decode_latent -> optional attn-head -> optional head-norm -> output head.
-
-        z:[B,L,d_latent] -> [B,L,V]
-        """
+    def _decode_features(self, z):
+        """Decode latents and run the rounding head before vocabulary projection."""
         p = self.p
         h = z / self.latent_scale
         # decode_latent: identity when there is no latent projector (latent_diffusion=False).
@@ -454,6 +454,14 @@ class MLXDIMBA:
         if self.use_head_norm:
             h = _layer_norm(h, p["head_norm_w"], p["head_norm_b"])
 
+        return h
+
+    def _project_token_features(self, h, positions=None):
+        """Project prepared features, optionally at selected sequence positions."""
+        p = self.p
+        if positions is not None:
+            h = mx.take_along_axis(h, positions[..., None], axis=1)
+
         if self.use_weight_tying:
             logits = mx.matmul(h, p["token_embed_w"].T)          # [B,L,V]
         else:
@@ -463,6 +471,10 @@ class MLXDIMBA:
             logits = logits * mx.exp(p["logit_scale"])
 
         return logits
+
+    def _decode_logits(self, z):
+        """Decode latents to full-sequence vocabulary logits."""
+        return self._project_token_features(self._decode_features(z))
 
     def _encode_latent(self, emb):
         """Encode token embeddings -> scaled latent. emb:[B,P,d_model] -> [B,P,d_latent]."""
@@ -565,6 +577,293 @@ class MLXDIMBA:
         logits = self._decode_logits(response)
         mx.eval(logits)
         return logits
+
+    @staticmethod
+    def _as_mx_ids(ids):
+        if isinstance(ids, mx.array):
+            return ids.astype(mx.int32)
+        return mx.array(np.asarray(ids, dtype=np.int32))
+
+    def _masked_timestep_index(self, t) -> int:
+        if isinstance(t, (float, np.floating)):
+            t = round(min(max(float(t), 0.0), 1.0) * (self.num_diffusion_steps - 1))
+        return max(0, min(self.num_diffusion_steps - 1, int(t)))
+
+    def _predict_token_features_batch(self, ids, t_idx):
+        """Compiled post-head/pre-vocabulary features for a one- or two-row batch."""
+        if getattr(self, "_ptf_compiled", None) is None:
+            if self.prediction_type == "x0":
+
+                def _core(ids_mx, pe):
+                    emb = self.p["token_embed_w"][ids_mx]
+                    z = self._encode_latent(emb)
+                    null = self._project_cond(self.p["null_cond"].reshape(1, 1, -1))
+                    cond = mx.broadcast_to(null, (ids_mx.shape[0], 1, self.cond_dim))
+                    return self._decode_features(self._denoiser(z, cond, pe, None))
+
+            else:
+
+                def _core(ids_mx, pe, sqrt_acp, sqrt_om):
+                    emb = self.p["token_embed_w"][ids_mx]
+                    z = self._encode_latent(emb)
+                    null = self._project_cond(self.p["null_cond"].reshape(1, 1, -1))
+                    cond = mx.broadcast_to(null, (ids_mx.shape[0], 1, self.cond_dim))
+                    raw = self._denoiser(z, cond, pe, None)
+                    return self._decode_features(sqrt_acp * z - sqrt_om * raw)
+
+            self._ptf_compiled = mx.compile(_core)
+
+        pe = self.p["ts_pe"][t_idx]
+        if self.prediction_type == "x0":
+            return self._ptf_compiled(ids, pe)
+        return self._ptf_compiled(
+            ids, pe, self.p["sqrt_acp"][t_idx], self.p["sqrt_om"][t_idx]
+        )
+
+    def predict_token_features(self, ids, t) -> "mx.array":
+        """Masked-diffusion features with the vocabulary projection left undone."""
+        ids = self._as_mx_ids(ids)
+        t_idx = self._masked_timestep_index(t)
+        # ponytail: mlx 0.29.3 (py3.9 cap) produces NaNs for the release model's
+        # unguarded compiled graph at batch 4/8; two-row chunks stay finite. Keep
+        # this ceiling until Python >= 3.10 and current MLX are supported.
+        features = mx.concatenate(
+            [
+                self._predict_token_features_batch(ids[i : i + 2], t_idx)
+                for i in range(0, ids.shape[0], 2)
+            ],
+            axis=0,
+        )
+        mx.eval(features)
+        return features
+
+    def guided_token_logits(
+        self,
+        ids,
+        mask_id: int,
+        prompt_len: int,
+        t,
+        guidance: float,
+        positions=None,
+    ) -> "mx.array":
+        """CFG logits projected only for ``positions``; all tensors stay on MLX."""
+        ids = self._as_mx_ids(ids)
+        positions = None if positions is None else self._as_mx_ids(positions)
+        uncond = mx.concatenate(
+            [
+                mx.full((ids.shape[0], prompt_len), mask_id, dtype=ids.dtype),
+                ids[:, prompt_len:],
+            ],
+            axis=1,
+        )
+
+        if guidance in (0.0, 1.0):
+            features = self.predict_token_features(uncond if guidance == 0.0 else ids, t)
+            return self._project_token_features(features, positions)
+
+        # Interleave each conditional/unconditional pair so every two-row compiled
+        # chunk stays below the MLX 0.29.3 batch ceiling. Queue every pair first and
+        # evaluate the concatenated result once instead of synchronizing per candidate.
+        paired = mx.stack([ids, uncond], axis=1).reshape(-1, ids.shape[1])
+        features = self.predict_token_features(paired, t).reshape(
+            ids.shape[0], 2, ids.shape[1], -1
+        )
+        combined = features[:, 1] + guidance * (features[:, 0] - features[:, 1])
+        return self._project_token_features(combined, positions)
+
+    def predict_token_logits(self, ids, t) -> "mx.array":
+        """Masked-diffusion token logits (mirrors ``DIMBA.predict_token_logits``)."""
+        logits = self._project_token_features(self.predict_token_features(ids, t))
+        mx.eval(logits)
+        return logits
+
+    def masked_gap_score(
+        self,
+        ids,
+        mask_id: int,
+        eos_id: int,
+        prompt_len: int,
+        groups: int = 4,
+    ) -> np.ndarray:
+        """Batched leave-group-out conditioning gap with one final host transfer."""
+        if groups < 1:
+            raise ValueError("groups must be positive")
+        ids = self._as_mx_ids(ids)
+        batch, length = ids.shape
+        if prompt_len >= length:
+            return np.zeros(batch, dtype=np.float32)
+
+        generated = (ids != eos_id) & (ids != mask_id)
+        generated = generated & (
+            mx.arange(length, dtype=mx.int32)[None, :] >= prompt_len
+        )
+        response_positions = np.arange(prompt_len, length, dtype=np.int32)
+        width = (len(response_positions) + groups - 1) // groups
+        variants, positions, valid_positions, targets = [], [], [], []
+        for remainder in range(groups):
+            selected = response_positions[response_positions % groups == remainder]
+            valid_width = np.arange(width) < len(selected)
+            selected = np.pad(selected, (0, width - len(selected)))
+            selected_mx = mx.broadcast_to(mx.array(selected)[None, :], (batch, width))
+            valid = mx.take_along_axis(generated, selected_mx, axis=1) & mx.array(
+                valid_width
+            )[None, :]
+            masked = mx.put_along_axis(
+                mx.zeros(ids.shape, dtype=mx.bool_), selected_mx, valid, axis=1
+            )
+            variants.append(mx.where(masked, mask_id, ids))
+            positions.append(selected_mx)
+            valid_positions.append(valid)
+            targets.append(mx.take_along_axis(ids, selected_mx, axis=1))
+
+        conditional = mx.concatenate(variants, axis=0)
+        selected_positions = mx.concatenate(positions, axis=0)
+        valid = mx.concatenate(valid_positions, axis=0)
+        target = mx.concatenate(targets, axis=0)
+        unconditional = mx.concatenate(
+            [
+                mx.full(
+                    (conditional.shape[0], prompt_len), mask_id, dtype=conditional.dtype
+                ),
+                conditional[:, prompt_len:],
+            ],
+            axis=1,
+        )
+        both = mx.concatenate([conditional, unconditional], axis=0)
+        both_positions = mx.concatenate(
+            [selected_positions, selected_positions], axis=0
+        )
+        features = self.predict_token_features(both, 0.25)
+        logits = self._project_token_features(features, both_positions).astype(mx.float32)
+        conditional_logits, unconditional_logits = mx.split(logits, 2, axis=0)
+
+        def chosen_logp(values):
+            chosen = mx.take_along_axis(values, target[..., None], axis=-1).squeeze(-1)
+            return chosen - mx.logsumexp(values, axis=-1)
+
+        gaps = (chosen_logp(conditional_logits) - chosen_logp(unconditional_logits)) * valid
+        scores = gaps.reshape(groups, batch, width).sum(axis=(0, 2)) / mx.maximum(
+            valid.reshape(groups, batch, width).sum(axis=(0, 2)), 1
+        )
+        mx.eval(scores)
+        return np.array(scores)
+
+    def sample_masked(
+        self,
+        prompt_ids: np.ndarray,
+        mask_id: int,
+        *,
+        gen_len: int = 40,
+        steps: int = 128,
+        temperature: float = 0.7,
+        top_k: int = 20,
+        freq_pen: float = 0.7,
+        guidance: float = 2.0,
+        seed: Optional[int] = None,
+        on_step=None,
+    ) -> np.ndarray:
+        """Run the complete MaskGIT trajectory on MLX and return only final IDs.
+
+        ``on_step`` is the sole progress-snapshot escape hatch. Without it, the
+        trajectory performs no MLX -> NumPy/Torch conversion between steps.
+        """
+        prompt_ids = np.asarray(prompt_ids, dtype=np.int32)
+        if prompt_ids.ndim != 2:
+            raise ValueError("prompt_ids must have shape [batch, prompt_tokens]")
+        if steps < 1 or gen_len < 1:
+            raise ValueError("steps and gen_len must be positive")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if not 1 <= top_k <= self.vocab_size:
+            raise ValueError(f"top_k must be in [1, {self.vocab_size}]")
+        if not 0 <= mask_id < self.vocab_size:
+            raise ValueError(f"mask_id must be in [0, {self.vocab_size})")
+
+        prompt = mx.array(prompt_ids)
+        batch, prompt_len = prompt.shape
+        seq_len = prompt_len + gen_len
+        ids = mx.concatenate(
+            [prompt, mx.full((batch, gen_len), mask_id, dtype=mx.int32)], axis=1
+        )
+        still = mx.concatenate(
+            [
+                mx.zeros((batch, prompt_len), dtype=mx.bool_),
+                mx.ones((batch, gen_len), dtype=mx.bool_),
+            ],
+            axis=1,
+        )
+        positions = mx.broadcast_to(
+            mx.arange(prompt_len, seq_len, dtype=mx.int32)[None, :], (batch, gen_len)
+        )
+        batch_index = mx.arange(batch, dtype=mx.int32)[:, None]
+        response_mask = mx.arange(seq_len, dtype=mx.int32)[None, :] >= prompt_len
+        key = None if seed is None else mx.random.key(int(seed))
+        n_active = gen_len
+
+        for step in range(steps):
+            logits = self.guided_token_logits(
+                ids,
+                mask_id,
+                prompt_len,
+                max(n_active / seq_len, 0.03),
+                guidance,
+                positions,
+            )
+            committed = (~still) & response_mask
+            counts = mx.zeros((batch, self.vocab_size), dtype=logits.dtype)
+            counts = counts.at[batch_index, ids].add(committed.astype(logits.dtype))
+            logits = (
+                logits
+                - freq_pen * mx.maximum(counts - 1.0, 0.0)[:, None, :]
+            ) / temperature
+
+            top_indices = mx.argpartition(
+                logits, self.vocab_size - top_k, axis=-1
+            )[..., -top_k:]
+            top_values = mx.take_along_axis(logits, top_indices, axis=-1)
+            if key is None:
+                choice = mx.random.categorical(top_values, axis=-1)
+            else:
+                keys = mx.random.split(key)
+                key, sample_key = keys[0], keys[1]
+                choice = mx.random.categorical(top_values, axis=-1, key=sample_key)
+            sampled = mx.take_along_axis(top_indices, choice[..., None], axis=-1).squeeze(-1)
+            confidence = mx.take_along_axis(
+                mx.softmax(top_values, axis=-1), choice[..., None], axis=-1
+            ).squeeze(-1)
+            ids = mx.put_along_axis(ids, positions, sampled.astype(ids.dtype), axis=1)
+
+            n_keep = int(gen_len * math.cos(math.pi / 2 * (step + 1) / steps))
+            if n_keep > 0:
+                keep_local = mx.argpartition(confidence, n_keep - 1, axis=1)[:, :n_keep]
+                positions = mx.take_along_axis(positions, keep_local, axis=1)
+                still = mx.put_along_axis(
+                    mx.zeros_like(still),
+                    positions,
+                    mx.ones(positions.shape, dtype=mx.bool_),
+                    axis=1,
+                )
+                ids = mx.put_along_axis(
+                    ids,
+                    positions,
+                    mx.full(positions.shape, mask_id, dtype=ids.dtype),
+                    axis=1,
+                )
+            else:
+                positions = positions[:, :0]
+                still = mx.zeros_like(still)
+            n_active = n_keep
+
+            if key is None:
+                mx.eval(ids, still, positions)
+            else:
+                mx.eval(ids, still, positions, key)
+            if on_step is not None:
+                on_step(np.array(ids), np.array(still), step, steps)
+            if n_keep <= 0:
+                break
+
+        return np.array(ids)
 
     def _flow_t_idx(self, t_val: float) -> int:
         """Continuous t in (0,1] -> discrete timestep-embedding index (mirrors denoise_flow)."""

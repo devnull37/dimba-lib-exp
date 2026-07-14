@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Training script for DIMBA with CDLM (Consistency Diffusion Language Model) support.
+"""Experimental DIMBA training with a CDLM-style consistency objective.
 
-CDLM enables up to 14x faster inference by training the model to produce consistent
-predictions across different timesteps. This script extends the standard training
-with consistency loss as described in the Together AI paper.
+Consistency training may reduce sampling steps by encouraging stable predictions
+across timesteps. The cited upstream work reports up to 14x faster inference; DIMBA
+has not reproduced that result, so benchmark speed and quality before promotion.
 
 Reference: "Consistency diffusion language models: Up to 14x faster inference without
 sacrificing quality" - Together AI
@@ -174,8 +174,10 @@ def main():
         model_config=model_config,
         learning_rate=training_config.get('learning_rate', 2e-5),
         warmup_steps=training_config.get('warmup_steps', 500),
+        weight_decay=training_config.get('weight_decay', 0.01),
         ema_decay=training_config.get('ema_decay', 0.9999),
         use_ema=training_config.get('use_ema', True),
+        optimizer=training_config.get('optimizer', 'adamw'),
         use_consistency_training=training_config.get('use_consistency_training', False),
         consistency_loss_weight=training_config.get('consistency_loss_weight', 0.5),
         consistency_delta_min=training_config.get('consistency_delta_min', 50),

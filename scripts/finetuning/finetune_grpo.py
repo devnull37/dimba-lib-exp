@@ -24,10 +24,12 @@ SRC_DIR = (SCRIPT_DIR / ".." / ".." / "src").resolve()
 sys.path.insert(0, str(SRC_DIR))
 
 from dimba import DIMBA
+from dimba.diffusion.sampling import sample_from_model, sample_from_model_flow
 from dimba.models.lora import inject_lora_to_model, save_lora_weights
 from dimba.models.quantization import prepare_for_qlora, quantize_model_4bit
 from dimba.tokenizers import BPETokenizer, SimpleCharacterTokenizer
 from dimba.training.rewards import REWARD_REGISTRY, Reward, get_reward
+from dimba.utils.checkpointing import atomic_torch_save
 
 
 def set_seed(seed: int) -> None:
@@ -498,52 +500,91 @@ def score_with_reward(
     return float(reward(prompt, completion, reference))
 
 
-def top_k_top_p(logits: torch.Tensor, top_k: Optional[int], top_p: Optional[float]) -> torch.Tensor:
-    if top_k is not None and top_k > 0:
-        v = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1).values[..., -1, None]
-        logits = logits.masked_fill(logits < v, -float("inf"))
-    if top_p is not None and 0.0 < top_p < 1.0:
-        s_logits, s_idx = torch.sort(logits, descending=True, dim=-1)
-        cp = torch.softmax(s_logits, dim=-1).cumsum(dim=-1)
-        rm = cp > top_p
-        rm[..., 0] = 0
-        mask = torch.zeros_like(logits, dtype=torch.bool)
-        mask.scatter_(dim=-1, index=s_idx, src=rm)
-        logits = logits.masked_fill(mask, -float("inf"))
-    return logits
+@torch.inference_mode()
+def generate_quiet(
+    model: DIMBA,
+    prompt_ids: torch.Tensor,
+    prompt_lens: torch.Tensor,
+    max_new_tokens: int,
+    max_seq_len: int,
+    num_steps: int,
+    temperature: float,
+    top_k: Optional[int],
+    top_p: Optional[float],
+    device: torch.device,
+    pad_token_id: int,
+) -> torch.Tensor:
+    """Generate full sequences with the shared clean-prefix continuous sampler.
 
+    Prompts are grouped by their unpadded length so padding never enters conditioning,
+    while each length group is still sampled as one batch.
+    """
+    if prompt_ids.ndim != 2 or prompt_lens.ndim != 1:
+        raise ValueError("prompt_ids must be [B, P] and prompt_lens must be [B]")
 
-@torch.no_grad()
-def generate_quiet(model: DIMBA, prompt_ids: torch.Tensor, seq_len: int, num_steps: int, temperature: float, top_k: Optional[int], top_p: Optional[float], device: torch.device) -> torch.Tensor:
     model.eval()
-    prompt_ids = prompt_ids.to(device)
-    bsz = prompt_ids.shape[0]
-    cond = model.encode_prompt(prompt_ids)
-    if cond.shape[1] < seq_len:
-        pad = torch.zeros(bsz, seq_len - cond.shape[1], cond.shape[2], device=device)
-        cond = torch.cat([cond, pad], dim=1)
-    else:
-        cond = cond[:, :seq_len, :]
-    cond = model.project_conditioning(cond)
-    x = torch.randn(bsz, seq_len, model.d_latent, device=device)
-    alphas = model.get_alphas_cumprod().to(device)
-    ts = torch.linspace(model.num_diffusion_steps - 1, 0, max(1, int(num_steps)), dtype=torch.long, device=device)
-    for i, t_cont in enumerate(ts):
-        t = torch.full((bsz,), int(t_cont.item()), dtype=torch.long, device=device)
-        xp = model.denoise_step(x, t, cond)
-        if i < len(ts) - 1:
-            t_prev = ts[i + 1].long()
-            a_t, a_prev = alphas[t], alphas[t_prev]
-            sigma = torch.sqrt((1 - a_prev) / (1 - a_t) * (1 - a_t / a_prev)).view(-1, 1, 1)
-            x = (xp + sigma * torch.randn_like(x)) * torch.sqrt(a_prev / a_t).view(-1, 1, 1)
+    prompt_ids = prompt_ids.to(device, non_blocking=True)
+    lengths = [int(length) for length in prompt_lens.detach().cpu().tolist()]
+    if len(lengths) != prompt_ids.shape[0]:
+        raise ValueError("prompt_lens batch size must match prompt_ids")
+    if any(length <= 0 or length > prompt_ids.shape[1] for length in lengths):
+        raise ValueError("prompt lengths must be within the padded prompt width")
+    if max_seq_len <= 0 or max_new_tokens < 0:
+        raise ValueError("max_seq_len must be positive and max_new_tokens non-negative")
+
+    output_len = min(int(max_seq_len), max(lengths) + int(max_new_tokens))
+    generated = torch.full(
+        (prompt_ids.shape[0], output_len),
+        int(pad_token_id),
+        dtype=prompt_ids.dtype,
+        device=device,
+    )
+    steps = max(1, int(num_steps))
+
+    for prompt_len in sorted(set(lengths)):
+        row_indices = torch.tensor(
+            [i for i, length in enumerate(lengths) if length == prompt_len],
+            dtype=torch.long,
+            device=device,
+        )
+        prompts = prompt_ids.index_select(0, row_indices)[:, :prompt_len]
+        prompt_copy_len = min(prompt_len, output_len)
+        generated[row_indices, :prompt_copy_len] = prompts[:, :prompt_copy_len]
+
+        response_len = min(int(max_new_tokens), int(max_seq_len) - prompt_len)
+        if response_len <= 0:
+            continue
+
+        if getattr(model, "use_flow_matching", False):
+            response = sample_from_model_flow(
+                model,
+                prompts,
+                response_len,
+                num_steps=steps,
+                sampler="euler",
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                guidance_scale=1.0,
+                device=device,
+            )
         else:
-            x = xp
-    logits = model.output_head(model.decode_latent(x), embedding_weight=model.token_embed.get_weight()) / max(1e-6, temperature)
-    probs = torch.softmax(top_k_top_p(logits, top_k, top_p), dim=-1)
-    probs = torch.nan_to_num(probs, nan=0.0)
-    s = probs.sum(dim=-1, keepdim=True)
-    probs = torch.where(s > 1e-6, probs / s, torch.ones_like(probs) / probs.shape[-1])
-    return torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(bsz, seq_len)
+            response = sample_from_model(
+                model,
+                prompts,
+                response_len,
+                num_steps=steps,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                guidance_scale=1.0,
+                eta=0.0,
+                device=device,
+                sampler="ddim",
+            )
+        generated[row_indices, prompt_len : prompt_len + response_len] = response
+
+    return generated
 
 
 def build_eval_inputs(prompt_ids: torch.Tensor, prompt_lens: torch.Tensor, generated: torch.Tensor, num_generations: int, max_new_tokens: int, max_seq_len: int, pad: int) -> Tuple[torch.Tensor, torch.Tensor, List[List[int]]]:
@@ -570,23 +611,85 @@ def build_eval_inputs(prompt_ids: torch.Tensor, prompt_lens: torch.Tensor, gener
     return inp, mask, comps
 
 
-def model_logits(model: DIMBA, input_ids: torch.Tensor) -> torch.Tensor:
-    t = torch.zeros(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
-    x_pred, _, _ = model(input_ids, t, return_latent_info=True)
-    return model.output_head(x_pred, embedding_weight=model.token_embed.get_weight())
+def model_completion_logits(
+    model: DIMBA,
+    input_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    completion_mask: torch.Tensor,
+    timesteps: torch.Tensor,
+    noise: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Score only response positions while keeping the prompt clean and leak-free."""
+    if prompt_mask.shape != input_ids.shape or completion_mask.shape != input_ids.shape:
+        raise ValueError("prompt and completion masks must match input_ids")
+    if timesteps.shape != (input_ids.shape[0],):
+        raise ValueError("timesteps must have shape [batch]")
+
+    prompt_mask = prompt_mask.to(dtype=torch.bool)
+    completion_mask = completion_mask.to(dtype=torch.bool)
+    timesteps = timesteps.to(device=input_ids.device, dtype=torch.long)
+    was_training = model.training
+    model.eval()  # Policy/reference comparisons require dropout-free logits.
+    try:
+        x_pred, used_noise, _ = model(
+            input_ids,
+            timesteps,
+            noise=noise,
+            prompt_mask=prompt_mask,
+            return_latent_info=True,
+        )
+        if used_noise is None:
+            raise RuntimeError("DIMBA forward did not return the corruption noise")
+
+        weight = model.token_embed.get_weight()
+        features = model.output_head.prepare_features(x_pred, weight)
+        logits = model.output_head.project_features(features[completion_mask], weight)
+        return logits, used_noise
+    finally:
+        model.train(was_training)
 
 
-def grpo_loss(policy_logits: torch.Tensor, ref_logits: torch.Tensor, input_ids: torch.Tensor, mask: torch.Tensor, adv: torch.Tensor, beta: float) -> Tuple[torch.Tensor, Dict[str, float]]:
-    p_lp = torch.log_softmax(policy_logits, dim=-1)
-    r_lp = torch.log_softmax(ref_logits, dim=-1)
-    tok_lp = torch.gather(p_lp, -1, input_ids.unsqueeze(-1)).squeeze(-1)
-    den = mask.sum(dim=1).clamp_min(1.0)
-    seq_lp = (tok_lp * mask).sum(dim=1) / den
+def sample_grpo_timesteps(model: DIMBA, batch_size: int, device: torch.device) -> torch.Tensor:
+    """Sample the full diffusion range except the clean self-copy endpoint."""
+    if model.num_diffusion_steps < 2:
+        raise RuntimeError("GRPO scoring requires at least two diffusion timesteps")
+    return torch.randint(1, model.num_diffusion_steps, (batch_size,), device=device)
+
+
+def grpo_loss(
+    policy_logits: torch.Tensor,
+    ref_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    sequence_ids: torch.Tensor,
+    adv: torch.Tensor,
+    beta: float,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Exact dense GRPO objective over a packed set of completion positions."""
+    if policy_logits.shape != ref_logits.shape or policy_logits.ndim != 2:
+        raise ValueError("policy and reference logits must have shape [active_tokens, vocab]")
+    if target_ids.shape != sequence_ids.shape or target_ids.numel() != policy_logits.shape[0]:
+        raise ValueError("target_ids and sequence_ids must identify every active token")
+
+    p_lp = torch.log_softmax(policy_logits.float(), dim=-1)
+    r_lp = torch.log_softmax(ref_logits.float(), dim=-1)
+    tok_lp = torch.gather(p_lp, -1, target_ids.unsqueeze(-1)).squeeze(-1)
     kl_tok = (p_lp.exp() * (p_lp - r_lp)).sum(dim=-1)
-    seq_kl = (kl_tok * mask).sum(dim=1) / den
-    obj = adv * seq_lp - beta * seq_kl
+
+    num_sequences = adv.shape[0]
+    counts = p_lp.new_zeros(num_sequences).scatter_add(
+        0, sequence_ids, torch.ones_like(tok_lp)
+    )
+    den = counts.clamp_min(1.0)
+    seq_lp = p_lp.new_zeros(num_sequences).scatter_add(0, sequence_ids, tok_lp) / den
+    seq_kl = p_lp.new_zeros(num_sequences).scatter_add(0, sequence_ids, kl_tok) / den
+    obj = adv.to(seq_lp.dtype) * seq_lp - beta * seq_kl
     loss = -obj.mean()
-    return loss, {"loss": float(loss.item()), "logp": float(seq_lp.mean().item()), "kl": float(seq_kl.mean().item()), "adv_abs": float(adv.abs().mean().item())}
+    return loss, {
+        "loss": loss.detach(),
+        "logp": seq_lp.mean().detach(),
+        "kl": seq_kl.mean().detach(),
+        "adv_abs": adv.abs().mean().detach(),
+    }
 
 
 def save_state(
@@ -603,7 +706,17 @@ def save_state(
 ) -> Path:
     (output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     path = output_dir / "checkpoints" / name
-    torch.save({"policy_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "step": step, "epoch": epoch, "model_config": model_cfg, "args": vars(args)}, path)
+    atomic_torch_save(
+        {
+            "policy_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "step": step,
+            "epoch": epoch,
+            "model_config": model_cfg,
+            "args": vars(args),
+        },
+        path,
+    )
     if save_lora_adapter:
         adapter_path = path.with_name(f"{path.stem}_lora.pt")
         save_lora_weights(model, adapter_path)
@@ -668,8 +781,27 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    """Reject configurations that would no-op or fail after expensive setup."""
+    if args.num_generations < 2:
+        raise ValueError("--num-generations must be >= 2 for group-relative advantages")
+    if args.max_new_tokens < 1 or args.max_new_tokens >= args.max_seq_len:
+        raise ValueError("--max-new-tokens must be in [1, max-seq-len)")
+    if args.batch_size < 1 or args.epochs < 1:
+        raise ValueError("--batch-size and --epochs must be >= 1")
+    if args.sampling_steps < 1 or args.log_every < 1 or args.save_every < 1:
+        raise ValueError("--sampling-steps, --log-every, and --save-every must be >= 1")
+    if args.learning_rate <= 0 or args.temperature <= 0:
+        raise ValueError("--learning-rate and --temperature must be > 0")
+    if args.beta < 0:
+        raise ValueError("--beta must be >= 0")
+    if args.top_p is not None and not 0 < args.top_p <= 1:
+        raise ValueError("--top-p must be in (0, 1]")
+
+
 def main() -> None:
     args = parse_args()
+    validate_args(args)
     set_seed(args.seed)
     device = get_device(args.device)
     out_dir = Path(args.output_dir)
@@ -731,36 +863,69 @@ def main() -> None:
     max_prompt = max(1, int(args.max_seq_len) - int(args.max_new_tokens))
     ds = PrefDataset(rows, tok_obj, max_prompt, int(args.max_new_tokens), eos)
     print(f"[data] samples={len(ds):,}")
-    dl = DataLoader(ds, batch_size=int(args.batch_size), shuffle=bool(args.shuffle), num_workers=int(args.num_workers), collate_fn=lambda b: collate_pref(b, pad))
+    dl = DataLoader(
+        ds,
+        batch_size=int(args.batch_size),
+        shuffle=bool(args.shuffle),
+        num_workers=int(args.num_workers),
+        collate_fn=lambda b: collate_pref(b, pad),
+        pin_memory=device.type == "cuda",
+        persistent_workers=int(args.num_workers) > 0,
+    )
 
     params = [p for p in policy.parameters() if p.requires_grad]
     if not params:
         raise RuntimeError("No trainable parameters found")
-    opt = torch.optim.AdamW(params, lr=float(args.learning_rate), weight_decay=float(args.weight_decay))
+    opt = torch.optim.AdamW(
+        params,
+        lr=float(args.learning_rate),
+        weight_decay=float(args.weight_decay),
+        fused=device.type == "cuda",
+    )
 
     step = 0
     stop = False
     for epoch in range(int(args.epochs)):
-        e_loss, e_reward, e_steps = 0.0, 0.0, 0
+        e_loss = torch.zeros((), device=device)
+        e_reward, e_steps = 0.0, 0
         for batch in dl:
             if args.max_steps > 0 and step >= args.max_steps:
                 stop = True
                 break
-            prompt_ids = batch["prompt_ids"].to(device)
-            prompt_lens = batch["prompt_lens"].to(device)
+            prompt_ids_cpu = batch["prompt_ids"]
+            prompt_lens = batch["prompt_lens"]
+            prompt_ids = prompt_ids_cpu.to(device, non_blocking=True)
             chosen, rejected = batch["chosen_ids"], batch["rejected_ids"]
             bsz = prompt_ids.shape[0]
 
             with torch.no_grad():
                 reps = prompt_ids.repeat_interleave(args.num_generations, dim=0)
-                seq_len = min(int(args.max_seq_len), int(prompt_ids.shape[1]) + int(args.max_new_tokens))
-                gen = generate_quiet(policy, reps, seq_len, args.sampling_steps, args.temperature, args.top_k, args.top_p, device)
-                eval_ids, comp_mask, comps = build_eval_inputs(prompt_ids, prompt_lens, gen, args.num_generations, args.max_new_tokens, args.max_seq_len, pad)
-                prompt_lens_cpu = prompt_lens.cpu()
-                prompt_ids_cpu = prompt_ids.cpu()
+                rep_lens = prompt_lens.repeat_interleave(args.num_generations)
+                gen = generate_quiet(
+                    policy,
+                    reps,
+                    rep_lens,
+                    args.max_new_tokens,
+                    args.max_seq_len,
+                    args.sampling_steps,
+                    args.temperature,
+                    args.top_k,
+                    args.top_p,
+                    device,
+                    pad,
+                )
+                eval_ids, comp_mask, comps = build_eval_inputs(
+                    prompt_ids_cpu,
+                    prompt_lens,
+                    gen,
+                    args.num_generations,
+                    args.max_new_tokens,
+                    args.max_seq_len,
+                    pad,
+                )
                 rewards = torch.zeros(bsz, args.num_generations, dtype=torch.float32)
                 for bi in range(bsz):
-                    plen = int(prompt_lens_cpu[bi].item())
+                    plen = int(prompt_lens[bi].item())
                     prompt_tokens = prompt_ids_cpu[bi, :plen].tolist()
                     for gi in range(args.num_generations):
                         idx = bi * args.num_generations + gi
@@ -778,14 +943,44 @@ def main() -> None:
                 adv = adv.reshape(-1).to(device)
 
             eval_ids = eval_ids.to(device)
-            comp_mask = comp_mask.to(device)
+            completion_mask = comp_mask.to(device=device, dtype=torch.bool)
+            prompt_lens_device = rep_lens.to(device)
+            prompt_mask = (
+                torch.arange(eval_ids.shape[1], device=device).unsqueeze(0)
+                < prompt_lens_device.unsqueeze(1)
+            )
+            target_ids = eval_ids[completion_mask]
+            sequence_ids = completion_mask.nonzero(as_tuple=True)[0]
+            score_timesteps = sample_grpo_timesteps(
+                policy, eval_ids.shape[0], device
+            )
 
             policy.train()
             opt.zero_grad(set_to_none=True)
-            p_logits = model_logits(policy, eval_ids)
+            p_logits, shared_noise = model_completion_logits(
+                policy,
+                eval_ids,
+                prompt_mask,
+                completion_mask,
+                score_timesteps,
+            )
             with torch.no_grad():
-                r_logits = model_logits(ref, eval_ids)
-            loss, stats = grpo_loss(p_logits, r_logits, eval_ids, comp_mask, adv, args.beta)
+                r_logits, _ = model_completion_logits(
+                    ref,
+                    eval_ids,
+                    prompt_mask,
+                    completion_mask,
+                    score_timesteps,
+                    noise=shared_noise,
+                )
+            loss, stats = grpo_loss(
+                p_logits,
+                r_logits,
+                target_ids,
+                sequence_ids,
+                adv,
+                args.beta,
+            )
             loss.backward()
             if args.grad_clip and args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
@@ -794,9 +989,17 @@ def main() -> None:
             step += 1
             e_steps += 1
             e_loss += stats["loss"]
-            e_reward += float(rewards.mean().item())
+            reward_mean = rewards.mean()
+            e_reward += float(reward_mean)
             if step % int(args.log_every) == 0:
-                print(f"[train] step={step} loss={stats['loss']:.6f} reward={float(rewards.mean().item()):.4f} adv_abs={stats['adv_abs']:.4f} logp={stats['logp']:.4f} kl={stats['kl']:.6f}")
+                log_loss, log_adv, log_prob, log_kl = torch.stack(
+                    [stats["loss"], stats["adv_abs"], stats["logp"], stats["kl"]]
+                ).cpu().tolist()
+                print(
+                    f"[train] step={step} loss={log_loss:.6f} "
+                    f"reward={float(reward_mean):.4f} adv_abs={log_adv:.4f} "
+                    f"logp={log_prob:.4f} kl={log_kl:.6f}"
+                )
             if step % int(args.save_every) == 0:
                 pth = save_state(
                     out_dir,
@@ -812,7 +1015,11 @@ def main() -> None:
                 )
                 print(f"[save] {pth}")
         if e_steps:
-            print(f"[epoch] {epoch+1}/{args.epochs} avg_loss={e_loss/e_steps:.6f} avg_reward={e_reward/e_steps:.4f}")
+            avg_loss = float((e_loss / e_steps).cpu())
+            print(
+                f"[epoch] {epoch+1}/{args.epochs} avg_loss={avg_loss:.6f} "
+                f"avg_reward={e_reward/e_steps:.4f}"
+            )
         if stop:
             break
 

@@ -32,6 +32,7 @@ from dimba.training import DIMBALightningModule
 from dimba.training.trainer import GenerationSampleCallback
 from dimba.tokenizers import SimpleCharacterTokenizer
 from dimba.data import TextDataset, collate_fn
+from dimba.utils.backends import require_fast_cuda_mamba2
 
 
 def _repo_path(rel: str) -> Path:
@@ -218,13 +219,8 @@ def main():
     # GPU session discovering it the hard way.
     mixer = type(module.model.denoiser.blocks[0].mamba_fwd).__name__
     print(f"   ssm kernel : {mixer}")
-    if args.use_mamba_ssm and args.accelerator == "gpu" and mixer == "SimpleMamba2":
-        raise RuntimeError(
-            "Requested --use-mamba-ssm but the model fell back to SimpleMamba2 "
-            "(pure-PyTorch scan). Install the kernels with:\n"
-            "    pip install --no-build-isolation causal-conv1d mamba-ssm\n"
-            "and make sure the dims are kernel-compatible (try --d-state 64)."
-        )
+    if args.use_mamba_ssm and args.accelerator == "gpu":
+        require_fast_cuda_mamba2(module.model, "cuda")
 
     # Calibrate latent scale (required for latent_diffusion)
     print("   calibrating latent scale ...")

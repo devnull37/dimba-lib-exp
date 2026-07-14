@@ -132,8 +132,10 @@ def main():
         model_config=config['model'],
         learning_rate=config['training']['learning_rate'],
         warmup_steps=config['training']['warmup_steps'],
+        weight_decay=config['training'].get('weight_decay', 0.01),
         ema_decay=config['training']['ema_decay'],
         use_ema=config['training']['use_ema'],
+        optimizer=config['training'].get('optimizer', 'adamw'),
     )
     
     # Calculate model parameters

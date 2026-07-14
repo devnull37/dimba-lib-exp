@@ -1,15 +1,16 @@
 # AGENTS.md
 
-Guidance for any agentic coding model working in this repo. Reflects the **v2 overhaul**
-(branch `feature/dimba-v2-overhaul`, PR #18). For deeper detail see
-`docs/OVERHAUL_STATUS.md`, `docs/IMPROVEMENT_PLAN.md`, and `docs/RESEARCH_DIRECTIONS.md`.
+Guidance for any agentic coding model working in this repo. Reflects the merged **v2 overhaul**
+and the 2026-07-13 next-run optimization pass. For deeper detail see
+`docs/OVERHAUL_STATUS.md`, `docs/PERFORMANCE_AND_SCALING.md`,
+`docs/IMPROVEMENT_PLAN.md`, and `docs/RESEARCH_DIRECTIONS.md`.
 
 ## Project overview
 
 **DIMBA** is a non-autoregressive **latent-diffusion** language model: continuous Gaussian
 diffusion runs in a learned latent space (VAE/projector over token embeddings; raw-embedding
 diffusion is the degenerate `latent_diffusion=False` case), denoised by a **bidirectional
-Mamba** backbone, generating whole sequences in parallel by iterative denoising.
+Mamba-2** backbone, generating whole sequences in parallel by iterative denoising.
 
 - **v1 = `paper/main.pdf`** — an *architectural concept* (explicitly untested). Do not treat
   it as ground truth: it contains a prompt-conditioning leak (`C = PromptEncoder(X₀)`) and an
@@ -23,13 +24,56 @@ Mamba** backbone, generating whole sequences in parallel by iterative denoising.
   `venv\Scripts\python.exe` (Windows) / `venv/bin/python` (mac). For scripts that import
   torch, **end with `os._exit(0)`** after flushing to dodge the teardown crash.
 - **Validate without running torch**: `python -m compileall src/dimba scripts tests` (syntax).
-- **Runtime smoke**: `venv/bin/python .sisyphus/smoke_full.py` (end-to-end, uses `os._exit`).
+- **Runtime smoke**: `PYTHONPATH=src python3 -m pytest -q -o addopts='' tests/test_smoke.py`.
+  Use the project-venv interpreter instead of `python3` when that venv exists.
 - **CI** (`.github/workflows/ci.yml`) runs the real `pytest` suite on clean Linux runners
   (py3.10/3.12) with working torch — that's the source of truth for runtime tests.
-- **Apple Silicon (M1/M2/M3) training**: use the **PyTorch MPS** path (the `backends/mlx/`
-  port is a skeleton, not training-ready). Set `PYTORCH_ENABLE_MPS_FALLBACK=1`, use **fp32**,
-  and `latent_diffusion=True`. `SimpleMamba2` uses the vectorized scan on MPS; keep `seq_len`
-  ≤ ~256. See the small-model recipe in `docs/OVERHAUL_STATUS.md`.
+- **Apple Silicon (M1/M2/M3) training**: use the **PyTorch MPS** path (`backends/mlx/` is a
+  production inference path, not a training backend). Set `PYTORCH_ENABLE_MPS_FALLBACK=1`, use **fp32**,
+  and `latent_diffusion=True`. `TorchMamba2` uses the vectorized scan on MPS; keep `seq_len`
+  ≤ ~256. Run `PYTORCH_ENABLE_MPS_FALLBACK=1 python3 scripts/train_interactive.py` and select
+  `mps-small`; that preset is a tested fp32 latent recipe (L=128). MLX is inference-only.
+
+## Production launch truth
+
+- The denoiser is **Mamba-2 only**. Mamba-1 is never selected as a fallback. CPU/MPS may use
+  weight-compatible `TorchMamba2`; CUDA training requires live `mamba_ssm.Mamba2` mixers and
+  `causal-conv1d`, and fails closed if either fused backend is unavailable.
+- `scripts/train_h100.py` is the continuous-distillation path. It is phase-by-phase:
+  `--phase all` is rejected. Stage 3 supports single-node `torchrun`; alignment runs on rank 0,
+  the complete diffusion + KD loss is DDP-wrapped, and each GPU keeps a frozen teacher replica.
+  Evaluate the checkpoint, then start single-process SFT or GRPO with `--quality-gate-passed`.
+- Use `--save-dir` for every run and a different directory for each AdamW/Muon arm. AdamW is
+  the default; Muon is an opt-in pilot via `--stage3-optimizer muon`.
+- Continuous Stage 3 must use the budget28 repair contract: SNR floor 0.5, CE fade `(1-t)`,
+  50/50 uniform/logit-normal timesteps, and `(1-t)`-faded teacher KD (1.0 in 3a,
+  0.3 in 3b). Teacher KD is causal-shifted, padding-masked, logits-only, and evaluated at the
+  student's sampled continuous-noise timestep. It reuses the base student prediction and chunks
+  vocabulary projection/KL; never restore the leaked clean-target `t=0` student pass.
+  Exact resume rejects a changed phase dictionary. Do not revert to the refuted “just add more
+  tokens” diagnosis; `docs/ROOT_CAUSE_BUDGET28.md` is the authoritative post-mortem.
+- Stage-3 checkpoints contain model, optimizer, RNG, exact stage progress, pinned data source,
+  and a cumulative stream cursor shared across 3a→3b. Exact resume requires the same preset,
+  optimizer, batch/backend, topology, and data configuration. Use `--resume --checkpoint PATH`.
+  Legacy weight-only distillation checkpoints additionally require the explicitly lossy
+  `--weights-only-resume` flag.
+- SFT and GRPO do not implement exact resume. Do not pass `--resume`; start the selected phase
+  from the prior phase's weight checkpoint.
+- First-class multi-GPU training includes continuous H100 Stage 3 and the masked track. Launch
+  continuous distillation with `torchrun ... scripts/train_h100.py --phase distill`. Launch
+  either masked base or SFT with
+  `torchrun --standalone --nproc-per-node=N` followed by
+  `scripts/masked_diffusion_finetune.py` or `scripts/mdm_sft_cfg2.py`. `--batch` is per GPU;
+  global batch is `batch × N × accumulate`. Exact resume requires the same world size and
+  run signature. Give every optimizer arm its own `--output-dir`; the canonical masked base
+  defaults are otherwise shared. Rank 0 builds the shared cache once; ranks load that file,
+  memory-mapped where the installed PyTorch supports it.
+- A single-process Stage 3 may halve its batch only before the first completed step. DDP aborts
+  coherently on OOM. Because exact resume pins the saved batch, lowering per-GPU batch starts a
+  new run (or requires an explicitly lossy weight-only restart); do not call it exact resume.
+- To stop Stage 3 safely, write `{"stop": true}` to `training_state_override.json`; wait for
+  `distill_latest.pt`, verify the process exits, then stop. SFT/GRPO have no exact continuation,
+  so do not present an interrupted post-training run as resumable.
 
 ## Architecture (current data flow)
 
@@ -75,7 +119,8 @@ for embedding mode, `1.0` for latent mode → calibrate).
 1. **Continuous latent (default)** — `GaussianEmbeddingCorruption`; the `forward()` path above.
 2. **Discrete / masked (LLaDA/MDLM)** — `diffusion/corruption.py:AbsorbingMaskCorruption` +
    `diffusion/masked_sampling.py:masked_diffusion_sample(predict_logits, ...)`; model side is
-   `predict_token_logits`. Needs a `[MASK]` token id (not in the tokenizer yet — pass explicitly).
+   `predict_token_logits`. Canonical training launchers append a real `[MASK]` row and record its
+   id in the checkpoint; library callers must still pass the id explicitly.
 3. **Hybrid (novel, experimental)** — `HybridCorruption` interpolates masked ↔ Gaussian per token.
 
 ## Training (`src/dimba/training/trainer.py`)
@@ -111,7 +156,14 @@ Schedule helpers: `CosineNoiseSchedule(num_steps, zero_terminal_snr=True)` with 
 - `selective_scan(dt, A, Bmat, C, x, *, stable=True, chunk_size=64)` — vectorized, numerically
   stable (chunked); `selective_scan_sequential` is the parity reference; `bidirectional_*` too.
   `SimpleMamba2` uses it and falls back to the sequential scan if the result is non-finite.
-- `maybe_compile(module)` — `torch.compile` on CUDA only. `backends/mlx/` — MLX skeleton (WIP).
+- `maybe_compile(module)` — `torch.compile` on CUDA only. `backends/mlx/` — full Apple-GPU
+  inference for continuous and masked sampling; PyTorch remains the source of truth for training.
+- The only added CUDA specialization is optional Liger fused linear CE for exact uniform
+  reductions. Masked/weighted objectives keep the native selected-token path. Do not add a
+  bespoke Mamba/causal-convolution kernel on top of the official fused stack without passing the
+  complete H100 parity, p50/p95, HBM, and quality promotion gate in `scripts/benchmark_h100.py`.
+- MLX/PyTorch token equality is benchmark-specific: the recorded deterministic parity cases match
+  argmax tokens, but other samplers, temperatures, and precision paths must be rechecked.
 
 ## Repo layout
 
@@ -125,12 +177,14 @@ configs/  tests/  notebooks/  docs/  paper/
 
 - Python ≥3.9, **black line-length 100**, type hints, Google-style docstrings.
 - Don't reintroduce the conditioning leak, the 2-tuple `forward`, positive-`A` SSM, or
-  un-scaled latents. Run `compileall` + the smoke before claiming a change works.
+  un-scaled latents. Run `compileall`, the full pytest suite, and the maintained smoke before
+  claiming a change works. CUDA performance claims additionally require the full H100 benchmark.
 
-## Current status (2026-05-27)
+## Current status (2026-07-13)
 
-- **PR #18** open into `main`: `c2352ba` (overhaul) + `60f30eb` (latent scale-factor). **Not
-  merged.** All known bugs fixed; `compileall` clean; runtime smoke 14/14 (venv python).
-- **Open follow-ups**: first-class masked-mode training script + `[MASK]` token; an M1
-  quickstart config; train a real VAE to calibrate the latent against; cross-attention
-  conditioning (stronger than pooled-global); real speed/quality benchmarks once compute lands.
+- Continuous H100 training is production-gated around fused Mamba-2, exact Stage-3 resume,
+  atomic checkpoints, and explicit phase quality gates.
+- Masked base/SFT training has first-class single-node DDP, shared caches, exact same-topology
+  resume, AdamW default, and an opt-in Muon pilot.
+- Remaining research work includes a trained VAE calibration, stronger conditioning, and
+  hardware speed/quality benchmarks; do not bypass the documented gates to obtain them.

@@ -229,6 +229,9 @@ def stage3_kd_loss(
     teacher_logits: Tensor,
     *,
     kd_temp: float = 2.0,
+    loss_mask: Optional[Tensor] = None,
+    sample_weight: Optional[Tensor] = None,
+    chunk_size: int = 16,
 ) -> Tensor:
     """KL-divergence knowledge distillation loss (soft labels).
 
@@ -241,7 +244,7 @@ def stage3_kd_loss(
                 \\log\\mathrm{softmax}\\!\\left(\\frac{z_s}{T}\\right)
             \\right)
 
-    averaged over batch and sequence positions.
+    averaged over the selected batch and sequence positions.
 
     The ``T^2`` scaling re-weights gradients to be independent of temperature,
     following Hinton et al. (2015).
@@ -254,6 +257,12 @@ def stage3_kd_loss(
         teacher_logits: Raw (un-normalized) teacher logits, shape ``[B, L, Vt]``.
             Must satisfy ``Vs == Vt``.
         kd_temp: Distillation temperature ``T > 0`` (default 2.0).
+        loss_mask: Optional ``[B, L]`` mask; zero-valued padding positions are
+            excluded from both the loss and its denominator.
+        sample_weight: Optional ``[B]`` multiplicative weight. This can fade
+            teacher targets near pure noise without renormalizing the fade.
+        chunk_size: Batch rows processed per fp32 KL chunk. This changes peak
+            memory only; the objective and reduction remain exact.
 
     Returns:
         A scalar tensor with the mean KL loss scaled by ``T^2``.
@@ -261,27 +270,59 @@ def stage3_kd_loss(
     Raises:
         ValueError: If the vocabulary sizes of student and teacher differ.
     """
-    if student_logits.shape[-1] != teacher_logits.shape[-1]:
+    if student_logits.shape != teacher_logits.shape:
+        if student_logits.shape[-1] != teacher_logits.shape[-1]:
+            raise ValueError(
+                f"Vocabulary size mismatch: student has {student_logits.shape[-1]} "
+                f"but teacher has {teacher_logits.shape[-1]}. "
+                "Both must share the same vocabulary for stage-3 KD."
+            )
         raise ValueError(
-            f"Vocabulary size mismatch: student has {student_logits.shape[-1]} "
-            f"but teacher has {teacher_logits.shape[-1]}. "
-            "Both must share the same vocabulary for stage-3 KD."
+            f"Student and teacher logits must have the same shape; got "
+            f"{tuple(student_logits.shape)} and {tuple(teacher_logits.shape)}"
         )
+    if student_logits.ndim != 3:
+        raise ValueError("Student and teacher logits must have shape [B, L, V]")
 
     T = float(kd_temp)
-    # Scale logits by temperature.
-    s_scaled = student_logits.float() / T  # [B, L, V]
-    t_scaled = teacher_logits.float() / T  # [B, L, V]
+    if T <= 0.0:
+        raise ValueError("kd_temp must be > 0")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    batch, length, _ = student_logits.shape
+    if loss_mask is not None and loss_mask.shape != (batch, length):
+        raise ValueError(
+            f"loss_mask must have shape {(batch, length)}, got {tuple(loss_mask.shape)}"
+        )
+    if sample_weight is not None and sample_weight.shape != (batch,):
+        raise ValueError(
+            f"sample_weight must have shape {(batch,)}, got {tuple(sample_weight.shape)}"
+        )
+    if batch == 0:
+        return student_logits.sum() * 0.0
 
-    # Teacher provides the soft target distribution (detach so no gradient flows back).
-    soft_targets = F.softmax(t_scaled, dim=-1).detach()  # [B, L, V]
-    log_student = F.log_softmax(s_scaled, dim=-1)  # [B, L, V]
+    # Keep only one slice of the large fp32 softmax/log-softmax intermediates live.
+    # Full bf16 logits are unavoidable, but at B=64,L=512,V=49152 this removes
+    # several multi-gigabyte fp32 allocations without approximating the KL.
+    total = torch.zeros((), device=student_logits.device, dtype=torch.float32)
+    for start in range(0, batch, chunk_size):
+        stop = min(batch, start + chunk_size)
+        soft_targets = F.softmax(teacher_logits[start:stop].float() / T, dim=-1).detach()
+        log_student = F.log_softmax(student_logits[start:stop].float() / T, dim=-1)
+        per_token = F.kl_div(log_student, soft_targets, reduction="none").sum(dim=-1)
+        if loss_mask is None:
+            per_sample = (
+                per_token.mean(dim=1) if length else per_token.sum(dim=1)
+            )
+        else:
+            mask = loss_mask[start:stop].to(
+                device=per_token.device, dtype=per_token.dtype
+            )
+            per_sample = (per_token * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        if sample_weight is not None:
+            per_sample = per_sample * sample_weight[start:stop].to(
+                device=per_sample.device, dtype=per_sample.dtype
+            )
+        total = total + per_sample.sum()
 
-    # KL(teacher || student) = sum_v teacher_v * (log teacher_v - log student_v)
-    # F.kl_div expects (log_input, target) where it computes sum(target*(log target - log input)).
-    # reduction='batchmean' divides by B; we need mean over B*L, so use 'sum' + manual divide.
-    B, L, _V = student_logits.shape
-    denom = max(1, B * L)  # avoid 0/0 -> nan on an empty/degenerate batch
-    kl = F.kl_div(log_student, soft_targets, reduction="sum") / denom
-
-    return kl * (T * T)
+    return total / max(1, batch) * (T * T)

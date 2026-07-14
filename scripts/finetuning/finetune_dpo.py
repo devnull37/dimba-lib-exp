@@ -56,13 +56,18 @@ if str(SRC_DIR) not in sys.path:
 
 # Reuse the SFT script's robust checkpoint/tokenizer/LoRA utilities to avoid
 # duplicating the inference logic and to stay consistent with the SFT path.
-import finetune_sft as sft  # noqa: E402  (path set above)
+if __package__:  # Package import in tests; direct-script import in production.
+    from . import finetune_sft as sft  # type: ignore[attr-defined]  # noqa: E402
+else:
+    import finetune_sft as sft  # noqa: E402
 
 from dimba.models.diffusion import DIMBA  # noqa: E402
+from dimba.utils.checkpointing import atomic_torch_save  # noqa: E402
 from dimba.training.preference import (  # noqa: E402
     dpo_loss,
     elbo_sequence_logprob,
     ipo_loss,
+    sample_elbo_trajectories,
     simpo_loss,
 )
 
@@ -274,19 +279,31 @@ class PreferenceTripletDataset(Dataset):
         )
         return {
             "chosen_input_ids": chosen_t["input_ids"],
+            "chosen_prompt_mask": (
+                chosen_t["attention_mask"].bool() & ~chosen_t["response_mask"].bool()
+            ),
             "chosen_response_mask": chosen_t["response_mask"],
             "chosen_labels": chosen_t["labels"],
             "rejected_input_ids": rejected_t["input_ids"],
+            "rejected_prompt_mask": (
+                rejected_t["attention_mask"].bool() & ~rejected_t["response_mask"].bool()
+            ),
             "rejected_response_mask": rejected_t["response_mask"],
             "rejected_labels": rejected_t["labels"],
         }
 
 
 def collate_triplets(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """Stack triplet tensors along the batch dimension."""
+    """Stack triplets and discard batch-wide trailing padding."""
     out: Dict[str, torch.Tensor] = {}
     for key in batch[0].keys():
         out[key] = torch.stack([item[key] for item in batch], dim=0)
+    for side in ("chosen", "rejected"):
+        active = out[f"{side}_prompt_mask"] | out[f"{side}_response_mask"].bool()
+        max_length = max(1, int(active.sum(dim=-1).max()))
+        for key in tuple(out):
+            if key.startswith(f"{side}_"):
+                out[key] = out[key][:, :max_length]
     return out
 
 
@@ -294,9 +311,12 @@ def policy_logprob(
     model: DIMBA,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
+    prompt_mask: torch.Tensor,
     response_mask: torch.Tensor,
     num_mc_samples: int,
     antithetic: bool,
+    timesteps: Optional[torch.Tensor] = None,
+    noises: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """ELBO-surrogate summed response log-prob under ``model``.
 
@@ -307,23 +327,34 @@ def policy_logprob(
         model: Policy or reference DIMBA model.
         input_ids: Full sequence ids ``[batch, seq]``.
         labels: Realized response token ids ``[batch, seq]``.
+        prompt_mask: Clean prompt mask ``[batch, seq]``; excludes response/padding.
         response_mask: Response mask ``[batch, seq]``.
         num_mc_samples: Timestep MC samples for the ELBO estimate.
         antithetic: Use antithetic timestep pairing (VRPO).
+        timesteps: Optional shared draws ``[mc_samples, batch]``.
+        noises: Optional shared corruption noise ``[mc_samples, batch, seq, latent]``.
 
     Returns:
         Per-sequence ELBO log-prob ``[batch]``.
     """
     safe_labels = labels.clone()
     safe_labels[response_mask == 0] = 0  # Indices ignored by the mask anyway.
-    return elbo_sequence_logprob(
-        model,
-        input_ids=input_ids,
-        labels=safe_labels,
-        mask=response_mask,
-        num_mc_samples=num_mc_samples,
-        antithetic=antithetic,
-    )
+    was_training = model.training
+    model.eval()  # Shared draws are only comparable with dropout disabled.
+    try:
+        return elbo_sequence_logprob(
+            model,
+            input_ids=input_ids,
+            labels=safe_labels,
+            mask=response_mask,
+            timesteps=timesteps,
+            num_mc_samples=num_mc_samples,
+            antithetic=antithetic,
+            prompt_mask=prompt_mask,
+            noises=noises,
+        )
+    finally:
+        model.train(was_training)
 
 
 def compute_dpo_batch_loss(
@@ -331,7 +362,7 @@ def compute_dpo_batch_loss(
     reference: Optional[DIMBA],
     batch: Dict[str, torch.Tensor],
     args: argparse.Namespace,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute the selected preference loss for one batch of triplets.
 
     Args:
@@ -344,14 +375,73 @@ def compute_dpo_batch_loss(
         Tuple ``(loss, metrics)`` where ``metrics`` holds scalar logging values.
     """
     c_ids = batch["chosen_input_ids"]
+    c_prompt_mask = batch["chosen_prompt_mask"]
     c_mask = batch["chosen_response_mask"]
     c_labels = batch["chosen_labels"]
     r_ids = batch["rejected_input_ids"]
+    r_prompt_mask = batch["rejected_prompt_mask"]
     r_mask = batch["rejected_response_mask"]
     r_labels = batch["rejected_labels"]
+    if args.loss_type != "simpo" and reference is None:
+        raise RuntimeError("Reference model required for dpo/ipo loss.")
 
-    pi_chosen = policy_logprob(policy, c_ids, c_labels, c_mask, args.mc_samples, args.antithetic)
-    pi_rejected = policy_logprob(policy, r_ids, r_labels, r_mask, args.mc_samples, args.antithetic)
+    chosen_timesteps, chosen_noises = sample_elbo_trajectories(
+        policy, c_ids, args.mc_samples, args.antithetic
+    )
+    pi_chosen = policy_logprob(
+        policy,
+        c_ids,
+        c_labels,
+        c_prompt_mask,
+        c_mask,
+        args.mc_samples,
+        args.antithetic,
+        chosen_timesteps,
+        chosen_noises,
+    )
+    if reference is not None:
+        with torch.no_grad():
+            ref_chosen = policy_logprob(
+                reference,
+                c_ids,
+                c_labels,
+                c_prompt_mask,
+                c_mask,
+                args.mc_samples,
+                args.antithetic,
+                chosen_timesteps,
+                chosen_noises,
+            )
+    del chosen_noises
+
+    rejected_timesteps, rejected_noises = sample_elbo_trajectories(
+        policy, r_ids, args.mc_samples, args.antithetic
+    )
+    pi_rejected = policy_logprob(
+        policy,
+        r_ids,
+        r_labels,
+        r_prompt_mask,
+        r_mask,
+        args.mc_samples,
+        args.antithetic,
+        rejected_timesteps,
+        rejected_noises,
+    )
+    if reference is not None:
+        with torch.no_grad():
+            ref_rejected = policy_logprob(
+                reference,
+                r_ids,
+                r_labels,
+                r_prompt_mask,
+                r_mask,
+                args.mc_samples,
+                args.antithetic,
+                rejected_timesteps,
+                rejected_noises,
+            )
+    del rejected_noises
 
     if args.loss_type == "simpo":
         chosen_len = c_mask.sum(dim=-1)
@@ -360,15 +450,7 @@ def compute_dpo_batch_loss(
             pi_chosen, pi_rejected, chosen_len, rejected_len, beta=args.beta, gamma=args.gamma
         )
     else:
-        if reference is None:
-            raise RuntimeError("Reference model required for dpo/ipo loss.")
-        with torch.no_grad():
-            ref_chosen = policy_logprob(
-                reference, c_ids, c_labels, c_mask, args.mc_samples, args.antithetic
-            )
-            ref_rejected = policy_logprob(
-                reference, r_ids, r_labels, r_mask, args.mc_samples, args.antithetic
-            )
+        assert reference is not None
         if args.loss_type == "ipo":
             loss, chosen_reward, rejected_reward = ipo_loss(
                 pi_chosen, pi_rejected, ref_chosen, ref_rejected, beta=args.beta
@@ -386,11 +468,11 @@ def compute_dpo_batch_loss(
     accuracy = (chosen_reward > rejected_reward).float().mean()
     margin = (chosen_reward - rejected_reward).mean()
     metrics = {
-        "loss": float(loss.item()),
-        "reward_acc": float(accuracy.item()),
-        "reward_margin": float(margin.item()),
-        "pi_chosen_lp": float(pi_chosen.mean().item()),
-        "pi_rejected_lp": float(pi_rejected.mean().item()),
+        "loss": loss.detach(),
+        "reward_acc": accuracy.detach(),
+        "reward_margin": margin.detach(),
+        "pi_chosen_lp": pi_chosen.detach().mean(),
+        "pi_rejected_lp": pi_rejected.detach().mean(),
     }
     return loss, metrics
 
@@ -486,13 +568,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    """Reject configurations that would no-op or fail after expensive setup."""
+    if args.mc_samples < 1:
+        raise ValueError("--mc-samples must be >= 1")
+    if args.antithetic and args.mc_samples % 2:
+        raise ValueError("--antithetic requires an even --mc-samples")
+    if args.batch_size < 1 or args.grad_accumulation_steps < 1 or args.num_epochs < 1:
+        raise ValueError("batch size, accumulation steps, and epochs must be >= 1")
+    if args.max_seq_length < 2 or args.log_every < 1:
+        raise ValueError("--max-seq-length must be >= 2 and --log-every must be >= 1")
+    if args.learning_rate <= 0 or args.beta <= 0:
+        raise ValueError("--learning-rate and --beta must be > 0")
+    if not 0 <= args.label_smoothing < 0.5:
+        raise ValueError("--label-smoothing must be in [0, 0.5)")
+
+
 def main() -> None:
     """Main DPO entrypoint."""
     args = parse_args()
+    validate_args(args)
     if args.use_qlora:
         args.use_lora = True
-    if args.antithetic and args.mc_samples % 2 != 0:
-        raise ValueError("--antithetic requires an even --mc-samples.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -559,6 +656,7 @@ def main() -> None:
         [p for p in policy.parameters() if p.requires_grad],
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
+        fused=device.type == "cuda",
     )
 
     optimizer.zero_grad(set_to_none=True)
@@ -574,7 +672,13 @@ def main() -> None:
 
             with nullcontext():
                 loss, metrics = compute_dpo_batch_loss(policy, reference, batch, args)
-                loss = loss / args.grad_accumulation_steps
+                group_start = (
+                    batch_idx // args.grad_accumulation_steps
+                ) * args.grad_accumulation_steps
+                group_size = min(
+                    args.grad_accumulation_steps, len(dataloader) - group_start
+                )
+                loss = loss / group_size
             loss.backward()
 
             is_update_step = ((batch_idx + 1) % args.grad_accumulation_steps == 0) or (
@@ -588,18 +692,21 @@ def main() -> None:
                 global_step += 1
 
                 if global_step % max(1, args.log_every) == 0:
+                    metric_values = torch.stack(tuple(metrics.values())).float().cpu().tolist()
+                    logged = dict(zip(metrics, metric_values))
                     print(
-                        f"step={global_step} loss={metrics['loss']:.6f} "
-                        f"reward_acc={metrics['reward_acc']:.3f} "
-                        f"margin={metrics['reward_margin']:.4f} "
-                        f"pi_c={metrics['pi_chosen_lp']:.2f} pi_r={metrics['pi_rejected_lp']:.2f}"
+                        f"step={global_step} loss={logged['loss']:.6f} "
+                        f"reward_acc={logged['reward_acc']:.3f} "
+                        f"margin={logged['reward_margin']:.4f} "
+                        f"pi_c={logged['pi_chosen_lp']:.2f} "
+                        f"pi_r={logged['pi_rejected_lp']:.2f}"
                     )
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     stop_training = True
                     break
 
     final_ckpt_path = output_dir / "dpo_model.pt"
-    torch.save(
+    atomic_torch_save(
         {
             "state_dict": policy.state_dict(),
             "global_step": global_step,
@@ -627,7 +734,7 @@ def main() -> None:
         lora_state = sft.extract_lora_state_dict(policy)
         adapter_dir = output_dir / "lora_adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
-        torch.save({"state_dict": lora_state}, adapter_dir / "adapter_model.pt")
+        atomic_torch_save({"state_dict": lora_state}, adapter_dir / "adapter_model.pt")
         print(f"Saved LoRA adapter weights: {adapter_dir / 'adapter_model.pt'}")
 
     tokenizer_path = sft.save_tokenizer(tokenizer, output_dir)

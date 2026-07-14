@@ -1,6 +1,8 @@
 # DIMBA Research Directions
 
-> Status: **research agenda — everything below is experimental and unvalidated.**
+> Status: **research agenda.** Some prerequisites and low-risk pieces (masked diffusion,
+> self-conditioning, CFG, reranking, and batched CFG dispatch) are now implemented; the proposed
+> research payoffs below remain experimental until trained-checkpoint quality gates pass.
 > Author: SA-5 (innovation), 2026-05-27. Audience: DimbaLabs research.
 > Companion to `docs/IMPROVEMENT_PLAN.md` (which fixes known correctness issues).
 > This document proposes *new* DIMBA-specific research, not bug fixes.
@@ -23,10 +25,10 @@ with a **bidirectional Mamba** backbone. Concretely (see `src/dimba/models/diffu
   projects to vocab logits. Sampling lives in `src/dimba/diffusion/sampling.py`
   (`sample_from_model`, `DDIMSampler`).
 
-A second forward process — **discrete absorbing-`[MASK]`** diffusion — is being built in
+A second forward process — **discrete absorbing-`[MASK]`** diffusion — is implemented in
 `src/dimba/diffusion/corruption.py` (`GaussianEmbeddingCorruption`, `AbsorbingMaskCorruption`,
-`HybridCorruption`) with a model-agnostic iterative decoder in
-`src/dimba/diffusion/masked_sampling.py`. Several directions below sit at the
+`HybridCorruption`), `src/dimba/training/masked.py`, the canonical masked launchers, and a
+model-agnostic iterative decoder in `src/dimba/diffusion/masked_sampling.py`. Several directions below sit at the
 **latent-continuous ↔ discrete-masked** boundary, which is exactly where DIMBA is
 architecturally distinctive (a *latent* diffusion text model with an *SSM* denoiser —
 not a Transformer, not pixel/embedding-space).
@@ -174,8 +176,9 @@ unchanged on a subset of positions (the ones already "resolved"), recomputing th
 the scan is wasted work. This is a **uniquely-SSM** acceleration that a Transformer DIMBA could not do.
 
 **(c) Implementation sketch.**
-- The pure-PyTorch fallback `SimpleMamba2` (`src/dimba/models/simple_mamba.py`) is a sequential scan
-  — the natural place to prototype, since it explicitly materializes a state. Add an optional
+- The sequential parity reference behind the pure-PyTorch fallback is the natural place to
+  prototype because it explicitly materializes state; production `SimpleMamba2` uses the
+  vectorized scan. Add an optional
   `(state_in, conv_buffer_in) -> (y, state_out, conv_buffer_out)` interface and a per-step cache
   keyed by block index, owned by the sampler (do **not** edit the model's forward signature; wrap it).
 - In `DDIMSampler.sample` (`src/dimba/diffusion/sampling.py`), maintain a `cache` dict and a
@@ -201,7 +204,8 @@ earlier backward states — caching may only be valid for the forward scan or fo
 regions. (2) Error accumulates across reused steps → needs a refresh schedule; quality/NFE is a
 Pareto curve, not free. (3) The real CUDA Mamba kernels don't expose intermediate per-token states
 cheaply; the win may be CPU/MPS-specific or require a custom kernel. (4) Interaction with
-self-conditioning (Direction-2 of the IMPROVEMENT_PLAN) and CFG (which doubles NFE).
+self-conditioning and CFG (which doubles logical model rows even though the current sampler batches
+both rows into one dispatch).
 
 **(f) References.** DeepCache (Ma et al., 2023, arXiv:2312.00858); ∆-DiT / feature caching for DiT
 (arXiv:2406.01125); Faster Diffusion / cache-me-if-you-can (arXiv:2312.09608); Mamba inference-state
@@ -211,8 +215,10 @@ stepping (Gu & Dao, 2023, arXiv:2312.00752); applies to `SimpleMamba2` and `Mamb
 
 ## Direction 4 — Guidance distillation: "free" classifier-free guidance in one pass
 
-**(a) Idea.** Classifier-free guidance (CFG) doubles inference cost: every step runs the denoiser
-**twice** (conditional + unconditional) and combines `pred_cond + w·(pred_cond − pred_uncond)`.
+**(a) Idea.** Classifier-free guidance (CFG) roughly doubles denoiser compute: every step evaluates
+conditional and unconditional rows and combines `pred_cond + w·(pred_cond − pred_uncond)`. The
+current sampler already concatenates those rows into one device dispatch, which removes launch
+overhead but retains 2B-row FLOPs.
 **Distill** that two-pass, fixed-`w` behavior into a **single forward pass** of a student DIMBA that
 takes `w` as an extra conditioning input — so guided sampling costs 1 NFE instead of 2.
 
@@ -241,8 +247,9 @@ in `w`. (ii) Build `GuidanceEmbedding`, confirm it produces a `[B, cond_dim]` ve
 `combined_cond`, changes the denoiser output monotonically with `w` (a controllability sanity check). Both
 are `python -c` smoke checks on random weights.
 
-**(e) Risks/unknowns.** (1) Distillation quality depends on a **good teacher** → gated on CFG training
-landing first. (2) Range of `w` to distill is a hyperparameter; too wide hurts fidelity. (3) Text CFG is
+**(e) Risks/unknowns.** (1) Distillation quality depends on a **good CFG teacher**. Two-row CFG is
+implemented, but the proposed one-pass guidance embedding/distillation is not. (2) Range of `w`
+to distill is a hyperparameter; too wide hurts fidelity. (3) Text CFG is
 less studied than image CFG; the cond/uncond gap in *latent* space may behave differently than in pixel
 space. (4) Adding `w`-conditioning slightly grows the model and could interact with self-conditioning.
 
@@ -447,9 +454,10 @@ length handling; pairs with `rerank.best_of_k` and `sampling.sample_from_model` 
   (shapes, finiteness, invariants, monotonicity) and a separate *payoff* claim that is honestly gated on a
   trained checkpoint. Do the mechanism checks now; do not claim quality wins without the Phase-0 benchmark
   harness (`docs/IMPROVEMENT_PLAN.md`).
-- **Priority (highest ROI / lowest risk first).** (2) reranking — *done, free, parallel* → (6)
-  self-conditioning half of the recipe — *near-free, highest single quality ROI* → (3)/(7) SSM-state reuse —
-  *DIMBA-unique speed* → (4) guidance distillation — *2× speed, gated on CFG* → (1)/(5) hybrid & VQ latent —
+- **Priority (highest ROI / lowest risk first).** (2) reranking and (6) self-conditioning machinery
+  are implemented → measure their trained-checkpoint payoff → (3)/(7) SSM-state reuse —
+  *DIMBA-unique speed but correctness-sensitive* → (4) guidance distillation — *up to 2× logical
+  CFG compute reduction, gated on a good teacher* → (1)/(5) hybrid & VQ latent —
   *higher-risk research bets* → (8) length head — *small, practical, do alongside any track*.
 
 ## Consolidated references

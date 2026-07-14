@@ -622,7 +622,40 @@ class DIMBA(nn.Module):
             t = (t.clamp(0.0, 1.0) * (self.num_diffusion_steps - 1)).round()
         return t.long()
 
-    def predict_token_logits(self, input_ids: torch.Tensor, t) -> torch.Tensor:
+    def predict_token_features(self, input_ids: torch.Tensor, t) -> torch.Tensor:
+        """Return post-head, pre-vocabulary features for masked inference.
+
+        Keeping the final linear projection separate lets classifier-free guidance
+        combine conditional/unconditional features exactly, then pay for one selected-
+        position vocabulary projection instead of two full-sequence projections.
+        """
+        batch_size = input_ids.shape[0]
+        z = self.encode_latent(self.token_embed(input_ids))
+        cond = self._build_conditioning(None, batch_size, input_ids.device)
+        t_idx = self._to_timestep_index(t, batch_size, input_ids.device)
+        raw = self._denoiser_raw(z, t_idx, cond, None)
+        z0_hat = self._to_x0_latent(z, raw, t_idx)
+        x_dec = self.decode_latent(z0_hat)
+        return self.output_head.prepare_features(x_dec, self.token_embed.get_weight())
+
+    def project_token_features(
+        self,
+        features: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Project prepared token features to vocabulary logits."""
+        return self.output_head.project_features(
+            features,
+            embedding_weight=self.token_embed.get_weight(),
+            positions=positions,
+        )
+
+    def predict_token_logits(
+        self,
+        input_ids: torch.Tensor,
+        t,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Per-position token logits for the discrete / masked-diffusion track.
 
         Unlike :meth:`forward` (which adds Gaussian noise to latents), the masked
@@ -636,18 +669,16 @@ class DIMBA(nn.Module):
             input_ids: Possibly-masked token ids ``[B, L]``.
             t: Timestep(s): an int/long index in ``[0, T)`` or a float in ``(0, 1]``
                 (masked-diffusion continuous time); scalar or ``[B]``.
+            positions: Optional indices ``[B, K]`` selecting positions that need
+                vocabulary logits. The bidirectional denoiser still sees the full
+                sequence; only the final vocabulary projection is reduced.
 
         Returns:
-            Token logits ``[B, L, vocab_size]``.
+            Token logits ``[B, L, vocab_size]`` or ``[B, K, vocab_size]`` when
+            ``positions`` is provided.
         """
-        batch_size = input_ids.shape[0]
-        z = self.encode_latent(self.token_embed(input_ids))
-        cond = self._build_conditioning(None, batch_size, input_ids.device)
-        t_idx = self._to_timestep_index(t, batch_size, input_ids.device)
-        raw = self._denoiser_raw(z, t_idx, cond, None)
-        z0_hat = self._to_x0_latent(z, raw, t_idx)  # convert v->x0 when prediction_type='v'
-        x_dec = self.decode_latent(z0_hat)
-        return self.output_head(x_dec, embedding_weight=self.token_embed.get_weight())
+        features = self.predict_token_features(input_ids, t)
+        return self.project_token_features(features, positions)
 
     def align_forward(
         self,

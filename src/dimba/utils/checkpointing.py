@@ -4,11 +4,70 @@ Provides milestone-based checkpointing that saves models as they grow
 through parameter count targets (e.g., 1B, 5B, 10B, 30B params).
 """
 
-import os
 import json
-import torch
-from typing import List, Optional, Dict, Any
+import os
+import random
 from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Union
+
+import torch
+
+
+def _mps_available() -> bool:
+    return bool(
+        hasattr(torch, "mps")
+        and hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    )
+
+
+def atomic_torch_save(obj: Any, filepath: Union[str, os.PathLike[str]]) -> None:
+    """Write a torch checkpoint atomically on the destination filesystem."""
+    path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(obj, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def capture_rng_state() -> Dict[str, Any]:
+    """Capture RNG state needed to continue a PyTorch training step exactly."""
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    if _mps_available():
+        state["torch_mps"] = torch.mps.get_rng_state()
+    return state
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore :func:`capture_rng_state`, failing on unavailable saved backends."""
+    if "python" not in state or "torch_cpu" not in state:
+        raise ValueError("checkpoint RNG state is incomplete")
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("checkpoint contains CUDA RNG state but CUDA is unavailable")
+        if len(cuda_state) != torch.cuda.device_count():
+            raise RuntimeError(
+                "checkpoint CUDA RNG state count does not match the current device count"
+            )
+    mps_state = state.get("torch_mps")
+    if mps_state is not None and not _mps_available():
+        raise RuntimeError("checkpoint contains MPS RNG state but MPS is unavailable")
+
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch_cpu"])
+    if cuda_state is not None:
+        torch.cuda.set_rng_state_all(cuda_state)
+    if mps_state is not None:
+        torch.mps.set_rng_state(mps_state)
 
 
 class ProgressiveCheckpointManager:
@@ -157,8 +216,9 @@ class ProgressiveCheckpointManager:
         checkpoint["metadata"]["milestone_str"] = milestone_str
         checkpoint["metadata"]["param_count_formatted"] = self.format_param_count(current_params)
 
-        # Save checkpoint
-        torch.save(checkpoint, filepath)
+        # Replace the complete file in one operation so an interrupted save never
+        # corrupts the last good checkpoint.
+        atomic_torch_save(checkpoint, filepath)
 
         # Save metadata JSON for easy inspection
         meta_path = self.save_dir / f"checkpoint_{milestone_str}_step_{global_step}.json"
@@ -172,8 +232,13 @@ class ProgressiveCheckpointManager:
             "param_count_formatted": self.format_param_count(current_params),
             "milestone_str": milestone_str,
         }
-        with open(meta_path, "w") as f:
-            json.dump(json_meta, f, indent=2)
+        meta_tmp = meta_path.with_name(f".{meta_path.name}.{os.getpid()}.tmp")
+        try:
+            with open(meta_tmp, "w") as f:
+                json.dump(json_meta, f, indent=2)
+            os.replace(meta_tmp, meta_path)
+        finally:
+            meta_tmp.unlink(missing_ok=True)
 
         return str(filepath)
 
@@ -193,13 +258,15 @@ class ProgressiveCheckpointManager:
         Returns:
             Checkpoint metadata dict
         """
-        checkpoint = torch.load(filepath, map_location="cpu")
+        checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
 
         # Load model state
         model.load_state_dict(checkpoint["model_state_dict"])
 
         # Load optimizer state if provided
-        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        if optimizer is not None:
+            if "optimizer_state_dict" not in checkpoint:
+                raise ValueError("checkpoint has no optimizer state")
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         # Restore milestone tracking

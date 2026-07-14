@@ -1,251 +1,129 @@
-#!/usr/bin/env python3
-"""Training scripts for DIMBA.
+# DIMBA scripts
 
-This directory contains standalone scripts for training, evaluating, and
-using DIMBA models.
+Run commands from the repository root with `PYTHONPATH=src`. See
+`docs/PERFORMANCE_AND_SCALING.md` for the production backend and benchmark policy.
 
-## Structure
+## Canonical training launchers
 
-### Interactive Training
-- `train_interactive.py` - **RECOMMENDED** Interactive wizard with auto GPU detection, 
-  config presets, memory estimation, resume support, and HuggingFace auto-upload
+### Continuous Stage 3 on one H100
 
-### Main Training Scripts
-- `train.py` - Generic training script with config file support
-- `train_vae.py` - Pre-train the TokenVAE for latent diffusion
-- `train_fineweb_1b.py` - Train 1.5B model on FineWeb (L40S 48GB profile)
-- `train_fineweb_500m_a4000.py` - Train 500M model on FineWeb (A4000 16GB profile)
-
-### Inference & Evaluation
-- `generate.py` - Generate text from a trained checkpoint
-- `evaluate.py` - Evaluate model perplexity and inference speed
-- `upload_to_hf.py` - Upload checkpoints to HuggingFace Hub
-
-### Utilities (`utils/`)
-- `calculate_memory.py` - Calculate memory usage for different configs
-- `test_config.py` - Test dependencies, GPU, and dataset access
-- `test_dataset_loading.py` - Test FineWeb dataset loading
-
-## Quick Start
-
-### Interactive training (easiest)
-```bash
-python scripts/train_interactive.py
-```
-
-This launches a wizard that:
-- **Asks what to train**: VAE, DIMBA (embedding), DIMBA (latent), or BOTH
-- Auto-detects your GPU(s)
-- Suggests optimal presets based on VRAM
-- Estimates memory usage before training
-- Lets you customize everything interactively
-
-### Training Modes Explained
-
-**EMBEDDING-SPACE DIFFUSION** (no VAE needed)
-```
-Tokens → Embeddings → [Diffusion] → Embeddings → Tokens
-```
-- Simpler, no pre-training required
-- Direct control over embeddings
-- Good for getting started
-
-**LATENT-SPACE DIFFUSION** (requires VAE)
-```
-Tokens → Embeddings → VAE Encode → Latents → [Diffusion] → Latents → VAE Decode → Embeddings → Tokens
-```
-- Compressed representation (faster training/inference)
-- Smoother latent space
-- Requires pre-trained VAE
-
-### Train VAE only
-```bash
-python scripts/train_interactive.py --train-mode vae
-```
-Pre-train a TokenVAE for later use with latent-space diffusion.
-
-### Train DIMBA (embedding-space)
-```bash
-python scripts/train_interactive.py --train-mode dimba-embedding
-```
-Train the diffusion model directly in embedding space. No VAE needed.
-
-### Train DIMBA (latent-space)
-```bash
-# Requires a pre-trained VAE checkpoint
-python scripts/train_interactive.py --train-mode dimba-latent --vae-checkpoint checkpoints/vae/final.ckpt
-```
-Train the diffusion model in VAE latent space for potentially better efficiency.
-
-### Train BOTH (VAE + DIMBA)
-```bash
-python scripts/train_interactive.py --train-mode both
-```
-Train VAE first, then automatically train DIMBA using that VAE. Complete pipeline in one command.
-
-### Do I need a VAE?
-
-**No** - You can train and use DIMBA without a VAE using embedding-space diffusion. This is the simpler option and works well.
-
-**Yes** - If you want:
-- Faster training/inference through compression
-- Smoother latent space representations
-- To experiment with latent diffusion techniques
-
-The VAE is trained on the **same dataset** as the diffusion model (or you can use a different one). The key is that the VAE learns to compress the token embeddings, and the diffusion model then learns to generate in that compressed space.
-
-### Auto-upload to HuggingFace
-
-After training completes, you can automatically upload to HuggingFace:
+Validate the resolved recipe without CUDA:
 
 ```bash
-# Interactive mode - will prompt for upload
-python scripts/train_interactive.py
-
-# Auto-upload with repo specified
-python scripts/train_interactive.py --preset a4000-500m --hf-repo-id username/dimba-500m
-
-# Auto-upload with token (or set HF_TOKEN env var)
-python scripts/train_interactive.py --preset a4000-500m \
-    --hf-repo-id username/dimba-500m \
-    --hf-token $HF_TOKEN \
-    --hf-private  # for private repo
+PYTHONPATH=src python3 scripts/train_h100.py \
+  --preset repair1b \
+  --phase distill \
+  --stage3-optimizer adamw \
+  --save-dir checkpoints/repair1b \
+  --dry-run
 ```
 
-### Resume training
+Remove `--dry-run` on the H100. This launcher requires the fused
+`mamba_ssm.Mamba2` plus `causal-conv1d` stack and rejects `--phase all`. Continuous Stage 3
+supports single-node `torchrun`; alignment runs once on rank 0 and exact resume requires the same
+world size. SFT/GRPO remain single-process. AdamW is the default; Muon is an opt-in
+pilot with `--stage3-optimizer muon`. Run each phase separately and pass
+`--quality-gate-passed` before SFT or GRPO. Use a distinct `--save-dir` for
+every AdamW/Muon arm.
 
-If training is interrupted, you can easily resume:
+Stage-3 exact resume requires the same preset, optimizer, batch/backend,
+topology, and data configuration:
 
 ```bash
-# Resume from latest checkpoint (interactive)
-python scripts/train_interactive.py --resume
-
-# Resume from specific checkpoint directory
-python scripts/train_interactive.py --resume-from ./checkpoints/interactive
-
-# Resume with new config (keep weights, change hyperparameters)
-python scripts/train_interactive.py --resume --new-config
-
-# Non-interactive resume
-python scripts/train_interactive.py --resume --yes
+PYTHONPATH=src python3 scripts/train_h100.py \
+  --preset repair1b \
+  --phase distill \
+  --save-dir checkpoints/repair1b \
+  --resume \
+  --checkpoint checkpoints/repair1b/distill_latest.pt
 ```
 
-When resuming:
-- The saved `train_config.yaml` is automatically loaded
-- Tokenizer is loaded from the checkpoint folder
-- Training continues from the last step
-- All checkpoints are saved to the same folder
-
-### Train from config
-```bash
-python scripts/train.py --config config.yaml --max-epochs 10
-```
-
-### Train VAE for latent diffusion
-```bash
-python scripts/train_vae.py --dataset wikitext --latent-dim 256 --epochs 10
-```
-
-### Generate text
-```bash
-python scripts/generate.py \
-    --checkpoint checkpoints/dimba.ckpt \
-    --config config.yaml \
-    --prompt "The future of AI is" \
-    --length 100 \
-    --num-steps 50
-```
-
-### Evaluate model
-```bash
-python scripts/evaluate.py \
-    --checkpoint checkpoints/dimba.ckpt \
-    --vocab-size 32000 \
-    --eval-speed
-```
-
-## Common Arguments
-
-Most scripts support these common arguments:
-- `--config` - Path to YAML config file
-- `--checkpoint` - Path to model checkpoint
-- `--device` - Device to use (cuda/cpu)
-- `--vocab-size` - Vocabulary size
-- `--batch-size` - Batch size for training/inference
-
-See individual script help for full options:
-```bash
-python scripts/<script>.py --help
-```
-
-## Presets (train_interactive.py)
-
-Available configuration presets:
-
-| Preset | GPU | Params | VRAM |
-|--------|-----|--------|------|
-| `cpu-small` | CPU | <100M | N/A |
-| `a4000-500m` | RTX A4000 16GB | ~500M | ~12GB |
-| `l40s-1b` | L40S 48GB | ~1.5B | ~35GB |
-| `a100-3b` | A100 80GB | ~3B | ~65GB |
-
-Use a preset directly:
-```bash
-python scripts/train_interactive.py --preset a4000-500m
-```
-
-## Interactive Training Output
-
-Interactive mode saves everything to `checkpoints/interactive/`:
-- `train_config.yaml` - The configuration used
-- `tokenizer.json` - Tokenizer state
-- `dimba-*.ckpt` - Model checkpoints
-- `last.ckpt` - Most recent checkpoint (for resuming)
-
-This folder is automatically gitignored to avoid committing large files.
-
-To use a different checkpoint directory:
-```bash
-# The script will ask, or specify in your config
-```
-
-## HuggingFace Integration
-
-### Auto-upload after training
-
-The interactive script can automatically upload to HuggingFace Hub:
+### Masked base training with DDP
 
 ```bash
-# Specify repo for auto-upload
-python scripts/train_interactive.py --preset a4000-500m --hf-repo-id username/dimba-500m
-
-# With private repo
-python scripts/train_interactive.py --preset a4000-500m \
-    --hf-repo-id username/dimba-500m \
-    --hf-private
-
-# Non-interactive with auto-upload
-python scripts/train_interactive.py --preset l40s-1b \
-    --yes \
-    --hf-repo-id username/dimba-1b \
-    --hf-token $HF_TOKEN
+PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
+  scripts/masked_diffusion_finetune.py \
+  --steps 40000 \
+  --batch 8 \
+  --accumulate 2 \
+  --optimizer adamw \
+  --output-dir checkpoints/masked-base-adamw
 ```
 
-**Upload includes:**
-- All checkpoints (`*.ckpt`)
-- `train_config.yaml` - training configuration
-- `tokenizer.json` - tokenizer state
+### Masked SFT with DDP
 
-**Requirements:**
 ```bash
-pip install huggingface_hub
+PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
+  scripts/mdm_sft_cfg2.py \
+  --steps 15000 \
+  --batch 8 \
+  --accumulate 2 \
+  --optimizer adamw \
+  --output-dir checkpoints/masked-sft-adamw
 ```
 
-**Environment variable:**
+For both masked launchers, `--batch` is the microbatch per GPU and global batch
+is `batch × world size × accumulate`. `--resume PATH` is exact only with the
+same world size and run signature. Give every AdamW/Muon arm a distinct
+`--output-dir`.
+
+### Apple Silicon development training
+
 ```bash
-export HF_TOKEN=your_token_here
-# Then you can skip --hf-token
-python scripts/train_interactive.py --hf-repo-id username/model
+PYTORCH_ENABLE_MPS_FALLBACK=1 PYTHONPATH=src \
+  python3 scripts/train_interactive.py
 ```
 
-"""
+Select `mps-small`. It is the tested fp32 PyTorch-MPS latent recipe. MLX is an
+inference backend, not a training backend.
+
+## H100 performance gate
+
+Run the complete parity and promotion suite on a real H100:
+
+```bash
+PYTHONPATH=src python3 scripts/benchmark_h100.py \
+  --checkpoint checkpoints/model.pt \
+  --output artifacts/h100-benchmark.json \
+  --fail-on-gate
+```
+
+The default suite runs masked inference, continuous DDIM, continuous DPM++,
+continuous fused CE, and masked training. A subset is diagnostic only and is
+not promotion evidence. `--dry-run` validates the benchmark plan on a non-CUDA
+machine.
+
+## Inference and evaluation
+
+```bash
+PYTHONPATH=src python3 scripts/generate.py \
+  "What is the capital of France?" \
+  --checkpoint checkpoints/model.pt \
+  --quality 0.5 \
+  --backend auto
+
+PYTHONPATH=src python3 scripts/evaluate.py --help
+```
+
+`generate.py` loads the architecture embedded in the checkpoint with a strict
+state-dict check. `--backend auto` selects MLX on supported Apple Silicon and
+Torch otherwise.
+
+## Other maintained entry points
+
+- `train.py` — generic YAML-driven training.
+- `train_vae.py` — TokenVAE experiments.
+- `train_interactive.py` — local preset wizard.
+- `finetuning/finetune_sft.py` — direct SFT.
+- `finetuning/finetune_dpo.py` — DPO, IPO, and SimPO.
+- `finetuning/finetune_grpo.py` — reward-driven GRPO.
+- `upload_to_hf.py` — Hugging Face upload utility.
+
+Inspect an entry point before launching it:
+
+```bash
+PYTHONPATH=src python3 scripts/<script>.py --help
+```
+
+Older experiment-specific scripts remain for reproducibility; they are not the
+canonical next-run launchers.

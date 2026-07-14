@@ -16,10 +16,10 @@ conditioning with zeros, and printed progress from inside the library; all fixed
 """
 
 import logging
-import math
+from typing import Callable, Optional
+
 import torch
 import torch.nn.functional as F
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +29,36 @@ def _coef(value: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     return value.view(*([1] * like.dim())).to(like.device, like.dtype)
 
 
+def _batched_cfg_denoise(
+    denoise_fn: Callable[..., torch.Tensor],
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    cond: torch.Tensor,
+    cfg_cond: Optional[torch.Tensor],
+    x_self_cond: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Run conditional and unconditional predictions in one model dispatch."""
+    if cfg_cond is None:
+        return denoise_fn(x_t, t, cond, x_self_cond), None
+
+    batch_size = x_t.shape[0]
+    x_in = torch.cat((x_t, x_t), dim=0)
+    t_in = torch.cat((t, t), dim=0)
+    self_cond_in = (
+        torch.cat((x_self_cond, x_self_cond), dim=0) if x_self_cond is not None else None
+    )
+    predictions = denoise_fn(x_in, t_in, cfg_cond, self_cond_in)
+    return predictions[:batch_size], predictions[batch_size:]
+
+
 def _dpmpp_step(
     x_t: torch.Tensor,
     x0_hat: torch.Tensor,
     acp_t: torch.Tensor,
     acp_prev: torch.Tensor,
     prev_x0: Optional[torch.Tensor],
-    prev_h: Optional[float],
+    prev_h: Optional[torch.Tensor],
+    is_final: bool = False,
 ) -> tuple:
     """One x0-parameterized DPM-Solver++(2M) reverse step ``x_t -> x_{prev}``.
 
@@ -54,8 +77,8 @@ def _dpmpp_step(
         (stored as ``prev_x0`` for the next call), and the current h (stored as
         ``prev_h`` for the next call).
     """
-    # Final step guard: acp_prev ~ 1 -> sigma_prev ~ 0 -> x_prev ~ x0_hat.
-    if float(acp_prev) >= 1.0 - 1e-6:
+    # The caller knows the final loop iteration without reading a CUDA scalar back.
+    if is_final:
         return x0_hat, x0_hat, None
 
     alpha_t = acp_t.sqrt()
@@ -66,7 +89,7 @@ def _dpmpp_step(
     # log-SNR: lambda = log(alpha) - log(sigma)
     lam_t = torch.log(alpha_t) - torch.log(sigma_t)
     lam_prev = torch.log(alpha_prev) - torch.log(sigma_prev)
-    h = float(lam_prev - lam_t)  # > 0 because acp_prev > acp_t
+    h = lam_prev - lam_t  # > 0 because acp_prev > acp_t
 
     # DPM-Solver++(2M): multistep if we have a prior estimate, else 1st-order.
     if prev_x0 is None or prev_h is None:
@@ -77,10 +100,8 @@ def _dpmpp_step(
         # Second-order correction blending current and previous x0 estimates.
         D = (1.0 + 1.0 / (2.0 * r)) * x0_hat - (1.0 / (2.0 * r)) * prev_x0
 
-    exp_neg_h = math.exp(-h)
-
     coef_xt = _coef(sigma_prev / sigma_t, x_t)
-    coef_D = _coef(alpha_prev * torch.tensor(1.0 - exp_neg_h, dtype=acp_t.dtype, device=acp_t.device), x_t)
+    coef_D = _coef(alpha_prev * -torch.expm1(-h), x_t)
     # DPM-Solver++(2M) data-prediction: x_prev = (sigma_prev/sigma_t) x_t
     #   - alpha_prev (e^-h - 1) D  ==  (sigma_prev/sigma_t) x_t + alpha_prev (1 - e^-h) D.
     # The x0 term is ADDED (the first-order case must reduce to DDIM(eta=0)).
@@ -95,6 +116,7 @@ def _ddim_step(
     acp_t: torch.Tensor,
     acp_prev: torch.Tensor,
     eta: float,
+    is_final: bool = False,
 ) -> torch.Tensor:
     """One x0-parameterized DDIM reverse step ``x_t -> x_{prev}``.
 
@@ -105,13 +127,16 @@ def _ddim_step(
         acp_prev: alpha_cumprod at the next (cleaner) timestep (scalar tensor).
         eta: DDIM stochasticity (0 = deterministic).
     """
-    # Final step (acp_t ~ 1): x_t is already ~clean and eps is undefined
-    # (sqrt(1-acp)->0). Returning x0_hat avoids a (x_t-x0)/~0 division that can
-    # overflow to Inf in fp16 and then poison the result via 0*Inf = NaN.
-    if float(acp_t) >= 1.0 - 1e-6:
+    # The caller knows the final loop iteration without reading a CUDA scalar back.
+    if is_final:
         return x0_hat
+
+    # Keep direct calls safe when acp_t is already clean without synchronizing it
+    # to Python. The safe denominator prevents an unselected fp16 Inf branch.
+    is_clean = acp_t >= 1.0 - 1e-6
     sqrt_acp_t = _coef(acp_t.sqrt(), x_t)
-    sqrt_om_t = _coef((1.0 - acp_t).clamp(min=1e-8).sqrt(), x_t)
+    one_minus_t = (1.0 - acp_t).clamp(min=1e-8)
+    sqrt_om_t = _coef(torch.where(is_clean, torch.ones_like(one_minus_t), one_minus_t).sqrt(), x_t)
     eps_hat = (x_t - sqrt_acp_t * x0_hat) / sqrt_om_t
 
     ratio = ((1.0 - acp_prev) / (1.0 - acp_t).clamp(min=1e-8)) * (
@@ -125,7 +150,7 @@ def _ddim_step(
     x_prev = _coef(acp_prev.sqrt(), x_t) * x0_hat + dir_coef * eps_hat
     if eta > 0:
         x_prev = x_prev + sigma * torch.randn_like(x_t)
-    return x_prev
+    return torch.where(is_clean, x0_hat, x_prev)
 
 
 def _make_timesteps(total_steps: int, num_steps: int, device: torch.device) -> torch.Tensor:
@@ -135,7 +160,7 @@ def _make_timesteps(total_steps: int, num_steps: int, device: torch.device) -> t
     return ts
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def sample_from_model(
     model: torch.nn.Module,
     prompt_ids: Optional[torch.Tensor],
@@ -164,7 +189,8 @@ def sample_from_model(
         temperature, top_k, top_p: token-sampling controls.
         guidance_scale: Classifier-free guidance weight (1.0 disables CFG).
         eta: DDIM stochasticity (0 = deterministic DDIM).
-        clamp_to_tokens: Legacy flag — hard-snap every step (== clamp_mode="hard", clamp_from=1.0).
+        clamp_to_tokens: Legacy flag — hard-snap every step
+            (equivalent to clamp_mode="hard", clamp_from=1.0).
         clamp_mode: "none" | "hard" (nearest token, Diffusion-LM) | "soft" (expected
             token embedding under the head's softmax, DiffuSeq-v2 — less committal).
         clamp_from: apply clamping only in the final fraction of steps (0=never, 1=all);
@@ -188,7 +214,12 @@ def sample_from_model(
     model.eval()
 
     d_latent = model.d_latent
-    use_cfg = abs(guidance_scale - 1.0) > 1e-6 and prompt_ids is not None
+    uncond_only = abs(guidance_scale) <= 1e-6 and prompt_ids is not None
+    use_cfg = (
+        not uncond_only
+        and abs(guidance_scale - 1.0) > 1e-6
+        and prompt_ids is not None
+    )
 
     # Prompt prefix (kept clean), conditioning, and the response noise.
     if prompt_ids is not None:
@@ -202,11 +233,12 @@ def sample_from_model(
         prompt_len = 0
 
     cond = model.conditioning_from_prompt(prompt_ids, batch_size, device)
-    uncond = (
-        model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
-        if use_cfg
-        else None
-    )
+    uncond = None
+    if uncond_only:
+        cond = model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
+    elif use_cfg:
+        uncond = model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
+    cfg_cond = torch.cat((cond, uncond), dim=0) if uncond is not None else None
 
     response = torch.randn(batch_size, seq_len, d_latent, device=device)
     if prompt_latent is not None:
@@ -216,24 +248,28 @@ def sample_from_model(
 
     alphas_cumprod = model.get_alphas_cumprod().to(device)
     timesteps = _make_timesteps(model.num_diffusion_steps, num_steps, device)
+    acp = alphas_cumprod.index_select(0, timesteps)
+    acp_prev = torch.cat((acp[1:], alphas_cumprod.new_ones(1)))
+    t_batches = timesteps[:, None].expand(-1, batch_size)
 
     x_self_cond = None
-    n_steps = len(timesteps)
+    n_steps = timesteps.shape[0]
     if clamp_to_tokens and clamp_mode == "none":  # backward-compat: hard-clamp every step
         clamp_mode, clamp_from = "hard", 1.0
 
     # DPM-Solver++(2M) carry state.
     dpmpp_prev_x0: Optional[torch.Tensor] = None
-    dpmpp_prev_h: Optional[float] = None
+    dpmpp_prev_h: Optional[torch.Tensor] = None
 
     for i in range(n_steps):
-        t_val = timesteps[i]
-        t = torch.full((batch_size,), int(t_val.item()), dtype=torch.long, device=device)
-        acp_t = alphas_cumprod[t_val]
+        t = t_batches[i]
+        acp_t = acp[i]
 
-        x0_hat = model.denoise_to_x0_latent(x_t, t, cond, x_self_cond)
+        x0_hat, x0_uncond = _batched_cfg_denoise(
+            model.denoise_to_x0_latent, x_t, t, cond, cfg_cond, x_self_cond
+        )
         if use_cfg:
-            x0_uncond = model.denoise_to_x0_latent(x_t, t, uncond, x_self_cond)
+            assert x0_uncond is not None
             if cfg_mode == "eps":
                 # Guide in noise space: convert both x0 estimates to eps, blend, convert
                 # back. Keeps the effective guidance scale more uniform across timesteps.
@@ -255,14 +291,20 @@ def sample_from_model(
             else:
                 x0_hat = _clamp_latent_to_tokens(model, x0_hat)
 
-        acp_prev = alphas_cumprod[timesteps[i + 1]] if i < n_steps - 1 else torch.ones((), device=device)
-
         if sampler == "dpmpp":
             x_prev, dpmpp_prev_x0, dpmpp_prev_h = _dpmpp_step(
-                x_t, x0_hat, acp_t, acp_prev, dpmpp_prev_x0, dpmpp_prev_h
+                x_t,
+                x0_hat,
+                acp_t,
+                acp_prev[i],
+                dpmpp_prev_x0,
+                dpmpp_prev_h,
+                is_final=i == n_steps - 1,
             )
         else:
-            x_prev = _ddim_step(x_t, x0_hat, acp_t, acp_prev, eta)
+            x_prev = _ddim_step(
+                x_t, x0_hat, acp_t, acp_prev[i], eta, is_final=i == n_steps - 1
+            )
 
         # Hold the prompt prefix clean.
         if prompt_latent is not None:
@@ -270,7 +312,8 @@ def sample_from_model(
         x_t = x_prev
 
         if verbose and (i % max(1, n_steps // 10) == 0):
-            logger.info("denoising step %d/%d (t=%d)", i + 1, n_steps, int(t_val.item()))
+            t_log = round((model.num_diffusion_steps - 1) * (1.0 - i / max(n_steps - 1, 1)))
+            logger.info("denoising step %d/%d (t=%d)", i + 1, n_steps, t_log)
 
     # Decode the response region to logits and sample.
     response_latent = x_t[:, prompt_len:, :]
@@ -283,7 +326,9 @@ def sample_from_model(
     probs = F.softmax(logits, dim=-1)
     probs = torch.nan_to_num(probs, nan=0.0)
     prob_sum = probs.sum(dim=-1, keepdim=True)
-    probs = torch.where(prob_sum > 1e-6, probs / prob_sum, torch.ones_like(probs) / probs.shape[-1])
+    probs = torch.where(
+        prob_sum > 1e-6, probs / prob_sum.clamp_min(1e-6), 1.0 / probs.shape[-1]
+    )
     generated = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1)
     return generated.view(batch_size, seq_len)
 
@@ -352,7 +397,7 @@ def sample_timesteps(batch_size: int, num_steps: int, device: torch.device) -> t
 
 # ── Flow Matching ODE sampler ─────────────────────────────────────────────────
 
-@torch.no_grad()
+@torch.inference_mode()
 def sample_from_model_flow(
     model: torch.nn.Module,
     prompt_ids: Optional[torch.Tensor],
@@ -393,7 +438,12 @@ def sample_from_model_flow(
     model.eval()
 
     d_latent = model.d_latent
-    use_cfg = abs(guidance_scale - 1.0) > 1e-6 and prompt_ids is not None
+    uncond_only = abs(guidance_scale) <= 1e-6 and prompt_ids is not None
+    use_cfg = (
+        not uncond_only
+        and abs(guidance_scale - 1.0) > 1e-6
+        and prompt_ids is not None
+    )
 
     if prompt_ids is not None:
         prompt_ids = prompt_ids.to(device)
@@ -406,10 +456,12 @@ def sample_from_model_flow(
         prompt_len = 0
 
     cond = model.conditioning_from_prompt(prompt_ids, batch_size, device)
-    uncond = (
-        model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
-        if use_cfg else None
-    )
+    uncond = None
+    if uncond_only:
+        cond = model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
+    elif use_cfg:
+        uncond = model.conditioning_from_prompt(None, batch_size, device, drop_cond=True)
+    cfg_cond = torch.cat((cond, uncond), dim=0) if uncond is not None else None
 
     # Start from pure noise at t=1
     response = torch.randn(batch_size, seq_len, d_latent, device=device)
@@ -417,26 +469,28 @@ def sample_from_model_flow(
 
     # Uniform time grid from t=1 → t=0
     ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+    t_batches = ts[:, None].expand(-1, batch_size)
 
-    def _velocity(xt, t_val, x_self_cond=None):
-        t_batch = torch.full((batch_size,), t_val, device=device)
+    def _velocity(xt, t_batch, t_val, x_self_cond=None):
         # model's denoise_to_x0_latent returns x0 prediction; velocity = (xt - x0) / t
-        x0_hat = model.denoise_flow(xt, t_batch, cond, x_self_cond)
+        x0_hat, x0_uncond = _batched_cfg_denoise(
+            model.denoise_flow, xt, t_batch, cond, cfg_cond, x_self_cond
+        )
         if use_cfg:
-            x0_uncond = model.denoise_flow(xt, t_batch, uncond, x_self_cond)
+            assert x0_uncond is not None
             x0_hat = x0_uncond + guidance_scale * (x0_hat - x0_uncond)
         # v = (x_t - x0) / t  (rearranged from x_t = (1-t)*x0 + t*noise)
-        v = (xt - x0_hat) / max(t_val, 1e-5)
+        v = (xt - x0_hat) / t_val.clamp_min(1e-5)
         return v, x0_hat
 
     x_self_cond = None
 
     for i in range(num_steps):
-        t_cur = float(ts[i])
-        t_nxt = float(ts[i + 1])
+        t_cur = ts[i]
+        t_nxt = ts[i + 1]
         dt = t_nxt - t_cur  # negative (integrating backward)
 
-        v_cur, x0_hat = _velocity(x_t, t_cur, x_self_cond)
+        v_cur, x0_hat = _velocity(x_t, t_batches[i], t_cur, x_self_cond)
         x_self_cond = x0_hat
 
         if sampler == "heun" and i < num_steps - 1:
@@ -444,7 +498,7 @@ def sample_from_model_flow(
             x_mid = x_t + v_cur * dt
             if prompt_latent is not None:
                 x_mid[:, :prompt_len, :] = prompt_latent
-            v_nxt, _ = _velocity(x_mid, t_nxt, x_self_cond)
+            v_nxt, _ = _velocity(x_mid, t_batches[i + 1], t_nxt, x_self_cond)
             # Corrector: average the two velocities
             x_t = x_t + 0.5 * (v_cur + v_nxt) * dt
         else:
@@ -455,7 +509,15 @@ def sample_from_model_flow(
             x_t[:, :prompt_len, :] = prompt_latent
 
         if verbose and i % max(1, num_steps // 5) == 0:
-            logger.info("flow step %d/%d (t=%.3f→%.3f)", i + 1, num_steps, t_cur, t_nxt)
+            t_cur_log = 1.0 - i / num_steps
+            t_nxt_log = 1.0 - (i + 1) / num_steps
+            logger.info(
+                "flow step %d/%d (t=%.3f→%.3f)",
+                i + 1,
+                num_steps,
+                t_cur_log,
+                t_nxt_log,
+            )
 
     # Decode response region
     response_latent = x_t[:, prompt_len:, :]
@@ -468,8 +530,9 @@ def sample_from_model_flow(
     probs = F.softmax(logits, dim=-1)
     probs = torch.nan_to_num(probs, nan=0.0)
     prob_sum = probs.sum(dim=-1, keepdim=True)
-    probs = torch.where(prob_sum > 1e-6, probs / prob_sum,
-                        torch.ones_like(probs) / probs.shape[-1])
+    probs = torch.where(
+        prob_sum > 1e-6, probs / prob_sum.clamp_min(1e-6), 1.0 / probs.shape[-1]
+    )
     generated = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1)
     return generated.view(batch_size, seq_len)
 
@@ -483,6 +546,7 @@ class DDIMSampler:
         self.ddim_eta = ddim_eta
         self.device = next(model.parameters()).device
 
+    @torch.inference_mode()
     def sample(
         self,
         prompt_ids: Optional[torch.Tensor],

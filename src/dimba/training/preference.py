@@ -45,15 +45,18 @@ is ``beta * (log pi(y|x) - log pi_ref(y|x))``.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from dimba.training.fused_ce import output_head_cross_entropy
 
 __all__ = [
     "sequence_logprob",
     "elbo_sequence_logprob",
     "antithetic_timesteps",
+    "sample_elbo_trajectories",
     "dpo_loss",
     "ipo_loss",
     "simpo_loss",
@@ -166,6 +169,53 @@ def antithetic_timesteps(
     return t, t_antithetic
 
 
+def sample_elbo_trajectories(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    num_mc_samples: int,
+    antithetic: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Draw shared non-clean trajectories for reference-anchored scoring.
+
+    Returns timesteps ``[mc, batch]`` sampled uniformly from ``[1, T)`` and
+    corruption noise ``[mc, batch, seq, latent]``. Antithetic pairs sum to ``T``
+    so both members remain outside the clean ``t=0`` self-copy endpoint.
+    """
+    if num_mc_samples < 1:
+        raise ValueError("num_mc_samples must be >= 1")
+    if antithetic and num_mc_samples % 2:
+        raise ValueError("antithetic sampling requires an even number of draws")
+    num_steps = int(model.num_diffusion_steps)
+    if num_steps < 2:
+        raise ValueError("ELBO scoring requires at least two diffusion timesteps")
+
+    batch_size = input_ids.shape[0]
+    if antithetic:
+        base = torch.randint(
+            1,
+            num_steps,
+            (num_mc_samples // 2, batch_size),
+            device=input_ids.device,
+        )
+        timesteps = torch.stack((base, num_steps - base), dim=1).flatten(0, 1)
+    else:
+        timesteps = torch.randint(
+            1,
+            num_steps,
+            (num_mc_samples, batch_size),
+            device=input_ids.device,
+        )
+    noises = torch.randn(
+        num_mc_samples,
+        batch_size,
+        input_ids.shape[1],
+        model.d_latent,
+        device=input_ids.device,
+        dtype=model.token_embed.get_weight().dtype,
+    )
+    return timesteps, noises
+
+
 def elbo_sequence_logprob(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -175,8 +225,12 @@ def elbo_sequence_logprob(
     timesteps: Optional[torch.Tensor] = None,
     num_mc_samples: int = 1,
     antithetic: bool = False,
-    logits_fn: Optional[Callable[[torch.nn.Module, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+    logits_fn: Optional[
+        Callable[[torch.nn.Module, torch.Tensor, torch.Tensor], torch.Tensor]
+    ] = None,
     generator: Optional[torch.Generator] = None,
+    prompt_mask: Optional[torch.Tensor] = None,
+    noises: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Diffusion-aware ELBO surrogate for the per-sequence response log-prob.
 
@@ -203,24 +257,33 @@ def elbo_sequence_logprob(
         is the masked-diffusion analogue of that construction.
 
     Args:
-        model: A DIMBA-like module. The default ``logits_fn`` expects
+        model: A DIMBA-like module. The default scoring path expects
             ``model.forward(input_ids, t, return_latent_info=True) ->
             (x_pred, ...)`` plus ``model.output_head`` and
-            ``model.token_embed.get_weight()`` (matching the existing GRPO path),
-            and ``model.num_diffusion_steps``.
+            ``model.token_embed.get_weight()``, and ``model.num_diffusion_steps``.
         input_ids: Full sequence token ids ``[batch, seq_len]`` (prompt + response).
         labels: Realized response token ids ``[batch, seq_len]`` to score.
         mask: Response mask ``[batch, seq_len]``; 1 on positions to score.
-        timesteps: Optional explicit timesteps ``[batch]``. When ``None`` they are
-            sampled uniformly (optionally antithetically) per MC sample.
-        num_mc_samples: Number of timestep samples to average the ELBO over.
+        timesteps: Optional explicit timesteps ``[batch]`` or
+            ``[mc_samples, batch]``. When ``None`` they are sampled uniformly
+            (optionally antithetically) per MC sample.
+        num_mc_samples: Number of timestep samples to draw when ``timesteps`` is
+            omitted. Explicit stacked timesteps define their own MC count.
         antithetic: If ``True`` and ``num_mc_samples`` is even, draw timesteps in
             antithetic pairs via :func:`antithetic_timesteps` for variance
             reduction. Ignored when ``timesteps`` is provided.
         logits_fn: Optional override ``(model, input_ids, t) -> logits`` so callers
             can plug in a custom diffusion-conditioned forward without depending
-            on DIMBA internals (useful for tests with tiny stub modules).
+            on DIMBA internals (useful for tests with tiny stub modules). Custom
+            functions are responsible for applying ``prompt_mask`` themselves.
         generator: Optional RNG for reproducible timestep sampling.
+        prompt_mask: Optional bool ``[batch, seq_len]`` selecting the clean prompt.
+            The default DIMBA path keeps these tokens unnoised, conditions only on
+            them, and projects vocabulary logits only at positions selected by
+            ``mask``.
+        noises: Optional explicit corruption noise ``[batch, seq_len, d_latent]``
+            or ``[mc_samples, batch, seq_len, d_latent]``. Supplying it with
+            ``timesteps`` lets policy and reference score the same trajectories.
 
     Returns:
         ELBO-surrogate summed log-prob per sequence, shape ``[batch]`` (nats).
@@ -233,13 +296,21 @@ def elbo_sequence_logprob(
     batch_size = input_ids.shape[0]
     device = input_ids.device
 
-    if logits_fn is None:
-        logits_fn = _default_diffusion_logits_fn
+    if prompt_mask is not None and prompt_mask.shape != input_ids.shape:
+        raise ValueError("prompt_mask must match input_ids")
 
     num_steps = int(getattr(model, "num_diffusion_steps", 1000))
 
     if timesteps is not None:
-        timestep_draws = [timesteps.to(device=device, dtype=torch.long)]
+        explicit_timesteps = timesteps.to(device=device, dtype=torch.long)
+        if explicit_timesteps.ndim == 1:
+            if explicit_timesteps.shape != (batch_size,):
+                raise ValueError("timesteps must have shape [batch] or [mc_samples, batch]")
+            timestep_draws = [explicit_timesteps]
+        elif explicit_timesteps.ndim == 2 and explicit_timesteps.shape[1] == batch_size:
+            timestep_draws = list(explicit_timesteps.unbind(0))
+        else:
+            raise ValueError("timesteps must have shape [batch] or [mc_samples, batch]")
     elif antithetic and num_mc_samples % 2 == 0:
         timestep_draws = []
         for _ in range(num_mc_samples // 2):
@@ -261,36 +332,75 @@ def elbo_sequence_logprob(
             for _ in range(num_mc_samples)
         ]
 
+    if noises is None:
+        noise_draws = [None] * len(timestep_draws)
+    else:
+        if logits_fn is not None:
+            raise ValueError("explicit noises are supported only by the default DIMBA scorer")
+        explicit_noises = noises.to(device=device)
+        if explicit_noises.ndim == 3:
+            noise_draws = [explicit_noises]
+        elif explicit_noises.ndim == 4:
+            noise_draws = list(explicit_noises.unbind(0))
+        else:
+            raise ValueError(
+                "noises must have shape [batch, seq, latent] or [mc_samples, batch, seq, latent]"
+            )
+        if len(noise_draws) != len(timestep_draws):
+            raise ValueError("timesteps and noises must contain the same number of draws")
+
     estimates = []
-    for t in timestep_draws:
-        logits = logits_fn(model, input_ids, t)
-        estimates.append(sequence_logprob(logits, labels, mask))
+    for t, noise in zip(timestep_draws, noise_draws):
+        if logits_fn is None:
+            estimates.append(
+                _default_diffusion_sequence_logprob(
+                    model,
+                    input_ids,
+                    labels,
+                    mask,
+                    t,
+                    prompt_mask=prompt_mask,
+                    noise=noise,
+                )
+            )
+        else:
+            logits = logits_fn(model, input_ids, t)
+            estimates.append(sequence_logprob(logits, labels, mask))
 
     # Monte-Carlo average over timesteps: mean of stacked [batch] estimates.
     return torch.stack(estimates, dim=0).mean(dim=0)
 
 
-def _default_diffusion_logits_fn(
+def _default_diffusion_sequence_logprob(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
     timesteps: torch.Tensor,
+    *,
+    prompt_mask: Optional[torch.Tensor],
+    noise: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Default DIMBA forward producing token logits at the given timesteps.
-
-    Mirrors the existing GRPO scoring path: a denoising forward at timestep ``t``
-    followed by the (optionally weight-tied) output head.
-
-    Args:
-        model: DIMBA-like module.
-        input_ids: Token ids ``[batch, seq_len]``.
-        timesteps: Diffusion timesteps ``[batch]``.
-
-    Returns:
-        Token logits ``[batch, seq_len, vocab_size]``.
-    """
-    x_pred, _, _ = model(input_ids, timesteps, return_latent_info=True)
-    embedding_weight = model.token_embed.get_weight()
-    return model.output_head(x_pred, embedding_weight=embedding_weight)
+    """Run leak-free DIMBA scoring without a full-sequence vocabulary projection."""
+    forward_kwargs = {
+        "prompt_mask": prompt_mask,
+        "return_latent_info": True,
+    }
+    if noise is not None:
+        forward_kwargs["noise"] = noise
+    x_pred, _, _ = model(input_ids, timesteps, **forward_kwargs)
+    active = mask.to(device=input_ids.device, dtype=torch.bool)
+    token_logprob = -output_head_cross_entropy(
+        model,
+        x_pred,
+        labels,
+        active_mask=active,
+        reduction="none",
+    ).float()
+    batch_indices = active.nonzero(as_tuple=True)[0]
+    return token_logprob.new_zeros(input_ids.shape[0]).index_add_(
+        0, batch_indices, token_logprob
+    )
 
 
 def dpo_loss(

@@ -2,10 +2,10 @@
 
 Two correctness-relevant changes vs. the original implementation:
 
-1. **Mamba-2 first.** We now prefer the genuine Mamba-2 (SSD) kernel from
-   ``mamba_ssm`` (``Mamba2``), falling back to Mamba-1 (``Mamba``) and then to the
-   pure-PyTorch :class:`~dimba.models.simple_mamba.SimpleMamba2`. The original
-   code imported ``Mamba`` (the Mamba-1 API) while naming everything "Mamba-2".
+1. **Mamba-2 only.** We prefer the genuine Mamba-2 (SSD) kernel from
+   ``mamba_ssm`` (``Mamba2``) and otherwise use a pure-PyTorch Mamba-2
+   implementation. Mamba-1 is intentionally never imported as a fallback because
+   its parameterization and checkpoint layout describe a different model.
 
 2. **Bidirectional scans.** Vanilla Mamba is *causal* (position ``t`` only sees
    ``<= t``). For non-autoregressive diffusion denoising every position should see
@@ -44,23 +44,20 @@ class RMSNorm(nn.Module):
         rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).sqrt().to(x.dtype)
         return (x / rms) * self.weight
 
-# Resolve the best available Mamba implementation once, at import time.
+# Resolve Mamba-2 once at import time. Mamba-1 is intentionally not a fallback:
+# its selective-SSM parameterization and checkpoint layout are a different model.
+# If the fused Mamba-2 extension is unavailable, _make_mixer uses the compatible
+# pure-PyTorch TorchMamba2 implementation instead.
 _MAMBA_CLS = None
-_MAMBA_KIND = "simple"
+_MAMBA_KIND = "torch_mamba2"
 HAS_MAMBA_SSM = False
-try:  # Mamba-2 (SSD) — the intended backbone.
+try:
     from mamba_ssm import Mamba2 as _MAMBA_CLS  # type: ignore
 
     HAS_MAMBA_SSM = True
     _MAMBA_KIND = "mamba2"
-except ImportError:
-    try:  # Mamba-1 fallback.
-        from mamba_ssm import Mamba as _MAMBA_CLS  # type: ignore
-
-        HAS_MAMBA_SSM = True
-        _MAMBA_KIND = "mamba1"
-    except ImportError:
-        _MAMBA_CLS = None
+except (ImportError, OSError):
+    _MAMBA_CLS = None
 
 from .embeddings import FiLMConditioning, AdditiveConditioning, AdaLNZeroConditioning
 
@@ -109,8 +106,8 @@ def _make_mixer(
 
         return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
 
-    # mamba_ssm kernels (CUDA). Mamba2 and Mamba take slightly different kwargs;
-    # fall back gracefully rather than crash, and warn once if we can't use them.
+    # mamba_ssm Mamba2 kernel (CUDA). Fall back gracefully for portable CPU/MPS
+    # use; production CUDA launchers separately require this fast path.
     try:
         return _MAMBA_CLS(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
     except (TypeError, ValueError, AssertionError, RuntimeError) as exc:  # pragma: no cover - CUDA only
@@ -247,7 +244,7 @@ class Mamba2Block(nn.Module):
         ffn_type: str = "mlp",
         ffn_hidden: Optional[int] = None,
         dropout: float = 0.0,
-        # Accepted for backward compatibility; only used by the Mamba-1 kernel.
+        # Accepted only so legacy configs/checkpoints still construct; Mamba-2 ignores them.
         dt_rank: str = "auto",
         dt_min: float = 0.001,
         dt_max: float = 0.1,
@@ -723,8 +720,57 @@ class DenoisingHead(nn.Module):
         else:
             self.projection = nn.Linear(d_model, vocab_size)
 
+    def prepare_features(
+        self,
+        x: torch.Tensor,
+        embedding_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run all context mixing and normalization before vocabulary projection."""
+        # The sampler/decoder can hand us an fp32 tensor (fp32 timestep math upcasts the
+        # latent), but the head's matmuls need an exact dtype match. Cast to the head dtype.
+        if self.use_weight_tying:
+            weight = embedding_weight if embedding_weight is not None else self.embedding_weight
+            x = x.to(weight.dtype)
+        elif isinstance(self.projection, nn.Linear):
+            x = x.to(self.projection.weight.dtype)
+        else:
+            projection_parameter = next(self.projection.parameters(), None)
+            if projection_parameter is not None:
+                x = x.to(projection_parameter.dtype)
+
+        if self.attn_blocks is not None:
+            for blk in self.attn_blocks:
+                x = blk(x)
+        if self.use_norm:
+            x = self.norm(x)
+        return x
+
+    def project_features(
+        self,
+        x: torch.Tensor,
+        embedding_weight: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Project prepared features, optionally at selected token positions only."""
+        if positions is not None:
+            if positions.ndim != 2 or positions.shape[0] != x.shape[0]:
+                raise ValueError("positions must have shape [batch, selected_tokens]")
+            x = x.gather(1, positions.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+
+        if self.use_weight_tying:
+            weight = embedding_weight if embedding_weight is not None else self.embedding_weight
+            logits = torch.matmul(x, weight.t())
+        else:
+            logits = self.projection(x)
+        if self.use_norm:
+            logits = logits * self.logit_scale.exp()
+        return logits
+
     def forward(
-        self, x: torch.Tensor, embedding_weight: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        embedding_weight: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Project denoised embeddings ``[B, L, d_model]`` to logits ``[B, L, vocab]``.
 
@@ -737,31 +783,13 @@ class DenoisingHead(nn.Module):
         Args:
             x: Decoded embeddings ``[B, L, d_model]``.
             embedding_weight: Optional embedding matrix for weight-tied projection.
+            positions: Optional token indices ``[B, K]``. Context mixing still runs
+                over the complete sequence, but the expensive vocabulary projection
+                is computed only for these positions. This is the fast masked-
+                inference path once some response tokens have been committed.
 
         Returns:
             Token logits ``[B, L, vocab_size]``.
         """
-        # The sampler/decoder can hand us an fp32 tensor (fp32 timestep math upcasts the
-        # latent), but the head's matmuls need an exact dtype match. Cast to the head dtype.
-        if self.use_weight_tying:
-            _ew = embedding_weight if embedding_weight is not None else self.embedding_weight
-            x = x.to(_ew.dtype)
-        elif isinstance(self.projection, nn.Linear):
-            x = x.to(self.projection.weight.dtype)
-
-        # Context-aware mixing (no-op for head_type=="linear").
-        if self.attn_blocks is not None:
-            for blk in self.attn_blocks:
-                x = blk(x)
-
-        if self.use_norm:
-            x = self.norm(x)
-        if self.use_weight_tying:
-            if embedding_weight is None:
-                embedding_weight = self.embedding_weight
-            logits = torch.matmul(x, embedding_weight.t())
-        else:
-            logits = self.projection(x)
-        if self.use_norm:
-            logits = logits * self.logit_scale.exp()
-        return logits
+        x = self.prepare_features(x, embedding_weight)
+        return self.project_features(x, embedding_weight, positions)

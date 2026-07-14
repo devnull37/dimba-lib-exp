@@ -2,9 +2,9 @@
 
 Resumes checkpoints/repair/repaired_final.pt (the fixed-objective denoiser) and
 trains with the fixed objective (snr_floor=0.5, ce_time_fade) PLUS soft-label KD
-from the SmolLM-135M teacher applied at the *sampled noisy timestep* — unlike
-the stage-3 KD in dimba.distillation.trainer, which runs the student at t=0 and
-therefore never trains the denoiser at noise. Teacher (causal) logits at
+from the SmolLM-135M teacher applied at the *sampled noisy timestep*. The main
+stage-3 trainer now uses the same corrected noisy path and `(1-t)` fade; this
+script is retained only as the historical standalone experiment. Teacher logits at
 position i predict token i+1; student x0-logits at position i reconstruct token
 i, so KD aligns student[:, 1:] with teacher[:, :-1]. KD and CE both fade with
 (1 - t): at pure noise a clean-text target is unmatchable and would re-teach

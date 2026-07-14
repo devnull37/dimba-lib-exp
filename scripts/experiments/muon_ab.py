@@ -10,6 +10,7 @@ sys.path.insert(0, "/workspace/dimba-lib-exp/src")
 sys.path.insert(0, "/workspace/dimba-lib-exp/scripts")
 from transformers import AutoTokenizer
 from dimba import DIMBA
+from dimba.training.optimizers import HybridMuon, build_optimizer
 import masked_diffusion_finetune as mdf
 
 SCRATCH = "/tmp/claude-0/-workspace/e7af4c75-0211-4993-889c-4db42f486fc9/scratchpad"
@@ -26,43 +27,6 @@ else:
     stream = mdf.build_stream(tok, 60000)
     torch.save(stream, cache)
 print(f"stream: {stream.numel()/1e6:.1f}M tokens", flush=True)
-
-
-def ns5(G, steps=5):
-    a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.to(torch.bfloat16)
-    transposed = G.size(-2) > G.size(-1)
-    if transposed:
-        X = X.mT
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    if transposed:
-        X = X.mT
-    return X.to(G.dtype)
-
-
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr, momentum=0.95):
-        super().__init__(params, dict(lr=lr, momentum=momentum))
-
-    @torch.no_grad()
-    def step(self):
-        for grp in self.param_groups:
-            for p in grp["params"]:
-                if p.grad is None:
-                    continue
-                st = self.state[p]
-                if "m" not in st:
-                    st["m"] = torch.zeros_like(p.grad)
-                buf = st["m"]
-                buf.mul_(grp["momentum"]).add_(p.grad)
-                g = p.grad.add(buf, alpha=grp["momentum"])  # nesterov
-                o = ns5(g)
-                scale = 0.2 * math.sqrt(max(p.shape[-2], p.shape[-1]))
-                p.add_(o, alpha=-grp["lr"] * scale)
 
 
 def load_model():
@@ -82,19 +46,14 @@ def lr_factor(s):
 def run(arm):
     torch.manual_seed(0)
     model, mid = load_model()
-    vocab = model.predict_token_logits(
-        torch.zeros(1, 8, dtype=torch.long, device=DEV), 0.5).shape[-1]
-    if arm == "adamw":
-        opts = [torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)]
-    else:
-        hidden, rest = [], []
-        for n, p in model.named_parameters():
-            if p.ndim == 2 and "embed" not in n.lower() and vocab not in p.shape:
-                hidden.append(p)
-            else:
-                rest.append(p)
-        print(f"[{arm}] muon params: {len(hidden)}, adamw params: {len(rest)}", flush=True)
-        opts = [Muon(hidden, lr=LR), torch.optim.AdamW(rest, lr=LR, weight_decay=0.0)]
+    optimizer = build_optimizer(model, name=arm, lr=LR, weight_decay=0.0)
+    if isinstance(optimizer, HybridMuon):
+        print(
+            f"[{arm}] muon params: {len(optimizer.muon_parameter_names)}, "
+            f"adamw params: {len(optimizer.adamw_parameter_names)}",
+            flush=True,
+        )
+    opts = [optimizer]
 
     torch.manual_seed(0)
     loader = DataLoader(mdf.PackedChunks(stream, mdf.SEQ_LEN), batch_size=BATCH,

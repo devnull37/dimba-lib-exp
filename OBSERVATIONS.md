@@ -1,15 +1,20 @@
 # Observations — non-critical issues
 
-Notes collected while babysitting the budget28 DIMBA run (stage-3 distillation).
-None of these block training; the live run is healthy. Each entry says what it is,
-why it's non-critical, and a concrete quick fix for later. **Not applied yet unless
-marked APPLIED.**
+> **Archived run log, superseded 13 Jul 2026.** These notes were collected while
+> babysitting budget28 Stage 3. Items 1–4 and 6 are fixed in the current code;
+> item 5 is incorporated into the current babysitting runbook. The original
+> incident descriptions remain below for provenance. See `AGENTS.md` and
+> `docs/PERFORMANCE_AND_SCALING.md` for current production behavior.
 
 Last updated: 30 Jun 2026 (UAE), during 3b co-adaptation.
 
 ---
 
-## 1. `scripts/generate.py` silently runs a near-random model  ⚠️ highest value
+## 1. `scripts/generate.py` silently ran a near-random model  ✅ APPLIED
+
+**Current status:** `load_model()` now uses the checkpoint's embedded constructor
+config, loads the state dict with `strict=True`, and uses the SmolLM tokenizer.
+
 **What:** `load_checkpoint()` builds the model from an external `config.yaml`
 (default `config.yaml`) instead of the config embedded in the checkpoint
 (`ck["config"]`), then calls `model.load_state_dict(model_state, strict=False)`.
@@ -40,7 +45,11 @@ strict load 0 missing / 0 unexpected against the embedded config).
 - Reference implementations that already do this correctly:
   `scratchpad/infer_real.py` (GPU) and `scratchpad/infer_cpu.py` (CPU).
 
-## 2. `config.yaml` ships a CPU-test-sized model as the default
+## 2. `config.yaml` ships a CPU-test-sized model as the default  ✅ APPLIED
+
+**Current status:** the file is explicitly labeled as a CPU smoke/development
+config, and production loading prefers the checkpoint's embedded config.
+
 **What:** `config.yaml` has `model.d_model: 256  # reduced for CPU testing`,
 `vocab_size: 10000`, etc. — a tiny smoke-test config, not the real run config
 (`d_model=576`, `vocab=49152`, `num_denoiser_layers=30`). Anything that reads this
@@ -53,7 +62,12 @@ this file; the checkpoint carries its own config.
 or (b) add a clear header comment that it is a CPU smoke-test config and tools
 should prefer the checkpoint's embedded config. Lowest-risk: option (b) plus #1.
 
-## 3. No CPU-inference flag exposed, even though a pure-torch path exists
+## 3. CPU inference was not exposed despite a pure-Torch path  ✅ APPLIED
+
+**Current status:** device selection now chooses CUDA, MPS, or CPU automatically;
+non-CUDA execution uses weight-compatible `TorchMamba2`, and generation exposes
+`--backend auto|torch|mlx`.
+
 **What:** `DIMBA(..., force_torch_mixer=True)` (also `use_simple_mamba=True`) swaps
 the CUDA-only `causal_conv1d`/SSD kernel for the pure-PyTorch `TorchMamba2`, which
 runs on CPU/MPS. `generate.py` never exposes this, so a CPU run dies with
@@ -66,20 +80,29 @@ when it isn't.
 `generate.py` that sets `force_torch_mixer=True` when device is not CUDA. Verified
 working in `scratchpad/infer_cpu.py` (strict 0/0, real English on CPU).
 
-## 4. `boundary_relaunch.sh` verify used a CPU forward smoke-test on a CUDA-only arch  ✅ APPLIED (local)
+## 4. `boundary_relaunch.sh` used an incompatible CPU verification path  ✅ APPLIED
+
+**Current status:** the original integrity fallback is present, and current
+non-CUDA model construction selects `TorchMamba2` for a real forward path.
+
 **What:** the original `verify` step ran a CPU `generate.py` forward pass as the
 "is the checkpoint broken?" gate. On this arch a CPU forward can't run (CUDA-only
 kernel; see #3), so the gate failed on a perfectly good checkpoint.
 
-**Status:** patched locally (commit `168d527`, **not pushed**) to detect the
-`is_cuda()/causal_conv1d` signature and fall back to a CPU integrity check
-(deserialize + key/shape + NaN/Inf scan).
+**Historical status:** the first patch detected the `is_cuda()/causal_conv1d`
+signature and fell back to a CPU integrity check (deserialize + key/shape +
+NaN/Inf scan).
 
-**Better long-term fix:** make the smoke-test use `force_torch_mixer=True` so it
-can do a real (if slow) CPU forward pass instead of only an integrity scan — or run
-the smoke test on GPU when one is free.
+**Resolution:** non-CUDA model construction now selects `TorchMamba2`
+automatically, so the verifier can use the real CPU forward path while retaining
+the integrity fallback.
 
-## 5. `nvidia-smi` PID ≠ container PID (monitoring foot-gun)
+## 5. `nvidia-smi` PID ≠ container PID (monitoring foot-gun)  ✅ DOCUMENTED
+
+**Current status:** `docs/BABYSIT_LOOP.md` checks trainer liveness through its
+pidfile and reports GPU utilization/memory separately; it does not cross-match
+host and container PIDs.
+
 **What:** inside this container `nvidia-smi --query-compute-apps=pid` reports the
 **host-namespace** PID (e.g. 7672) while the same process is a different PID inside
 the container (e.g. 294841). Any monitor that matches the nvidia-smi PID against a
@@ -93,7 +116,11 @@ Identify the trainer by `pgrep -f train_h100.py` and confirm GPU use via
 `utilization.gpu` + `memory.used`, not by PID equality. Optionally map via
 `/proc/<container_pid>/status` `NSpid` if an exact mapping is ever needed.
 
-## 6. `generate.py` detokenize fallback drops non-ASCII
+## 6. `generate.py` detokenize fallback dropped non-ASCII  ✅ APPLIED
+
+**Current status:** generation loads the real SmolLM tokenizer; the lossy
+character fallback is gone.
+
 **What:** the no-tokenizer fallback only keeps `32 <= id < 127`, so with a real
 vocab everything prints as `<non-printable tokens>`. Subsumed by fixing #1 (use the
 real tokenizer), noted for completeness.
@@ -102,10 +129,11 @@ real tokenizer), noted for completeness.
 
 ---
 
-### Suggested order when we get to it
-1. #1 + #2 + #6 together (one PR on `generate.py` + a `config.yaml` comment) — biggest payoff.
-2. #3 (`--device cpu` / `--force-torch-mixer`) — small, enables CPU eval anywhere.
-3. #4 long-term (torch-mixer smoke test) — optional; local patch already unblocks the run.
-4. #5 — doc note in the monitor tooling.
+### Historical implementation order (completed)
+
+1. #1 + #2 + #6 together — applied.
+2. #3 non-CUDA Torch path — applied.
+3. #4 verifier path — applied.
+4. #5 monitoring guidance — documented.
 
 Reference scripts (correct, working): `scratchpad/infer_real.py`, `scratchpad/infer_cpu.py`.

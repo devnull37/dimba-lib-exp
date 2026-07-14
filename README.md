@@ -29,8 +29,20 @@ DIMBA v2 (now merged into `main`) is a substantial correctness and research upgr
 - **Fixed conditioning** — the prompt is encoded as clean context with response-only loss; the v1 train/inference conditioning leak is gone.
 - **DPO post-training** for preference data, plus pluggable *verifiable* rewards for GRPO.
 - **Discrete / masked diffusion mode** (LLaDA / MDLM-style) alongside continuous latent diffusion.
+- **Production Mamba-2 enforcement** — CUDA training fails closed unless the native
+  `mamba_ssm.Mamba2` and `causal-conv1d` paths are active; Mamba-1 is never selected.
+- **Muon + native multi-GPU** — hybrid Muon/AdamW is available as a gated pilot, and the
+  canonical masked base/SFT launchers plus continuous H100 Stage 3 support one-process-per-GPU
+  DDP with exact same-topology resume.
+- **Device-resident samplers** — masked and continuous trajectories, batched CFG, selected-token
+  vocabulary projection, and batched verification remove hot host/GPU round trips.
+- **Budget28 post-mortem repair** — Stage 3 now uses SNR floor 0.5, CE fade, a 50/50
+  uniform/logit-normal timestep mixture, and `(1-t)`-faded teacher KD 1.0→0.3; “just train longer” is no longer
+  the run plan.
 
 See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap and [`docs/RESEARCH_DIRECTIONS.md`](docs/RESEARCH_DIRECTIONS.md) for forward-looking ideas.
+For current launch commands, benchmark gates, and measured-versus-projected speedups, see
+[`docs/PERFORMANCE_AND_SCALING.md`](docs/PERFORMANCE_AND_SCALING.md).
 
 ---
 
@@ -38,8 +50,10 @@ See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap 
 
 ### ⚡ Pure PyTorch Mamba-2 Implementation
 - **No CUDA dependencies required** — runs on CPU, GPU, and Apple Silicon
-- Custom `SimpleMamba2` fallback implementation when `mamba-ssm` is unavailable
-- Seamlessly switches between high-performance CUDA kernels and pure PyTorch
+- Automatic weight-compatible `TorchMamba2` fallback when `mamba-ssm` is unavailable
+- Explicit `SimpleMamba2` lightweight/reference backend for tiny experiments
+- CPU/MPS inference uses the pure-PyTorch fallback when needed; production CUDA training requires
+  the official fused Mamba-2 + causal-convolution kernels and refuses a slow fallback
 
 ### 🎯 Latent Space Diffusion with VAE
 - Optional Variational Autoencoder for compressing token embeddings
@@ -50,13 +64,17 @@ See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap 
 - **Runs CUDA-trained checkpoints on a Mac with no CUDA.** A pure-PyTorch Mamba-2 (SSD) mixer
   (`TorchMamba2`) is weight-compatible with the `mamba_ssm` CUDA kernel, so checkpoints load
   `strict=True` and run on CPU/MPS unchanged.
-- **Whole sampler on the Apple GPU via MLX** (`MLXDIMBA`) — token-identical to PyTorch and
-  **~17× faster than torch-MPS, ~44× faster than CPU** (256 tokens, 64 steps: 1.5 s vs 25.5 s).
+- **Whole sampler on the Apple GPU via MLX** (`MLXDIMBA`) — matched PyTorch's argmax tokens
+  in the cited deterministic parity benchmark and was **~17× faster than torch-MPS, ~44×
+  faster than CPU** (256 tokens, 64 steps: 1.5 s vs 25.5 s).
   ```bash
   pip install mlx
   python scripts/sample_mlx.py --num-samples 3 --temperature 0.8
   ```
 - See **[`docs/BACKENDS.md`](docs/BACKENDS.md)** for the full benchmark table and details.
+- The current masked sampler measured **6.82 s vs 7.83 s before this optimization pass** on an
+  M1 Pro (**1.149×**, identical final argmax tokens); the older 44× figure is a different
+  continuous-model CPU comparison.
 
 ### 🎮 Interactive Training Scripts
 - `train_interactive.py` — guided wizard for easy configuration
@@ -68,6 +86,21 @@ See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap 
 - **Classifier-free guidance** — adjustable prompt adherence at sampling time
 - **Consistency distillation** (experimental) — targets few-step generation (the paper's "ultra-fast" goal; not yet benchmarked)
 - Top-k, top-p, and temperature-based sampling
+
+### 🎬 YC / demo visualization (DIMBA vs AR)
+One command runs timed inference against a same-size AR baseline (SmolLM-135M),
+sweeps the quality slider, and writes a self-contained HTML visualization:
+
+```bash
+python3 scripts/yc_app_demo.py
+# leaner / denser:
+python3 scripts/yc_app_demo.py --profile fast
+python3 scripts/yc_app_demo.py --profile full
+```
+
+Outputs land in `demos/yc_app/` (`yc_demo.html` + `yc_demo_metrics.json`).
+Open the HTML in a browser for screen capture. Weights resolve from a local
+checkpoint, the HuggingFace cache (`devnull37/hr-diffuse-1-nano`), or download.
 
 ---
 
@@ -156,7 +189,7 @@ See [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) for the full roadmap 
 git clone https://github.com/devnull37/dimba-lib-exp.git
 cd dimba-lib-exp
 
-# Basic installation (CPU + SimpleMamba fallback)
+# Basic installation (CPU + TorchMamba2 fallback)
 pip install -e .
 
 # With GPU support (full Mamba-2 with CUDA)
@@ -187,12 +220,38 @@ The wizard will guide you through:
 # Train on GPU
 python scripts/train.py --config config.yaml --gpus 1 --max-epochs 10
 
-# Train on CPU (uses SimpleMamba)
+# Train on CPU (uses the TorchMamba2 fallback)
 python scripts/train.py --config config.yaml
 
-# Train on Apple Silicon
-python scripts/train.py --config config.yaml --mps
+# Train on Apple Silicon: select the tested mps-small preset in the wizard
+PYTORCH_ENABLE_MPS_FALLBACK=1 python3 scripts/train_interactive.py
 ```
+
+For the next-run masked recipe, launch one process per NVIDIA GPU. `--batch` is per GPU, so
+`global_batch = batch × GPU_count × accumulate`:
+
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/masked_diffusion_finetune.py \
+  --batch 64 --accumulate 1 --optimizer adamw \
+  --output-dir checkpoints/masked-base-adamw
+
+# Run Muon as a separate, gated A/B arm—not as an unmeasured default:
+torchrun --standalone --nproc-per-node=8 scripts/masked_diffusion_finetune.py \
+  --batch 64 --accumulate 1 --optimizer muon \
+  --output-dir checkpoints/masked-base-muon
+```
+
+Continuous Stage 3 also supports DDP; its fixed token-budget presets divide optimizer steps by
+world size, run alignment once on rank 0, and keep one frozen teacher replica per GPU:
+
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/train_h100.py \
+  --preset validation --phase distill \
+  --save-dir checkpoints/h100-validation-8gpu
+```
+
+SFT/GRPO in that launcher remain single-process. See
+[`docs/PERFORMANCE_AND_SCALING.md`](docs/PERFORMANCE_AND_SCALING.md).
 
 #### Option 3: Python API
 
@@ -228,9 +287,10 @@ print(generated)
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| **NVIDIA CUDA** | ✅ Full support | Best performance with `mamba-ssm>=2.2.0` |
-| **Apple Silicon (MPS)** | ✅ Full support | Native Metal backend for M1/M2/M3 |
-| **CPU** | ✅ Supported | Uses pure PyTorch `SimpleMamba2` fallback |
+| **NVIDIA CUDA** | ✅ Full support | Native Mamba-2 + causal-conv required for production training |
+| **Apple Silicon (MPS)** | ✅ Training/inference | Tested fp32 `mps-small` latent recipe; sequence length 128 |
+| **Apple Silicon (MLX)** | ✅ Inference only | Fast device-resident continuous + masked sampling |
+| **CPU** | ✅ Supported | Uses weight-compatible pure-PyTorch `TorchMamba2` fallback |
 | **AMD ROCm** | ⚠️ Experimental | Via PyTorch ROCm builds |
 
 ### Hardware-Specific Training Scripts
@@ -242,7 +302,7 @@ python scripts/train_fineweb_500m_a4000.py
 # L40S / A100 - 1.5B parameter model  
 python scripts/train_fineweb_1b.py
 
-# CDLM (Consistency Training) - up to 14× faster inference
+# Experimental legacy consistency objective (no validated DIMBA speedup yet)
 python scripts/train_cdlm.py
 ```
 
@@ -279,15 +339,18 @@ model = DIMBA(
 
 ### Consistency Training (CDLM)
 
-Train with Consistency Models for ultra-fast inference:
+Run the experimental legacy consistency objective. It targets fewer network evaluations, but no
+DIMBA checkpoint has yet demonstrated an accuracy-preserving speedup:
 
 ```bash
 python scripts/train_cdlm.py \
     --config config.yaml \
-    --consistency-weight 0.5 \
-    --delta-min 50 \
-    --delta-max 200
+    --enable-consistency \
+    --consistency-weight 0.5
 ```
+
+See [`docs/CDLM.md`](docs/CDLM.md); do not treat the upstream 10-14× target as a measured DIMBA
+result.
 
 ---
 
@@ -297,11 +360,11 @@ python scripts/train_cdlm.py \
 
 - [x] Core diffusion training pipeline
 - [x] Mamba-2 denoiser with FiLM conditioning
-- [x] Pure PyTorch SimpleMamba2 fallback
+- [x] Weight-compatible pure-PyTorch TorchMamba2 CPU/MPS fallback
 - [x] VAE-based latent diffusion
 - [x] DDIM + DPM-Solver++ sampling
 - [x] Interactive training wizard
-- [x] Multi-GPU training (PyTorch Lightning)
+- [x] Native one-process-per-GPU DDP for continuous Stage 3 and masked base/SFT, with exact same-topology resume
 - [x] Apple Silicon (MPS + MLX) support
 - [x] HuggingFace datasets integration
 - [x] BPE tokenization
@@ -316,10 +379,12 @@ python scripts/train_cdlm.py \
 - [x] Block FFN (SwiGLU / MLP) per Mamba-2 block — opt-in channel mixing
 - [x] Cross-architecture distillation (`src/dimba/distillation/`) — distill any HF Transformer into DIMBA
 - [x] Block-sequential CoT inference — sequential thinking blocks, each a full diffusion pass
+- [x] Hybrid Muon/AdamW optimizer pilot (AdamW remains the control/default)
+- [x] Device-resident masked/continuous sampling with batched CFG and selected projection
+- [x] Reproducible H100 benchmark + parity/HBM/p50/p95 promotion gates
 
 ### 🚧 Experimental / In Progress
 
-- [ ] Discrete / masked diffusion mode (LLaDA / MDLM-style)
 - [ ] Consistency distillation for few-step sampling
 - [ ] Multi-modal extensions
 - [ ] Quantization support (INT8, INT4) / Q-LoRA polish
@@ -332,6 +397,9 @@ python scripts/train_cdlm.py \
 2. **Discrete-continuous gap**: Mapping between discrete tokens and continuous embeddings affects rare token handling
 3. **Hyperparameter sensitivity**: Performance varies significantly with diffusion steps (T), architecture depth
 4. **Conditioning strength**: the v1 prompt-conditioning leak is fixed (clean-prefix context + response-only loss); global pooled conditioning can still be strengthened with cross-attention (see research directions)
+5. **CUDA measurements pending**: the target-H100 harness is ready, but current CUDA speedups are forecasts until a trained-checkpoint run passes its promotion gate
+6. **Distributed scope**: exact same-topology DDP is implemented for canonical masked launchers
+   and continuous H100 Stage 3; multi-node and target-H100/NCCL validation remain hardware gates
 
 ---
 
@@ -362,6 +430,10 @@ dimba-lib-exp/
 │   │   └── cot_dataset.py    # SmolTalk + OrcaMath + BlockCoTDataset
 │   ├── training/             # Training utilities
 │   │   ├── trainer.py        # Main trainer
+│   │   ├── masked.py         # Exact selected-token masked objective
+│   │   ├── optimizers.py     # AdamW + hybrid Muon policy
+│   │   ├── distributed.py    # torchrun/DDP, exact resume, rank-zero cache
+│   │   ├── fused_ce.py       # Semantics-gated optional Liger CE
 │   │   ├── grpo.py           # GRPO with anti-overthinking ⭐
 │   │   ├── preference.py     # DPO / IPO / SimPO
 │   │   └── rewards.py        # Pluggable verifiable rewards
@@ -369,6 +441,9 @@ dimba-lib-exp/
 │   └── tokenizers/           # Tokenization
 ├── scripts/                  # Training & utility scripts
 │   ├── train_4090.py         # Full pipeline: distill→SFT→GRPO ⭐
+│   ├── benchmark_h100.py     # CUDA performance + parity promotion gate
+│   ├── masked_diffusion_finetune.py  # Canonical masked base/DDP launcher
+│   ├── mdm_sft_cfg2.py       # Canonical masked SFT/DDP launcher
 │   ├── distill.py            # Standalone distillation script
 │   ├── monitor.py            # /loop training monitor ⭐
 │   ├── train_interactive.py  # Interactive wizard
@@ -376,7 +451,7 @@ dimba-lib-exp/
 │   ├── train_cdlm.py         # Consistency training
 │   ├── generate.py           # Text generation
 │   └── evaluate.py           # Evaluation
-├── tests/                    # Unit tests (328 passing)
+├── tests/                    # Unit, parity, distributed, and benchmark-gate tests
 ├── config.yaml               # Model + distillation config
 └── docs/                     # Documentation
 ```

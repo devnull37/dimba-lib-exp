@@ -12,6 +12,10 @@ tags:
 
 # hr-diffuse-1-nano
 
+> **Historical release card.** Experiment results and the original roadmap are
+> preserved below. The current repository defaults to AdamW and offers Muon only
+> as an opt-in, benchmark-gated pilot; see `docs/PERFORMANCE_AND_SCALING.md`.
+
 **A masked discrete diffusion language model on a bidirectional Mamba backbone. 287.9M measured parameters, 135M-class backbone capacity.**
 
 This is the final release of the first generation of the project. It is a research artifact, trained end to end for about $450 on rented H100s by a self-funded independent researcher. To our knowledge, every published masked-diffusion text model uses a transformer backbone (LLaDA, MDLM, Dream). This model is the same proven objective on a different spine: bidirectional Mamba.
@@ -94,11 +98,11 @@ A controlled 3-arm A/B (2000 steps from scratch, identical data and seeds) teste
 
 1. SFT loss is computed on the response plus exactly one EOS token, never on the padding tail. Training on the tail silently collapses the model to empty answers while the loss looks excellent.
 2. Repair training works with random corruptions and fails with self-generated ones. Training the model to fix its own sampled errors destroyed its detection ability entirely (7.1% to 0.0%), because its own samples are by definition what it finds plausible.
-3. Optimizer: a controlled 2k-step A/B of Muon vs AdamW on this architecture gave Muon a small consistent win (final CE 5.453 vs 5.470) with no instability. We believe this is the first Muon result on a Mamba diffusion LM. The next scale-up trains with Muon.
+3. Optimizer: a controlled 2k-step A/B of Muon vs AdamW on this architecture gave Muon a small consistent win (final CE 5.453 vs 5.470) with no instability. That is enough to justify a gated next-run arm, not to replace AdamW by default; promote Muon only on better time-to-held-out-quality.
 
 ## Roadmap
 
-- Next run (when funded, roughly $1,500 to $4,000): 1.5B with teacher-enabled distillation from SmolLM2-1.7B, Muon optimizer, and the shared-base plus per-direction LoRA bidirectionality validated above. The run starts with a cheap pilot A/B phase (teacher on vs off, architecture ladder) before committing the budget.
+- Next run (when funded, roughly $1,500 to $4,000): 1.5B with teacher-enabled distillation from SmolLM2-1.7B and the shared-base plus per-direction LoRA bidirectionality validated above. The run starts with cheap AdamW/Muon and architecture pilot arms before committing the budget.
 - The scientific goal is a scaling curve for the four probes established here: planted-error detection rate, remask fire rate, critic AUC, and the slope of the inference-compute dial. All four are measured at this scale and waiting for their second data point.
 - Planning-latent tokens: a compressed continuous plan vector conditioning the discrete diffusion.
 

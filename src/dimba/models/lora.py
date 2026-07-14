@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..utils.checkpointing import atomic_torch_save
+
 DEFAULT_LORA_TARGET_MODULES: Tuple[str, ...] = (
     "in_proj",
     "out_proj",
@@ -215,8 +217,7 @@ def save_lora_weights(model: nn.Module, path: Union[str, Path]) -> Dict[str, tor
         lora_state[f"{module_name}.r"] = torch.tensor(module.r, dtype=torch.int64)
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"lora_state_dict": lora_state}, path)
+    atomic_torch_save({"lora_state_dict": lora_state}, path)
     return lora_state
 
 

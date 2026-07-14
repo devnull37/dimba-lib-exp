@@ -2,6 +2,10 @@
 
 *by Faris Allafi, July 2026, draft*
 
+> **Historical experiment narrative.** The measurements and decisions below
+> are preserved as recorded. Current launch policy defaults to AdamW and treats
+> Muon as an opt-in, benchmark-gated pilot; see `docs/PERFORMANCE_AND_SCALING.md`.
+
 I'm 14, self-funded, and for the past months I've been building **DIMBA**: a language model that uses a *bidirectional Mamba* backbone with a *diffusion* objective instead of the usual left-to-right transformer. This is the story of how the first version failed for $358, how a pivot to masked diffusion made it work, and how one long day of test-time-compute experiments produced the most interesting finding of the project:
 
 > **At 135M-class scale, every inference-time technique that asks the model to judge itself fails, and every technique that imposes an external constraint works.** Self-judgment is the first casualty of small scale.
@@ -115,7 +119,7 @@ Two forward-looking pieces from the same day:
 
 **The accuracy↔cost dial.** Diffusion gives you *two* orthogonal inference knobs: number of denoising steps, and best-of-N with the verifier. Both are per-request. That means one deployed model can serve "fast and rough" and "slow and careful" from the same weights, which is a genuine architectural advantage over autoregressive models, where thinking longer had to be trained in. (Next step: let the model set its own dial per request.)
 
-**Muon works on Mamba diffusion.** I ran a controlled A/B (2,000 identical steps, same data, same seed) of Muon, the orthogonalized-momentum optimizer used in Kimi K2, against AdamW, with the standard hybrid split (243 weight matrices on Muon, embeddings and the rest on AdamW). Muon led at nearly every checkpoint and finished at 5.453 vs 5.470 loss. A small edge, but this was Muon's *worst-case* setting (short continuation of a converged model; its published 1.5-2× wins come from long from-scratch runs), and it was perfectly stable. As far as I can find, this is the **first Muon result on a Mamba-backbone diffusion LM.** Decision made: 350M trains with Muon.
+**Muon is promising on Mamba diffusion.** I ran a controlled A/B (2,000 identical steps, same data, same seed) of Muon against AdamW, with the standard hybrid split (243 hidden weight matrices on Muon, embeddings and the rest on AdamW). Muon led at nearly every checkpoint and finished at 5.453 vs 5.470 loss. That small, stable edge justifies a gated next-run arm; AdamW remains the control until Muon wins on wall-clock time to the same held-out quality.
 
 ## The thesis, and the experiment I actually want to run
 

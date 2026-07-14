@@ -1,4 +1,6 @@
-# DIMBA Model Configuration
+# DIMBA CPU smoke/development configuration.
+# Production checkpoints carry their constructor config; loaders must prefer that
+# embedded config instead of treating these small defaults as the trained model.
 
 # Model architecture parameters
 model:
@@ -40,6 +42,7 @@ data:
 
 # Training configuration
 training:
+  optimizer: "adamw"        # "muon" uses Muon for hidden matrices + AdamW for embeddings/heads/vectors
   learning_rate: 2e-5
   warmup_steps: 500
   weight_decay: 0.01
@@ -50,8 +53,8 @@ training:
   max_steps: null           # Set to limit training steps (null = no limit)
   log_interval: 100
   val_interval: 500
-  # CDLM Consistency Training (Together AI paper)
-  use_consistency_training: false  # Enable for up to 14x faster inference
+  # Experimental CDLM consistency training; quality/speed are not validated here.
+  use_consistency_training: false  # Keep off outside an explicit benchmark arm
   consistency_loss_weight: 0.5    # Lambda weight for consistency loss (0.5-1.0)
   consistency_delta_min: 50       # Minimum timestep gap for consistency pairs
   consistency_delta_max: 200      # Maximum timestep gap for consistency pairs
@@ -59,7 +62,8 @@ training:
 # GPU/Device configuration
 device:
   use_gpu: true             # Set to false to force CPU training
-  multi_gpu: false          # Use DataParallel for multi-GPU
+  # Legacy placeholder; canonical multi-GPU uses torchrun DDP masked launchers.
+  multi_gpu: false
   mixed_precision: false    # Use automatic mixed precision (amp)
   benchmark: true           # Enable cudnn benchmark
 

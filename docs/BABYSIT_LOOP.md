@@ -1,286 +1,266 @@
-# DIMBA training babysitter — complete agent brief
+# DIMBA training babysitter
 
-This is a **self-contained `/loop` prompt**. A fresh Claude agent, given only this
-text, will **launch** the DIMBA 50B training run, **monitor** every phase, **apply
-live adjustments**, **self-heal simple errors**, and **escalate** anything risky.
+This is the `/loop` brief for a long GPU run. It handles one phase at a time, reports,
+persists state, and stops. It never advances through a quality gate automatically.
 
-## How the human starts it (one time, on the GPU box)
+## Human setup
 
-1. Open a Claude Code session **on the GPU box** (where the GPU, the repo, and
-   `nvidia-smi` live). The repo is at `~/dimba-lib-exp` and the box `git pull`s
-   from `main`.
-2. Fill in the **CONFIG** block below (at minimum `HF_REPO`).
-3. Run `/loop 45m` and paste **this entire file**. That's it — the agent does the
-   rest, including launching training on its first tick. Cadence 30–60 min is
-   right (`30m` early in a phase, `60m` once stable).
+Run the loop on the GPU box from a clean checkout. Fill in:
 
-```
-# ===== CONFIG (the human fills these in before pasting) =====
-REPO_DIR   = ~/dimba-lib-exp
-PRESET     = full              # full = 50B target. SEE "Which preset" below — running
-                               #   `validation` (~1B, a few $/hours) FIRST is strongly
-                               #   recommended to sanity-check the recipe before 50B.
-PHASE      = all               # all = distill -> SFT -> GRPO (the full pipeline)
-HF_REPO    = <you>/dimba-135m  # HuggingFace repo for checkpoint backups (REQUIRED for
-                               #   off-box durability; leave blank to skip uploads)
-HF_TOKEN   = (env HF_TOKEN)    # set `export HF_TOKEN=hf_...` in the shell before /loop
-LOG        = ~/dimba_train.log
-PIDFILE    = ~/dimba_train.pid
-LOOPSTATE  = ~/dimba_loop_state.json   # the agent's own memory between ticks
-# ============================================================
-```
-
----
-
-## THE PROMPT (everything below is for the babysitter agent)
-
-You are the **babysitter** for a long, expensive (multi-day, single-H100) training
-run. Read this whole brief once, then on each tick do: **figure out the situation →
-act → report → persist your notes → stop**. The `/loop` harness re-invokes you every
-30–60 min, so each tick is short and you rely on `LOOPSTATE` to remember context.
-
-### 0. What you are training (so you understand what you're watching)
-
-- **DIMBA** is a ~135M-parameter **bidirectional Mamba-2 *diffusion* language model**.
-  It is NOT a normal autoregressive transformer: it denoises tokens (diffusion /
-  flow-matching) rather than predicting strictly left-to-right, and its token-mixing
-  is a Mamba-2 state-space layer, not attention.
-- We **distilled** it from **SmolLM-135M** (a strong small transformer) using a
-  MOHAWK-style conversion: keep SmolLM's embeddings + FFN/MLP + LM head, replace
-  attention with a bidirectional Mamba mixer, then align and co-adapt.
-- **Why this run exists:** run #1 came out incoherent. Root causes — now fixed —
-  were (a) too few tokens (~1B), (b) the inherited FFN stayed **frozen** the whole
-  time so it never adapted to consuming Mamba (not attention) outputs, and (c) a
-  timestep-sampling bug. This run fixes all three and scales tokens up.
-- **Success looks like:** the distilled base produces *coherent* text continuations;
-  SFT then teaches instruction/chain-of-thought format; GRPO sharpens reasoning.
-
-### 0.1 The three phases (what each is, in order)
-
-The pipeline is `distill → SFT → GRPO`. With `PHASE=all` it runs them back-to-back.
-
-1. **DISTILL** (the long one, where the 50B tokens go). Internally three stages:
-   - **Stage 1 — matrix alignment**: the Mamba mixer learns to mimic SmolLM's
-     attention mixing matrices. Short, teacher active. ~hundreds of steps.
-   - **Stage 2 — hidden alignment**: each block's hidden state is matched to
-     SmolLM's. Short, teacher active.
-   - **Stage 3 — co-adaptation pretraining** (THE 50B): plain language modelling on
-     FineWeb, teacher unloaded. Two sub-phases:
-       * **3a, FFN-frozen** — 33B tokens, lr 2e-4, ~503,540 steps. The Mamba mixer
-         learns to feed the (frozen) inherited FFN in-distribution.
-       * **3b, FFN-unfrozen** — 17B tokens, lr 3e-5, ~259,399 steps. The FFN now
-         co-adapts at a low LR (the fix for run #1). A checkpoint
-         `distill_stage3a.pt` is saved at the 3a→3b boundary.
-   - Output: `checkpoints/distill/final.pt`.
-2. **SFT** — supervised fine-tuning, 2 stages (full instruction+math mix, then a
-   hard reasoning-only subset), teaching the `<think>…</think>` block-CoT format.
-   Output: `checkpoints/sft/final.pt`. **SFT cannot fix an incoherent base** — see
-   the COHERENCE GATE.
-3. **GRPO** — reinforcement learning on verifiable rewards (default: math). Watches
-   reward, KL divergence, and "think-block" counts. Output: `checkpoints/grpo/…`.
-
-### 0.2 Files, signals, and terms you will use
-
-- `LOG` (`~/dimba_train.log`): training stdout. Your primary raw signal. Key lines:
-  - `distill backend: CUDA Mamba2 kernel (fast binary)` ← MUST see this (see 3.B).
-  - `DistillationTrainer [stage3] step N/M — loss=X` ← distill progress (~every 50 steps).
-  - `GRPO[label] step N/M | reward=… | think=… | kl=… | acc=… | lr=…` ← GRPO progress.
-  - `distillation done → …/distill/final.pt`, `SFT done → …`, `all done. final model: …`.
-- `scripts/monitor.py`: run `python3 scripts/monitor.py`. Reads `training_state.json`
-  (now written in **every** phase, distill included) and prints phase, step, loss,
-  trends, and concrete recommendations. This is your formatted dashboard.
-- `training_state.json`: `{stage, step, loss, lr, …}`, refreshed each log interval.
-- `training_state_override.json`: **you** write this to adjust the live run (see §5).
-  The trainer reads + DELETES it (applies once).
-- `LOOPSTATE` (`~/dimba_loop_state.json`): **your** memory between ticks. You create
-  and update it. Suggested shape:
-  `{"situation","last_phase","last_step","last_loss","last_ts","fix_attempts":{},"launched":true}`.
-- `checkpoints/{distill,sft,grpo}/`: saved weights. NEVER delete a `final.pt` or
-  `distill_stage3a.pt`. Intermediate `*_step*.pt` are deletable to free disk.
-
-### 1. FIGURE OUT THE SITUATION (do this first, every tick)
-
-Run these, then pick exactly one branch:
 ```bash
-cd <REPO_DIR>
-ALIVE=no; [ -f <PIDFILE> ] && ps -p "$(cat <PIDFILE>)" >/dev/null 2>&1 && ALIVE=yes
-tail -n 5 <LOG> 2>/dev/null
+export REPO_DIR="$HOME/dimba-lib-exp"
+export PHASE="distill"              # distill, sft, or grpo; never all
+export PRESET="validation"          # smoke, validation, scale, full, ...
+export OPTIMIZER="adamw"            # adamw default; muon is a pilot
+export SAVE_DIR="$HOME/checkpoints/dimba-validation-adamw"
+export CHECKPOINT=""                 # required for sft/grpo or resume
+export HF_REPO="you/dimba-135m"      # empty disables upload
+export LOG="$HOME/dimba_train.log"
+export PIDFILE="$HOME/dimba_train.pid"
+export LOOPSTATE="$HOME/dimba_loop_state.json"
 ```
-- **DONE** — `LOG` contains `all done. final model:` → the run finished. Post a final
-  summary, confirm `grpo`/final checkpoints exist + uploaded, and **end the loop**.
-- **RUNNING** — `ALIVE=yes` → go to **§2 (monitor)**.
-- **CRASHED/STOPPED** — `ALIVE=no` and `LOG` exists and does NOT say `all done`
-  (look for a traceback) → go to **§4 (error recovery)**.
-- **KICKOFF** — no `PIDFILE`/`LOG` yet, or `LOOPSTATE.launched` is not set → this is
-  the very first tick → go to **§1.5 (launch it)**.
 
-### 1.5 KICKOFF — launch training (first tick only)
+Set `HF_TOKEN` in the shell before starting the loop; never write it to `LOOPSTATE`.
+Use a different `SAVE_DIR` for every run and every AdamW/Muon arm. Start with
+`validation`; do not spend the `full` budget until its gates pass.
 
-Do these in order; if any check fails, treat it as an error (§4) or escalate.
+## Non-negotiable launch rules
+
+- `scripts/train_h100.py` is continuous and phase-by-phase. It rejects `--phase all`.
+  Stage 3 may run under single-node `torchrun`; SFT/GRPO remain single-process.
+- CUDA training must resolve every mixer to `mamba_ssm.Mamba2` and must import
+  `causal_conv1d`. The code fails closed instead of running TorchMamba2. Mamba-1 is
+  never a fallback.
+- SFT and GRPO require `--quality-gate-passed`. That flag records a human decision;
+  the babysitter must not infer it from a falling loss.
+- AdamW is the default. Use Muon only for a named pilot/A-B arm.
+- Exact resume exists for continuous Stage 3. SFT and GRPO do not have exact resume;
+  never pass `--resume` to them.
+
+## What is being watched
+
+The definitive failed run consumed about 28B Stage-3 tokens. It recovered unseen text
+through `t≈0.9` but failed at the pure-noise `t=1` starting point. The current recipe
+uses SNR floor 0.5, CE fade `(1-t)`, a 50/50 uniform/logit-normal timestep mixture,
+and `(1-t)`-faded teacher KD 1.0→0.3 across frozen 3a / low-LR unfrozen 3b. Loss alone cannot prove
+the endpoint is fixed. SFT cannot rescue an incoherent base; GRPO cannot bootstrap
+from uniformly wrong samples.
+
+Important files:
+
+- `<LOG>`: process output.
+- `training_state.json`: current stage, step, loss, and LR.
+- `training_state_override.json`: one-shot live override, consumed and deleted.
+- `<SAVE_DIR>/distill_latest.pt`: exact rolling Stage-3 checkpoint.
+- `<SAVE_DIR>/distill_stage3a.pt`: exact 3a boundary checkpoint.
+- `<SAVE_DIR>/final.pt`: selected phase output.
+- `<LOOPSTATE>`: babysitter state across ticks.
+
+## First tick: preflight and launch
+
+Run:
+
 ```bash
-cd <REPO_DIR>
-git pull                                   # get the latest code (config, fixes)
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader   # expect an H100, ~80GB
-python3 -c "import mamba_ssm, causal_conv1d" \
-  || MAX_JOBS=4 pip install mamba-ssm causal-conv1d --no-build-isolation
-python3 scripts/train_h100.py --preset <PRESET> --dry-run        # sanity: 50B for full
+cd "$REPO_DIR"
+git status --short
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+python3 -c "from mamba_ssm import Mamba2; import causal_conv1d"
+python3 scripts/train_h100.py --preset "$PRESET" \
+  --stage3-optimizer "$OPTIMIZER" --dry-run
 ```
-- If VRAM < ~70 GB → ALERT the human (this isn't a full H100; SFT batch may OOM).
-- Launch detached + logged. Include `--hf-repo` only if `HF_REPO` is set; if it's
-  blank, WARN that checkpoints won't be backed up off-box.
+
+The dry run must print `Stage-3 teacher KD = 1.00 -> 0.30` (or `0.30 -> 0.30` for
+the unfrozen-only repair preset). Stop if either Stage-3 phase resolves to zero KD.
+
+Stop and alert if the worktree is unexpectedly dirty, CUDA is unavailable, the fused
+imports fail, or the GPU is not the intended box. Do not install or change a CUDA stack
+mid-run without recording it.
+
+Launch exactly one phase.
+
+Fresh distillation:
+
 ```bash
-export HF_TOKEN=<HF_TOKEN>     # if set
-nohup python3 scripts/train_h100.py --preset <PRESET> --phase <PHASE> \
-    ${HF_REPO:+--hf-repo <HF_REPO>} > <LOG> 2>&1 &
-echo $! > <PIDFILE>
-sleep 30
+nohup python3 scripts/train_h100.py --preset "$PRESET" --phase distill \
+  --stage3-optimizer "$OPTIMIZER" --save-dir "$SAVE_DIR" \
+  --hf-repo "$HF_REPO" > "$LOG" 2>&1 &
+echo $! > "$PIDFILE"
 ```
-- Confirm it started: process alive (`ps -p $(cat <PIDFILE>)`) AND `LOG` shows the
-  banner (`=== PHASE 1: DISTILLATION`). If it died in 30s → §4 with the traceback.
-- **Verify the fast kernel** from the log: it must say `CUDA Mamba2 kernel (fast
-  binary)`, NOT `TorchMamba2 (...fallback)`. Fallback = ~10× slower + OOM-prone →
-  §4 (fix = the `pip install` above, then relaunch).
-- Set `LOOPSTATE.launched = true`, record phase/step/ts, and post a "🚀 STARTED"
-  report. Done for this tick.
 
-### 2. MONITOR (when RUNNING) — observe progress
-- `python3 scripts/monitor.py` — note phase, step, loss, its trends, and any
-  recommendations it prints.
-- `tail -n 30 <LOG>` — read the latest raw trainer lines (cross-check the monitor).
-- `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader`.
-- Compute **steps/min** from `(step − last_step)/(now − last_ts)` and an **ETA** for
-  the remaining steps of the current stage (frozen ≈503,540; unfrozen ≈259,399;
-  use `--dry-run` numbers; SFT/GRPO are far shorter).
+SFT after a human-approved distillation gate:
 
-### 3. HEALTH CHECKS (flag ANY as an issue → §4 or §5 as noted)
-- **A. Loss**: must be finite and trending **down** or flat-low. There's no hard
-  target number — judge by the trend. `NaN`/`Inf`, or a sustained 2×+ rise over
-  several readings → **divergence**: first try a live LR halving (§5); if it keeps
-  diverging next tick → escalate.
-- **B. Backend** (verify once): `CUDA Mamba2 kernel (fast binary)` present. Fallback
-  → §4.
-- **C. Stalled**: step unchanged vs `last_step` AND GPU util low → hang → §4.
-- **D. Stage-3 OOM**: `grep -c "CUDA OOM" <LOG>`. One early downshift is BY DESIGN
-  (batch halves, steps auto-scale to keep the token budget). Continuous downshifting
-  → escalate.
-- **E. SFT OOM skips**: `grep -c "CUDA OOM on a micro-batch" <LOG>`. A few = fine;
-  approaching 20 consecutive = the SFT batch is too big and the run will abort →
-  escalate ("lower H100_SFT_BATCH_SIZE, restart SFT").
-- **F. Disk**: `df -h .`. >90% on the checkpoints filesystem → the next save crashes.
-  You MAY autonomously delete old intermediates: keep the 2 newest `*_step*.pt` per
-  phase, NEVER touch `final.pt` / `distill_stage3a.pt`. Re-check and report.
-- **G. Checkpoints landing**: `ls -la checkpoints/*/`. A phase's `final.pt` must
-  appear (and upload to HF if `HF_REPO` set); `distill_stage3a.pt` at the 3a→3b
-  boundary.
-
-### 4. ERROR-RECOVERY SUBROUTINE (crash / traceback / hang / red test / failed command)
-Do EXACTLY this, in order — this is the heart of "self-heal then escalate":
-1. **Capture** the error: `grep -nE "Traceback|Error|Exception|CUDA|Killed" <LOG> | tail`
-   then read around it. Form a short `error_sig` = exception type + the file:line.
-2. **Pull new code first** (a fix may already be on `main`):
-   `git stash -u 2>/dev/null; git pull --rebase; git stash pop 2>/dev/null || true`.
-3. **Test** the code is healthy: `python3 -m compileall -q scripts/ src/` plus the
-   most relevant suite (`pytest tests/test_distillation.py -q -o addopts=""` for
-   trainer errors; `tests/test_override.py` for monitor/override; etc.).
-4. **If healthy after the pull** → relaunch from the latest checkpoint (§4a),
-   report "recovered via git pull", done.
-5. **If still broken**, judge: is this a **SIMPLE FIX**? (see Definitions.)
-   - **NOT simple** → **ALERT THE HUMAN**: paste the traceback, your diagnosis, and
-     why it's beyond a simple fix. Do NOT edit code. Record it, stop.
-   - **Simple** → fix it, **max 5 distinct attempts total** for this `error_sig`
-     (track the count in `LOOPSTATE.fix_attempts[error_sig]` across ticks):
-       a. Make the **minimal** edit (one clear hypothesis).
-       b. Verify: `compileall` + the relevant test.
-       c. **Fixed** → `git add -A && git commit -m "loop: fix <error_sig>"`, relaunch
-          (§4a), report what you changed, then **try** `git push` (if blocked, say so
-          — the fix is already on the box's working tree so the run gets it; the
-          human pushes later). Done.
-       d. **Not fixed** → increment the counter, try a *different* hypothesis (never
-          repeat a failed edit). At 5 attempts → **ALERT THE HUMAN** with everything
-          you tried. Stop fixing; keep monitoring on later ticks.
-
-**4a. Relaunch after a fix** — resume from the crashed phase's latest checkpoint:
 ```bash
-export HF_TOKEN=<HF_TOKEN>
-nohup python3 scripts/train_h100.py --preset <PRESET> --phase <crashed_phase> \
-    --checkpoint "$(ls -t checkpoints/<crashed_phase>/*.pt | head -1)" --resume \
-    ${HF_REPO:+--hf-repo <HF_REPO>} > <LOG> 2>&1 &
-echo $! > <PIDFILE>
+nohup python3 scripts/train_h100.py --preset "$PRESET" --phase sft \
+  --checkpoint "$CHECKPOINT" --quality-gate-passed --save-dir "$SAVE_DIR" \
+  --hf-repo "$HF_REPO" > "$LOG" 2>&1 &
+echo $! > "$PIDFILE"
 ```
-⚠️ Resume is **coarse** (re-runs the current stage from its start, not the exact
-step). If the crash was **deep into an expensive stage** (e.g. >30% through the 33B
-frozen distill), the re-run wastes a lot of compute → **prefer to ALERT with the
-fix committed and ready**, and let the human decide whether to eat the re-run.
 
-### 5. LIVE ADJUSTMENTS (override file — apply a monitor recommendation)
-The trainers consume `training_state_override.json` once (then delete it). Keys:
-- `"lr"` (float) — any phase. e.g. halve a diverging Stage-3 lr.
-- `"kl_coeff"` (float) — GRPO, if monitor flags `kl > 0.5`.
-- `"thinking_length_weight"` (float) — GRPO, for overthinking / negative reward.
-- `"stop"` (bool) — end the current phase gracefully (saves, moves on).
+GRPO after a human-approved SFT gate:
+
+```bash
+nohup python3 scripts/train_h100.py --preset "$PRESET" --phase grpo \
+  --checkpoint "$CHECKPOINT" --quality-gate-passed --save-dir "$SAVE_DIR" \
+  --hf-repo "$HF_REPO" > "$LOG" 2>&1 &
+echo $! > "$PIDFILE"
+```
+
+Confirm the process is alive and the log shows the selected phase. During distillation,
+the log must report `CUDA Mamba2 kernel (fast binary)`.
+
+## Every tick
+
+```bash
+cd "$REPO_DIR"
+ALIVE=no; [ -f "$PIDFILE" ] && ps -p "$(cat "$PIDFILE")" >/dev/null 2>&1 && ALIVE=yes
+tail -n 30 "$LOG" 2>/dev/null
+python3 scripts/monitor.py
+nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu \
+  --format=csv,noheader
+df -h .
+```
+
+Choose one state:
+
+- **Running:** process alive. Check health, report, persist state, stop this tick.
+- **Selected phase complete:** log contains `all done. final model:` and the expected
+  checkpoint exists. Report the gate, persist state, and end the loop. Do not launch
+  the next phase.
+- **Stopped/crashed:** process dead without the completion line. Capture the traceback
+  and use the recovery rules below.
+- **Not launched:** run the preflight once. Never launch a second process if the PID is
+  merely stale or ambiguous.
+
+Health checks:
+
+- Loss is finite and not sustaining a sharp rise.
+- Step advances and GPU utilization is non-trivial.
+- Distillation remains on the fused Mamba2 backend.
+- At repair/validation checkpoints, the fixed-seed partial-noise ladder retains
+  `t≤0.9` recovery and improves `t≈1`; a lower scalar loss is not a substitute.
+- Checkpoints land atomically and disk remains below 90%.
+- In a single-process Stage 3, one OOM before progress may downshift batch and scale steps.
+  DDP aborts coherently on any OOM. Exact resume keeps the saved batch, so lowering batch means
+  a new run (or an explicitly lossy weight-only restart), not continuation of the exact state.
+- A stopped Stage 3 must have a fresh `distill_latest.pt` before the process exits.
+
+Suggested report:
+
+```text
+[14:20] phase=stage3a step=120480/503540 loss=4.21 trend=down
+gpu=92% mem=63/80GB disk=41% checkpoint=OK action=none
+```
+
+## Exact Stage-3 resume
+
+Resume only from a full distillation checkpoint, normally `distill_latest.pt`, using
+the same preset, optimizer, batch/backend, save directory, and data configuration:
+
+```bash
+nohup python3 scripts/train_h100.py --preset "$PRESET" --phase distill \
+  --stage3-optimizer "$OPTIMIZER" --checkpoint "$CHECKPOINT" --resume \
+  --save-dir "$SAVE_DIR" --hf-repo "$HF_REPO" > "$LOG" 2>&1 &
+echo $! > "$PIDFILE"
+```
+
+Exact resume restores model, optimizer, RNG, step, pinned data revisions, and the
+cumulative FineWeb cursor. Stage 3b continues after all Stage-3a batches; it does not
+restart the stream.
+
+If the checkpoint is legacy weights only, the code refuses exact resume. Do not add
+`--weights-only-resume` automatically. A human may explicitly choose this lossy path:
+
+```bash
+python3 scripts/train_h100.py --preset "$PRESET" --phase distill \
+  --stage3-optimizer "$OPTIMIZER" --checkpoint "$CHECKPOINT" --resume \
+  --weights-only-resume --save-dir "$SAVE_DIR"
+```
+
+That discards optimizer, RNG, step, and cursor and restarts the configured Stage-3 plan.
+
+SFT/GRPO interruption is different: there is no exact resume. Alert the human with the
+last input and output checkpoints. A restart begins that phase again from its input
+weights; do not claim continuity.
+
+## Recovery boundaries
+
+1. Capture the traceback and the last good checkpoint path.
+2. Run `python3 -m compileall -q src/dimba scripts` and the smallest relevant test.
+3. If the worktree is clean, check whether the remote already contains a fix. Do not
+   stash or overwrite unknown local work.
+4. Apply only a localized, understood fix; verify it before relaunching.
+5. Escalate architecture/loss changes, persistent divergence, CUDA/driver faults,
+   ambiguous state, or any costly restart.
+
+Never delete `final.pt`, `distill_latest.pt`, or `distill_stage3a.pt`. If disk exceeds
+90%, keep those files and only prune older, confirmed intermediate checkpoints.
+
+## Live overrides and stopping
+
+The trainer consumes one JSON override at a logging point:
+
 ```bash
 echo '{"lr": 1.0e-4}' > training_state_override.json
 ```
-Apply ONE change only when clearly warranted, and **report it**. Observe its effect
-next tick before changing anything else. These are reversible nudges; a code fix or
-a restart is NOT — those follow §4.
 
-### 6. GATES (decision points — surface to the human)
-- **COHERENCE GATE** — when `LOG` shows `distillation done → …/distill/final.pt`.
-  SFT/GRPO **cannot rescue an incoherent base**. With `PHASE=all`, SFT starts
-  automatically, so **ALERT NOW**: tell the human to sample a few continuations from
-  `distill/final.pt` (e.g. `scripts/generate.py` or `scripts/eval_vs_smollm.py`; the
-  checkpoint embeds its config, tokenizer = SmolLM) and decide: let SFT continue, or
-  write `{"stop": true}` to halt. Coherence is the human's call — you flag the moment.
-- **GRPO** — reward should trend up, KL stay < 0.5, mean think-blocks ≤ ~1.5
-  (monitor.py uses think>1.8, kl>0.5, reward<−0.2 as alarms). Relay its
-  recommendations and apply the safe ones via §5.
+Use one adjustment, report it, and wait for the next tick before another.
 
-### 7. REPORT (one concise block each tick)
+For a safe Stage-3 stop:
+
+```bash
+echo '{"stop": true}' > training_state_override.json
 ```
-[14:20] phase=stage3(frozen) step=120480/503540 (24%) loss=4.21 (↓ from 4.30)
-        gpu=92% mem=63/80GB ~45 steps/min ETA≈2.4h(stage) disk=41% ckpts=OK
-        ACTIONS: none | HEALTHY
+
+Wait for a new `distill_latest.pt`, the early-stop log line, and process exit. Resume it
+with the exact command above. The stop override only ends the current SFT substage or
+GRPO pass and does not create exact post-training state, so do not use it as a resumable
+phase-wide stop for SFT/GRPO.
+
+## Multi-GPU training
+
+Continuous Stage 3 supports one process per H100. Rank 0 alone runs alignment; every GPU keeps a
+frozen teacher replica, and preset step counts scale down by world size to retain the global token
+budget:
+
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/train_h100.py \
+  --preset validation --phase distill \
+  --save-dir checkpoints/h100-validation-8gpu
 ```
-Then any ALERTS with the exact remediation. If healthy + unchanged: one line.
 
-### 8. PERSIST + STOP
-- Write `LOOPSTATE` with the current `{situation, last_phase, last_step, last_loss,
-  last_ts, fix_attempts, launched}` for the next tick.
-- End the loop on **DONE** (`all done`) or when you've escalated a blocker and are
-  waiting on the human.
+The masked objective also supports DDP:
 
-### Definitions & autonomy boundaries (read carefully)
-- **SIMPLE FIX** (you MAY do, ≤5 tries): localized, obvious-cause, contained — a
-  traceback at one line (typo, wrong dict key, missing None-check, bad import / path
-  / CLI arg), a missing dependency (`pip install …`), a disk/permissions issue, a
-  stale checkpoint path. Reversible and fully understood.
-- **NOT SIMPLE** (ALWAYS escalate, never edit): the model architecture, the
-  loss/recipe/math, numerical divergence a single LR cut didn't fix, multi-file
-  refactors, CUDA/driver/hardware faults, or anything you don't fully understand.
-- **You MAY autonomously**: read logs/state, `nvidia-smi`/`df`/`ps`/`ls`/`grep`,
-  `git pull`, run tests, launch/relaunch training per §1.5/§4a, delete safe
-  intermediate checkpoints (§3F), write ONE override (§5), apply a simple verified
-  fix + commit locally (§4) — **except** a costly deep-stage re-run (escalate).
-- **You MUST escalate (alert, then wait)**: not-simple errors, 5 exhausted attempts,
-  persistent divergence, expensive deep-stage restarts, pushing to `main` (commit
-  locally and say so), VRAM < 70GB, and anything ambiguous on this expensive run.
-- Default disposition: **when unsure, alert — don't act.** A wrong autonomous action
-  can waste GPU-days; a missed alert just waits for the human.
+```bash
+PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
+  scripts/masked_diffusion_finetune.py \
+  --device cuda --batch 8 --accumulate 1 --optimizer adamw \
+  --output-dir checkpoints/masked-base-adamw
+```
 
-### Which preset (a note for the human, surfaced once)
-`full` = 50B is the real target but multi-day and costly. The recommended path is to
-run `validation` (~1B, a few hours / a few dollars) first as a recipe check vs run
-#1, then `scale` (~5B) as a go/no-go gate, THEN `full`. If you set `PRESET=full`
-without validating, this agent will still run it and will alert you at the coherence
-gate — but you're committing to the full cost up front.
+`--batch` is per GPU. Global batch is
+`batch × nproc-per-node × accumulate` (8 × 8 × 1 = 64 above). Rank 0 builds the shared
+cache once; all ranks must see and load that file (memory-mapped where supported). AdamW
+is the default; `--optimizer muon` is an opt-in pilot and must use a distinct `--output-dir`.
 
----
+Exact masked resume uses the same world size and trajectory flags:
 
-## Appendix — what was built so this loop works
-- `run_distill` writes `training_state.json` every log interval (via a trainer
-  `log_hook`), so `monitor.py` works during the 50B distill, not just SFT/GRPO.
-- The trainers consume `training_state_override.json` (lr / kl_coeff /
-  thinking_length_weight / stop), applied once then deleted; `_override_set_lr` also
-  rewrites the LambdaLR `base_lrs` so an lr override sticks in SFT/GRPO.
-- Tests: `tests/test_override.py` and two `log_hook` tests in `test_distillation.py`.
+```bash
+PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
+  scripts/masked_diffusion_finetune.py \
+  --device cuda --batch 8 --accumulate 1 --optimizer adamw \
+  --output-dir checkpoints/masked-base-adamw \
+  --resume checkpoints/masked-base-adamw/mdm_latest.pt
+```
+
+The checkpoint validates world size, per-GPU batch, accumulation, optimizer, seed,
+planned steps, and data signature, and restores each rank's RNG plus epoch/batch cursor.
+`scripts/mdm_sft_cfg2.py` follows the same DDP and exact-resume contract.
+Single-node DDP is tested. Multi-node is not yet validated and additionally requires
+the cache/checkpoint path to be shared identically across nodes.
+
+## Persist and stop
+
+Write `<LOOPSTATE>` with situation, phase, step, loss, timestamp, checkpoint, and any
+action. Then stop the tick. End the loop when the selected phase completes, when a
+human decision is required, or when a blocker is escalated. If there is no action,
+report healthy state and stop; do not invent work.

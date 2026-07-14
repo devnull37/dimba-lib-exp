@@ -35,6 +35,8 @@ dependencies = [
     "omegaconf>=2.3.0",
     "tqdm>=4.65.0",
     "tokenizers>=0.13.0",
+    "textual>=0.47.0",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +44,7 @@ mamba = ["mamba-ssm>=2.2.0"]
 gpu = [
     "mamba-ssm>=2.2.0",
     "causal-conv1d>=1.4.0",
+    "liger-kernel>=0.8.0",
 ]
 eval = [
     "sacrebleu>=2.3.1",

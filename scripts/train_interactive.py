@@ -223,26 +223,28 @@ PRESETS = {
 
     'mps-small': {
         'name': 'Apple Silicon MPS (Small Model)',
-        'description': 'Optimized for Apple Silicon Macs (M1/M2/M3)',
+        'description': 'FP32 latent-diffusion recipe for Apple Silicon Macs',
         'model': {
-            'd_model': 768,
-            'd_prompt': 768,
+            'd_model': 256,
+            'd_prompt': 128,
             'num_diffusion_steps': 1000,
-            'num_denoiser_layers': 8,
-            'd_state': 32,
+            'num_denoiser_layers': 4,
+            'd_state': 16,
             'd_conv': 4,
             'expand': 2,
-            'conditioning_type': 'film',
+            'conditioning_type': 'adaln',
             'dropout': 0.1,
             'use_weight_tying': True,
+            'latent_diffusion': True,
+            'd_latent': 128,
         },
         'data': {
             'type': 'huggingface',
-            'dataset_name': 'HuggingFaceFW/fineweb',
-            'dataset_config': 'sample-10BT',
-            'batch_size': 8,
-            'max_length': 512,
-            'num_workers': 4,
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-2-raw-v1',
+            'batch_size': 4,
+            'max_length': 128,
+            'num_workers': 0,
             'streaming': False,
         },
         'training': {
@@ -1460,9 +1462,11 @@ def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int], gpus
         model_config=model_config,
         learning_rate=float(train_cfg['learning_rate']),
         warmup_steps=int(train_cfg['warmup_steps']),
+        weight_decay=float(train_cfg.get('weight_decay', 0.01)),
         ema_decay=float(train_cfg.get('ema_decay', 0.9999)),
         use_ema=train_cfg.get('use_ema', True),
         ema_device=train_cfg.get('ema_device', 'cpu'),
+        optimizer=str(train_cfg.get('optimizer', 'adamw')),
     )
 
     total_params = sum(p.numel() for p in lightning_module.model.parameters())
@@ -1539,7 +1543,6 @@ def run_dimba_training(config: dict, num_gpus: int, gpu_indices: list[int], gpus
     except KeyboardInterrupt:
         print("\n⚠️ Training interrupted by user")
         print(f"Last checkpoint: {checkpoint_callback.last_model_path}")
-        print("\nTo resume, run: python scripts/train_interactive.py --resume")
     except Exception as e:
         print(f"\n❌ Training failed: {e}")
         raise
@@ -1570,8 +1573,6 @@ Examples:
   # Train both VAE and DIMBA
   python scripts/train_interactive.py --train-mode both
 
-  # Resume training
-  python scripts/train_interactive.py --resume
         """
     )
     parser.add_argument('--train-mode', type=str, 

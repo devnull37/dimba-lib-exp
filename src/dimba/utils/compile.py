@@ -14,7 +14,7 @@ import warnings
 import torch
 import torch.nn as nn
 
-__all__ = ["maybe_compile"]
+__all__ = ["maybe_compile", "maybe_compile_fn"]
 
 
 def maybe_compile(
@@ -61,3 +61,50 @@ def maybe_compile(
             stacklevel=2,
         )
         return module
+
+
+def maybe_compile_fn(fn, *, enable: bool = True, dynamic=None, mode=None):
+    """``torch.compile`` for plain functions, safe on any device.
+
+    Unlike :func:`maybe_compile` this does not gate on CUDA: torch >= 2.7 ships
+    inductor backends for MPS and CPU too, so the elementwise glue around a
+    sampling loop (masking, schedule math, penalties) is worth fusing anywhere.
+
+    ``dynamic=None`` (the default) lets dynamo auto-detect dynamic shapes,
+    which is the only mode that currently works on the MPS inductor backend;
+    on CUDA pass ``dynamic=True`` to skip the recompile-then-generalize dance.
+
+    torch.compile is lazy, so failures surface at the first *call*, not here.
+    The returned wrapper catches any error from the compiled variant, warns
+    once, and falls back to the eager ``fn`` permanently. It never raises.
+    """
+    if not enable or not hasattr(torch, "compile"):
+        return fn
+
+    try:
+        compiled = torch.compile(fn, dynamic=dynamic, mode=mode)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        warnings.warn(
+            f"maybe_compile_fn: torch.compile failed ({exc!r}); using eager fn.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return fn
+
+    state = {"broken": False}
+
+    def wrapper(*args, **kwargs):
+        if state["broken"]:
+            return fn(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as exc:
+            state["broken"] = True
+            warnings.warn(
+                f"maybe_compile_fn: compiled call failed ({exc!r}); "
+                "falling back to eager permanently.",
+                RuntimeWarning,
+            )
+            return fn(*args, **kwargs)
+
+    return wrapper

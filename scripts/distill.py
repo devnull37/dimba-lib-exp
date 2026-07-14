@@ -58,6 +58,7 @@ from dimba.distillation import (  # noqa: E402
     DistillationConfig,
     LayerMap,
 )
+from dimba.utils.checkpointing import atomic_torch_save  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +315,7 @@ def main() -> None:
         "model_state_dict": model.state_dict(),
         "config": model.config,
     }
-    torch.save(checkpoint, ckpt_path)
+    atomic_torch_save(checkpoint, ckpt_path)
     print(f"\nCheckpoint saved to: {ckpt_path}")
 
     # Also save a copy of the run config alongside the checkpoint.

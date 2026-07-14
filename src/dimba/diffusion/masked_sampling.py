@@ -26,14 +26,24 @@ Algorithm (conditional generation done right)
 
 from __future__ import annotations
 
+import inspect
 import math
 from typing import Callable, Optional
 
 import torch
-import torch.nn.functional as F
 
 # predict_logits(ids: [batch, seq] long, t: float) -> logits: [batch, seq, vocab]
-PredictLogits = Callable[[torch.Tensor, float], torch.Tensor]
+PredictLogits = Callable[..., torch.Tensor]
+
+
+def _max_softmax_confidence(logits: torch.Tensor):
+    """Return argmax probability in fp32 without materializing full probabilities."""
+    # Native bf16/fp16 logsumexp loses enough precision to reorder confidence-ranked
+    # positions. The sampler's reveal trajectory is accuracy-sensitive, so perform
+    # both reductions in fp32 while still avoiding a second [B, K, vocab] softmax.
+    values = logits.float()
+    max_logits, pred_ids = values.max(dim=-1)
+    return (max_logits - torch.logsumexp(values, dim=-1)).exp(), pred_ids
 
 
 def _unmask_count_schedule(gen_len: int, num_steps: int) -> list[int]:
@@ -57,7 +67,7 @@ def _unmask_count_schedule(gen_len: int, num_steps: int) -> list[int]:
     return [base + (1 if i < remainder else 0) for i in range(num_steps)]
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def masked_diffusion_sample(
     predict_logits: PredictLogits,
     prompt_ids: torch.Tensor,
@@ -76,6 +86,8 @@ def masked_diffusion_sample(
             ``ids`` is ``[batch, prompt_len + gen_len]`` (long) and ``t`` is the
             current scalar timestep in ``(0, 1]`` (``1`` fully masked, ``-> 0``
             clean). Must return logits ``[batch, prompt_len + gen_len, vocab]``.
+            Callables exposing a ``positions=[B,K]`` parameter automatically use
+            DIMBA's selected-projection fast path and return ``[B,K,vocab]``.
         prompt_ids: Conditioning prompt ids ``[batch, prompt_len]`` (long). Kept
             fixed and unmasked throughout (correct conditional generation).
         gen_len: Number of response tokens to generate (appended after prompt).
@@ -114,25 +126,43 @@ def masked_diffusion_sample(
     response_masked = torch.ones((batch, gen_len), dtype=torch.bool, device=device)
 
     reveal_schedule = _unmask_count_schedule(gen_len, num_steps)
+    try:
+        selected_projection = not remask and "positions" in inspect.signature(
+            predict_logits
+        ).parameters
+    except (TypeError, ValueError):
+        selected_projection = False
+    active_positions = (
+        torch.arange(prompt_len, total_len, device=device).unsqueeze(0).expand(batch, -1)
+    )
+    n_active = gen_len
+    n_committed = 0
 
     for step in range(num_steps):
         # Continuous time goes 1 -> ~0 across steps (fully masked -> clean).
         t = 1.0 - step / num_steps
         t = max(t, 1e-3)
 
-        logits = predict_logits(ids, t)  # [batch, total_len, vocab]
-        resp_logits = logits[:, prompt_len:, :]  # [batch, gen_len, vocab]
+        if selected_projection:
+            # The denoiser still sees the complete sequence; only its final, expensive
+            # hidden-to-vocabulary projection is gathered to unresolved positions.
+            resp_logits = predict_logits(ids, t, positions=active_positions)
+        else:
+            logits = predict_logits(ids, t)  # [batch, total_len, vocab]
+            resp_logits = logits[:, prompt_len:, :]  # [batch, gen_len, vocab]
 
         if temperature != 1.0 and temperature > 0:
             resp_logits = resp_logits / temperature
 
-        probs = F.softmax(resp_logits, dim=-1)
-        confidence, pred_ids = probs.max(dim=-1)  # both [batch, gen_len]
+        confidence, pred_ids = _max_softmax_confidence(resp_logits)
 
-        # Only consider currently-masked response positions for unmasking;
-        # set confidence of already-committed positions to -inf so they are not
-        # re-selected by the top-k below.
-        select_conf = confidence.masked_fill(~response_masked, float("-inf"))
+        # The selected path contains only unresolved positions. The generic path
+        # masks committed positions out of the confidence ranking.
+        select_conf = (
+            confidence
+            if selected_projection
+            else confidence.masked_fill(~response_masked, float("-inf"))
+        )
 
         # Number of positions to reveal this step.
         n_reveal = reveal_schedule[step]
@@ -140,7 +170,30 @@ def masked_diffusion_sample(
         if step == num_steps - 1:
             n_reveal = gen_len
 
-        if n_reveal > 0:
+        if selected_projection and n_reveal > 0:
+            k = min(n_reveal, n_active)
+            reveal_local = torch.topk(select_conf, k=k, dim=1).indices
+            reveal_positions = active_positions.gather(1, reveal_local)
+            reveal_tokens = pred_ids.gather(1, reveal_local)
+            ids.scatter_(1, reveal_positions, reveal_tokens)
+            response_masked.scatter_(1, reveal_positions - prompt_len, False)
+
+            n_remaining = n_active - k
+            if n_remaining > 0:
+                remaining_conf = select_conf.scatter(
+                    1,
+                    reveal_local,
+                    torch.full_like(reveal_local, float("inf"), dtype=select_conf.dtype),
+                )
+                keep_local = torch.topk(
+                    remaining_conf, k=n_remaining, dim=1, largest=False
+                ).indices
+                active_positions = active_positions.gather(1, keep_local)
+            else:
+                active_positions = active_positions[:, :0]
+            n_active = n_remaining
+            n_committed += k
+        elif n_reveal > 0:
             # Per-row top-k highest-confidence masked positions.
             k = min(n_reveal, gen_len)
             topk = torch.topk(select_conf, k=k, dim=1).indices  # [batch, k]
@@ -153,11 +206,11 @@ def masked_diffusion_sample(
             new_resp = torch.where(reveal_mask, pred_ids, new_resp)
             ids[:, prompt_len:] = new_resp
             response_masked &= ~reveal_mask
+            n_committed += min(k, gen_len - n_committed)
 
         # Optional low-confidence remasking (skip on the final step).
         if remask and remask_fraction > 0 and step < num_steps - 1:
             committed = ~response_masked  # [batch, gen_len]
-            n_committed = int(committed.sum(dim=1).max().item())
             n_remask = int(math.floor(remask_fraction * n_committed))
             if n_remask > 0:
                 # Lowest confidence among committed positions -> re-mask.
@@ -174,13 +227,9 @@ def masked_diffusion_sample(
                     ids[:, prompt_len:],
                 )
                 response_masked |= remask_sel
+                n_committed -= min(n_remask, n_committed)
 
-    # Safety: if any position is somehow still masked, fill from a final pass.
-    if response_masked.any():
-        logits = predict_logits(ids, 1e-3)
-        pred_ids = logits[:, prompt_len:, :].argmax(dim=-1)
-        ids[:, prompt_len:] = torch.where(
-            response_masked, pred_ids, ids[:, prompt_len:]
-        )
+        if not remask and n_committed == gen_len:
+            break
 
     return ids[:, prompt_len:]
