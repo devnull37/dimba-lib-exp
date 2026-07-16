@@ -89,6 +89,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Native checkpoint with strict model_state_dict + config loading.",
     )
 
+    parser.add_argument(
+        "--preset",
+        choices=("production",),
+        help="Named workload shape. 'production' is the interactive CLI shape "
+        "the docs/benchmarks.md Test D latency numbers come from: batch 1, "
+        "prompt 10, 40 generated tokens, 128 steps. Only overrides shape "
+        "flags left at their defaults.",
+    )
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--vocab-size", type=int, default=49_152)
     parser.add_argument("--d-model", type=int, default=576)
@@ -113,9 +121,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=("default", "reduce-overhead", "max-autotune"),
         default="reduce-overhead",
     )
+    parser.add_argument(
+        "--no-graph",
+        action="store_false",
+        dest="graph",
+        help="Disable CUDA-graph capture of the masked-inference feature pass "
+        "(the graphed variant is the promotable optimized arm by default).",
+    )
+    parser.set_defaults(graph=True)
     parser.add_argument("--parity-rtol", type=float, default=2e-2)
     parser.add_argument("--parity-atol", type=float, default=2e-2)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.preset == "production":
+        # Interactive-CLI latency shape (docs/benchmarks.md Test D). Explicit
+        # shape flags win over the preset.
+        defaults = parser.parse_args([])
+        for name, value in (
+            ("inference_batch_size", 1),
+            ("prompt_len", 10),
+            ("seq_len", 50),
+            ("steps", 128),
+        ):
+            if getattr(args, name) == getattr(defaults, name):
+                setattr(args, name, value)
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -726,7 +755,9 @@ def _cold_compile(
     }
 
 
-def _make_masked_predictors(model, mask_id: int, prompt_len: int, guidance: float):
+def _make_masked_predictors(
+    model, mask_id: int, prompt_len: int, guidance: float, graph: bool = False
+):
     def baseline(ids: torch.Tensor, t):
         unconditional = ids.clone()
         unconditional[:, :prompt_len] = mask_id
@@ -734,17 +765,32 @@ def _make_masked_predictors(model, mask_id: int, prompt_len: int, guidance: floa
         unconditional_logits = model.predict_token_logits(unconditional, t).float()
         return unconditional_logits + guidance * (conditional_logits - unconditional_logits)
 
-    def optimized(ids: torch.Tensor, t, positions: Optional[torch.Tensor] = None):
+    def guided_features(ids: torch.Tensor, t):
         unconditional = ids.clone()
         unconditional[:, :prompt_len] = mask_id
         features = model.predict_token_features(torch.cat((ids, unconditional), dim=0), t)
         conditional_features, unconditional_features = features.chunk(2, dim=0)
-        guided = unconditional_features + guidance * (
+        return unconditional_features + guidance * (
             conditional_features - unconditional_features
         )
-        return model.project_token_features(guided, positions=positions).float()
 
-    return baseline, optimized
+    graph_handle = None
+    if graph:
+        from dimba.utils.cuda_graphs import GraphedFn
+
+        graph_handle = GraphedFn(guided_features)
+
+    features_fn = graph_handle if graph_handle is not None else guided_features
+
+    def optimized(ids: torch.Tensor, t, positions: Optional[torch.Tensor] = None):
+        # 0-d device tensor: a Python float would be baked into a captured
+        # graph (or trigger a per-t recompile under torch.compile).
+        t_dev = t if torch.is_tensor(t) else torch.tensor(float(t), device=ids.device)
+        return model.project_token_features(
+            features_fn(ids, t_dev), positions=positions
+        ).float()
+
+    return baseline, optimized, graph_handle
 
 
 def run_masked_inference(
@@ -758,8 +804,11 @@ def run_masked_inference(
     generated = args.seq_len - args.prompt_len
     mask_id = args.vocab_size - 1
     prompt = torch.randint(0, mask_id, (batch, args.prompt_len), device=device)
-    baseline_predict, optimized_predict = _make_masked_predictors(
-        model, mask_id, args.prompt_len, args.guidance_scale
+    # --compile runs are diagnostic-only; tracing over a graph-replay callable
+    # is incoherent, so compile requests force the eager optimized arm.
+    use_graph = bool(args.graph and device.type == "cuda" and not args.compile)
+    baseline_predict, optimized_predict, graph_handle = _make_masked_predictors(
+        model, mask_id, args.prompt_len, args.guidance_scale, graph=use_graph
     )
 
     def sample(predict):
@@ -806,11 +855,23 @@ def run_masked_inference(
     units = batch * generated
     _add_throughput(baseline_metrics, units, "generated_tokens_per_second")
     _add_throughput(optimized_metrics, units, "generated_tokens_per_second")
+    optimized_variant = "selected_unresolved_projection_one_batched_cfg_pass"
+    if use_graph:
+        optimized_variant += "_cuda_graph_replay"
     result: Dict[str, Any] = {
         "name": "masked-inference",
         "kind": "end_to_end",
         "baseline_variant": "full_sequence_vocab_projection_two_sequential_cfg_passes",
-        "optimized_variant": "selected_unresolved_projection_one_batched_cfg_pass",
+        "optimized_variant": optimized_variant,
+        "cuda_graph": {
+            "requested": use_graph,
+            "captured_graphs": (
+                graph_handle.captured_graphs if graph_handle is not None else 0
+            ),
+            "eager_fallback": (
+                graph_handle.eager_fallback if graph_handle is not None else None
+            ),
+        },
         "shape": {
             "batch": batch,
             "prompt": args.prompt_len,

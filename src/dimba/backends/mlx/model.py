@@ -47,6 +47,25 @@ __all__ = ["MLXDIMBA"]
 
 _NO_MLX = "MLX not installed (pip install mlx, Apple Silicon only)."
 
+# Schedule tables and the logit temperature stay fp32 under half-precision
+# weight casts: tiny tensors, high numerical leverage.
+_KEEP_FP32 = {"acp", "sqrt_acp", "sqrt_om", "logit_scale"}
+
+
+def _compiled_batch_ceiling() -> Optional[int]:
+    """Max rows per compiled feature call (the mlx 0.29.x NaN workaround).
+
+    mlx 0.29.3 (the py3.9 cap) produces NaNs for the release model's unguarded
+    compiled graph at batch 4/8; two-row chunks stay finite. Fixed upstream:
+    on mlx >= 0.30 the ceiling lifts (the batch-4 case in
+    tests/test_mlx_masked_parity.py re-runs the repro on every version bump).
+    """
+    try:
+        parts = tuple(int(x) for x in mx.__version__.split(".")[:2])
+    except Exception:  # pragma: no cover - unparseable dev version
+        return 2
+    return None if parts >= (0, 30) else 2
+
 
 def _to_mx(t) -> "mx.array":
     arr = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
@@ -136,17 +155,26 @@ class MLXDIMBA:
         )
         self.mixers_fwd: List[MLXMamba2Mixer] = [mk() for _ in range(self.num_layers)]
         self.mixers_bwd: List[MLXMamba2Mixer] = [mk() for _ in range(self.num_layers)]
+        self._batch_ceiling = _compiled_batch_ceiling()
         # Plain-array parameters (filled by from_torch).
         self.p: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------ loading
     @classmethod
-    def from_torch(cls, torch_model) -> "MLXDIMBA":
+    def from_torch(cls, torch_model, dtype=None) -> "MLXDIMBA":
         """Build from a constructed PyTorch ``DIMBA`` (weights copied to MLX).
 
         Supports both v1 (film/x0) and v2 (adaln/v-pred/head-norm/latent-norm/
         self-conditioning/attn-head) configs. Only ``noise_dist != gaussian`` and
         ``bidirectional=False`` remain unsupported.
+
+        ``dtype`` (e.g. ``mx.float16``): store weights and run activations in
+        half precision. M-series inference at small batch is memory-bandwidth
+        bound, so halving the weight bytes is a direct latency win. The SSD
+        scan's log-decay math, the schedule tables, SSM time constants
+        (``A_log``/``dt_bias``), and the sampling confidence softmax stay fp32.
+        Quality-affecting: exact logit parity with the fp32 path does not hold;
+        gate on argmax agreement. Default ``None`` keeps everything fp32.
         """
         cfg = dict(torch_model.config)
         _unsupported = []
@@ -310,8 +338,39 @@ class MLXDIMBA:
             p["proj_w"] = _to_mx(g("output_head.projection.weight"))
             p["proj_b"] = _to_mx(g("output_head.projection.bias"))
 
+        if dtype is not None:
+            self._cast_weights(dtype)
         mx.eval([v for v in p.values() if isinstance(v, mx.array)])
         return self
+
+    def _cast_weights(self, dtype) -> None:
+        """Cast float weights to ``dtype``, keeping the fp32 islands (see
+        :meth:`from_torch`)."""
+        float_dtypes = (mx.float32, mx.float16, mx.bfloat16)
+
+        def cast(v):
+            if isinstance(v, mx.array) and v.dtype in float_dtypes:
+                return v.astype(dtype)
+            return v
+
+        for key, value in self.p.items():
+            if key in _KEEP_FP32:
+                continue
+            if isinstance(value, list):
+                self.p[key] = [
+                    {k: cast(a) for k, a in item.items()}
+                    if isinstance(item, dict)
+                    else cast(item)
+                    for item in value
+                ]
+            else:
+                self.p[key] = cast(value)
+        for mixer in (*self.mixers_fwd, *self.mixers_bwd):
+            mixer.set_dtype(dtype)
+            # Time constants feed exp/softplus inside the scan: keep fp32.
+            mixer.A_log = mixer.A_log.astype(mx.float32)
+            mixer.dt_bias = mixer.dt_bias.astype(mx.float32)
+            mx.eval(mixer.parameters())
 
     # ------------------------------------------------------------------ pieces
     def _timestep_emb(self, t_idx):
@@ -621,21 +680,27 @@ class MLXDIMBA:
         )
 
     def predict_token_features(self, ids, t) -> "mx.array":
-        """Masked-diffusion features with the vocabulary projection left undone."""
+        """Masked-diffusion features with the vocabulary projection left undone.
+
+        Returns a lazy array: callers (sampler step, projection, gap score)
+        evaluate once per step so the whole step is a single fused graph
+        instead of two.
+        """
         ids = self._as_mx_ids(ids)
         t_idx = self._masked_timestep_index(t)
-        # ponytail: mlx 0.29.3 (py3.9 cap) produces NaNs for the release model's
-        # unguarded compiled graph at batch 4/8; two-row chunks stay finite. Keep
-        # this ceiling until Python >= 3.10 and current MLX are supported.
-        features = mx.concatenate(
+        ceiling = self._batch_ceiling
+        if ceiling is None or ids.shape[0] <= ceiling:
+            return self._predict_token_features_batch(ids, t_idx)
+        # ponytail: mlx 0.29.x (py3.9 cap) produces NaNs for the release model's
+        # unguarded compiled graph at batch 4/8; two-row chunks stay finite. The
+        # ceiling lifts automatically on mlx >= 0.30 (_compiled_batch_ceiling).
+        return mx.concatenate(
             [
-                self._predict_token_features_batch(ids[i : i + 2], t_idx)
-                for i in range(0, ids.shape[0], 2)
+                self._predict_token_features_batch(ids[i : i + ceiling], t_idx)
+                for i in range(0, ids.shape[0], ceiling)
             ],
             axis=0,
         )
-        mx.eval(features)
-        return features
 
     def guided_token_logits(
         self,
@@ -668,6 +733,9 @@ class MLXDIMBA:
         features = self.predict_token_features(paired, t).reshape(
             ids.shape[0], 2, ids.shape[1], -1
         )
+        # Combine in fp32: guidance amplifies the cond/uncond difference, which
+        # is the worst case for half precision. No-op for fp32 models.
+        features = features.astype(mx.float32)
         combined = features[:, 1] + guidance * (features[:, 0] - features[:, 1])
         return self._project_token_features(combined, positions)
 
@@ -761,11 +829,18 @@ class MLXDIMBA:
         guidance: float = 2.0,
         seed: Optional[int] = None,
         on_step=None,
+        commit_threshold: Optional[float] = None,
     ) -> np.ndarray:
         """Run the complete MaskGIT trajectory on MLX and return only final IDs.
 
         ``on_step`` is the sole progress-snapshot escape hatch. Without it, the
         trajectory performs no MLX -> NumPy/Torch conversion between steps.
+
+        ``commit_threshold`` (quality-affecting, off by default) additionally
+        commits any sampled token whose confidence exceeds the threshold even
+        when the cosine schedule would remask it, stopping as soon as every
+        position is committed. The loop already evaluates per step, so the
+        extra scalar readback is effectively free here.
         """
         prompt_ids = np.asarray(prompt_ids, dtype=np.int32)
         if prompt_ids.ndim != 2:
@@ -809,6 +884,9 @@ class MLXDIMBA:
                 guidance,
                 positions,
             )
+            # Sampling/confidence math in fp32 regardless of model dtype
+            # (mirrors the torch sampler's .float(); no-op for fp32 models).
+            logits = logits.astype(mx.float32)
             committed = (~still) & response_mask
             counts = mx.zeros((batch, self.vocab_size), dtype=logits.dtype)
             counts = counts.at[batch_index, ids].add(committed.astype(logits.dtype))
@@ -834,6 +912,13 @@ class MLXDIMBA:
             ids = mx.put_along_axis(ids, positions, sampled.astype(ids.dtype), axis=1)
 
             n_keep = int(gen_len * math.cos(math.pi / 2 * (step + 1) / steps))
+            if commit_threshold is not None and n_keep > 0:
+                # Keep masked only what is BOTH scheduled to stay masked and
+                # still low-confidence (mirrors scripts/generate.py).
+                n_low = int(
+                    mx.max((confidence <= commit_threshold).sum(axis=1)).item()
+                )
+                n_keep = min(n_keep, n_low)
             if n_keep > 0:
                 keep_local = mx.argpartition(confidence, n_keep - 1, axis=1)[:, :n_keep]
                 positions = mx.take_along_axis(positions, keep_local, axis=1)

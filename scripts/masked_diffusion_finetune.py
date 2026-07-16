@@ -174,6 +174,11 @@ def parse_args(argv=None):
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=DEVICE)
     ap.add_argument("--workers", type=int, default=2, help="data-loader workers per process")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the denoiser forward (CUDA only): fuses "
+                         "the norm/AdaLN/FFN/flip glue between the fused "
+                         "mamba_ssm kernels; the data-dependent masked loss "
+                         "stays eager")
     ap.add_argument("--local-rank", "--local_rank", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args(argv)
@@ -228,6 +233,18 @@ def _run(args, context):
     dtype = torch.bfloat16 if context.device.type == "cuda" else torch.float32
     model = model.to(device=context.device, dtype=dtype)
     del sd
+
+    if args.compile and context.device.type == "cuda":
+        # Compile only the backbone forward: `features[target_mask]` in the
+        # loss is data-dependent and would recompile every step, so the loss
+        # math stays eager. dynamic=False: training shapes are fixed
+        # ([batch, SEQ_LEN]), and static shapes give inductor the best kernels.
+        model.predict_token_features = torch.compile(
+            model.predict_token_features, dynamic=False
+        )
+        if context.is_main:
+            print("torch.compile: denoiser forward compiled (dynamic=False)",
+                  flush=True)
 
     data_id = f"fineweb_{args.skip_docs}_{args.docs}_{SEQ_LEN}"
     cache = f"{args.output_dir}/data/{data_id}.pt"

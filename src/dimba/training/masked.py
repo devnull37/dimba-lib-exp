@@ -71,8 +71,15 @@ def masked_token_loss(
     inverse_t_weight: bool = True,
     neighbor_unlikelihood_weight: float = 0.0,
     fused_ce_mode: str = "auto",
+    ce_chunk_tokens: Optional[int] = 2048,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Compute CE only where tokens are masked, without a full ``[B,L,V]`` tensor."""
+    """Compute CE only where tokens are masked, without a full ``[B,L,V]`` tensor.
+
+    ``ce_chunk_tokens`` additionally chunks the selected-token vocabulary
+    projection + CE so the ``[masked_tokens, vocab]`` logits are never retained
+    for backward (identical math and per-token gradients; see
+    :func:`dimba.training.fused_ce.output_head_cross_entropy`). ``None``
+    restores the single-shot projection."""
     if fused_ce_mode not in {"auto", "on", "off"}:
         raise ValueError("fused CE mode must be 'auto', 'on', or 'off'")
     if fused_ce_mode == "on":
@@ -101,6 +108,7 @@ def masked_token_loss(
             reduction="none",
             mode=fused_ce_mode,
             uniform_reduction=False,
+            chunk_tokens=ce_chunk_tokens,
         )
 
     sample_ids = torch.arange(batch, device=target_ids.device)[:, None].expand(batch, length)

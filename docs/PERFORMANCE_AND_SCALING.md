@@ -40,13 +40,54 @@ numbers and should not be read as benchmarks of the current tree.
 - Best-of-N verification is batched instead of calling the model once per candidate.
 - MLX masked sampling now keeps the whole trajectory on the Apple GPU, uses selected projection,
   batches CFG, and converts to host memory once at the end. MLX 0.29's batch-3+ NaN workaround uses
-  stable two-row chunks without changing token results.
+  stable two-row chunks without changing token results. The two-row ceiling is version-gated and
+  lifts automatically on MLX >= 0.30 (the batch-4 parity test re-runs the NaN repro on every
+  version bump); the per-step interior `mx.eval` was removed so each step evaluates one fused graph.
+- **CUDA-graph capture (new, default on for CUDA):** the sampler's backbone forward has a constant
+  input shape across the whole trajectory, so `scripts/generate.py` captures the batched-CFG
+  feature pass as one `torch.cuda.CUDAGraph` per shape (`dimba/utils/cuda_graphs.py`) and replays
+  it each step; the shape-varying selected vocabulary projection stays eager. This targets the
+  dominant cost at interactive shapes: per-step Python dispatch plus ~1000 kernel launches for
+  single-digit-ms of GPU compute. Capture failures fall back to eager permanently and are recorded
+  by the benchmark (`cuda_graph.captured_graphs` / `eager_fallback`). Disable with `--no-graph`.
+  Exact-token parity is expected (replay runs identical kernels) and gated by
+  `scripts/benchmark_h100.py`, whose masked-inference optimized arm is now the graphed variant;
+  `--preset production` reproduces the docs/benchmarks.md Test D shape (batch 1, prompt 10,
+  40 generated tokens, 128 steps).
+- **Confidence-threshold commits (new, opt-in, quality-affecting):** `--commit-threshold TAU`
+  commits any sampled token whose confidence exceeds TAU ahead of the cosine remask schedule and
+  stops as soon as every position is committed. The cosine schedule only reaches zero keeps on the
+  final couple of steps, so stock runs always pay all steps; latency is measured-linear in steps
+  (2.23 s @ 21 vs 13.33 s @ 128). Gate on the quality probes (docs/benchmarks.md tests A-C), not
+  token parity. Also wired into the MLX sampler.
+- **Adaptive CFG truncation (new, opt-in, quality-affecting):** `--cfg-drop FRAC` drops the
+  unconditional CFG row once FRAC of response tokens are committed, halving tail-step model FLOPs.
+  Only meaningful once the loop is compute-bound (i.e. after CUDA graphs land); quality-gated.
+- **MLX half precision (new, opt-in):** `--mlx-dtype fp16|bf16` stores weights/activations in half
+  precision with fp32 islands (SSD scan log-decay math, schedule tables, `A_log`/`dt_bias`,
+  CFG combine, confidence softmax). Measured on M1 Pro at the production interactive shape
+  (batch 1, gen 40, 32 steps, random nano-shaped weights): **1.01x** - the MLX path is
+  dispatch-bound at this size, not bandwidth-bound, so half precision is roughly latency-neutral
+  today. Kept as an opt-in for larger batches/models; exact logit parity does not hold (argmax
+  agreement is the gate, >= 95% on the parity config).
 
 ### Training
 
 - Masked training corrupts and selects tokens on device and materializes `[active_tokens, vocab]`
   rather than `[batch, sequence, vocab]`. The weighted masked objective remains the exact native
   PyTorch loss.
+- **Chunked selected-token CE (new, default on):** the `[active_tokens, vocab]` logits are no
+  longer retained for backward. `masked_token_loss` computes the projection + CE in 2048-token
+  chunks through a custom autograd function (`dimba/training/fused_ce.py:_ChunkedLinearCE`) that
+  recomputes each chunk's logits in backward: identical ops, exact per-token `1/t` gradients,
+  weight/bias/scale grads accumulated across chunks in fp32. At batch 64 x 512 x 49k vocab this
+  frees roughly the full bf16 logits tensor (~1.6 GB) of activation memory per microbatch - use it
+  to raise `--batch`. `ce_chunk_tokens=None` restores the single-shot projection.
+- **`--compile` on the training launchers (new, opt-in, CUDA):** `masked_diffusion_finetune.py`
+  and `mdm_sft_cfg2.py` can `torch.compile` the denoiser forward (`predict_token_features`,
+  `dynamic=False`) to fuse the norm/AdaLN/FFN/flip glue between the fused mamba_ssm kernels. The
+  data-dependent masked loss stays eager so it never recompiles. Verify with the printed tok/s
+  line and a ~500-step loss overlay vs eager (statistical, not bitwise, parity).
 - Optional Liger fused linear cross-entropy is used only for mathematically compatible uniform
   continuous `mean`/`sum` reductions. Weighted, masked, response-only, time-faded, and
   unlikelihood losses stay on the exact selected-token path because Liger's unreduced backward
@@ -166,6 +207,11 @@ That is a measured **12.9% latency reduction**, with identical final argmax toke
 paired local measurement, not a multi-run H100 result. Older CPU/MPS/MLX tables in
 [BACKENDS.md](BACKENDS.md) use different models and recipes and are retained as historical context.
 
+A follow-up M1 Pro measurement of `--mlx-dtype fp16` (nano-shaped random weights, batch 1,
+gen 40, 32 steps, CFG 2.0, 3-run median): **1.01x vs fp32** with 100% token agreement on that
+run. At interactive shapes the MLX path is dispatch-bound, so half-precision weights are
+latency-neutral today; the flag is kept for larger batches/models.
+
 ### Muon pilot
 
 The controlled 2,000-step masked-continuation pilot ended at CE **5.453 for Muon vs 5.470 for
@@ -192,6 +238,8 @@ Use these ranges for capacity planning only:
 
 | Scope | Expected improvement | Basis |
 |---|---:|---|
+| CUDA-graph replay of the sampler backbone (batch 1, gen 40) | **3-8x** | replaces ~1000 eager launches + Python dispatch per step with one graph replay; the per-step cost implied by the measured 13.33 s / 128 steps is ~100 ms vs single-digit-ms of model FLOPs |
+| Confidence-threshold commits (`--commit-threshold`) | **1.5-4x fewer steps** | latency is measured-linear in steps; quality-gated, not parity-gated |
 | Masked inference on one H100 | **1.2-1.6x** | selected vocabulary projection, resident trajectory, batched CFG |
 | Continuous CFG inference on one H100 | **1.3-1.8x** | one 2B dispatch, resident schedules, fewer launches/syncs |
 | Masked training step | **1.05-1.30x** | active-token projection; benefit grows with vocabulary and mask sparsity |

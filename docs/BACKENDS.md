@@ -68,9 +68,17 @@ paired local run, not a multi-run CUDA comparison. A current one-candidate CLI c
 comparison.
 
 `MLXDIMBA.predict_token_logits` is parity-tested against torch in
-`tests/test_mlx_masked_parity.py` (max |Δ| ≈ 3e-5, identical argmax). On MLX 0.29.3 (the last
-version for Python 3.9), batches ≥3 are internally chunked into two-row calls to avoid a fused-
-graph NaN bug; remove the workaround only after testing Python ≥3.10 with a current MLX release.
+`tests/test_mlx_masked_parity.py` (max |Δ| ≈ 3e-5, identical argmax). On MLX 0.29.x (the last
+line for Python 3.9), batches ≥3 are internally chunked into two-row calls to avoid a fused-
+graph NaN bug. The ceiling is now version-gated (`_compiled_batch_ceiling` in
+`src/dimba/backends/mlx/model.py`) and lifts automatically on MLX ≥ 0.30; the batch-4 parity
+test re-runs the repro on every version bump before the workaround path is skipped.
+
+Half-precision weights are available via `MLXDIMBA.from_torch(model, dtype=mx.float16)` or
+`scripts/generate.py --mlx-dtype fp16` (SSD-scan log-decay math, schedule tables, and the
+confidence softmax stay fp32). Measured on this M1 Pro at the interactive shape (batch 1,
+gen 40): **1.01× — latency-neutral**, because the path is dispatch-bound at that size; the flag
+is kept for larger batches/models and gated on argmax agreement, not exact logit parity.
 
 ## How to run
 

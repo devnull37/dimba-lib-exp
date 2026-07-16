@@ -207,6 +207,9 @@ def parse_args(argv=None):
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=DEVICE)
     ap.add_argument("--workers", type=int, default=2, help="data-loader workers per process")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the denoiser forward (CUDA only); the "
+                         "data-dependent masked loss stays eager")
     ap.add_argument("--local-rank", "--local_rank", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args(argv)
@@ -249,6 +252,17 @@ def _run(args, context):
     dtype = torch.bfloat16 if context.device.type == "cuda" else torch.float32
     model = model.to(device=context.device, dtype=dtype)
     del sd
+
+    if args.compile and context.device.type == "cuda":
+        # Compile only the backbone forward (fixed [batch, SEQ_LEN] shapes);
+        # the data-dependent masked loss stays eager. Mirrors
+        # masked_diffusion_finetune.py.
+        model.predict_token_features = torch.compile(
+            model.predict_token_features, dynamic=False
+        )
+        if context.is_main:
+            print("torch.compile: denoiser forward compiled (dynamic=False)",
+                  flush=True)
 
     def build_cached_rows():
         rows = build_sft_rows(tokenizer)

@@ -98,11 +98,15 @@ def load_model(path: str = DEFAULT_CKPT):
 class _MLXModel:
     """Thin Torch-facing adapter around the device-resident MLX sampler."""
 
-    def __init__(self, torch_model):
+    def __init__(self, torch_model, dtype="fp32"):
         from dimba.backends.mlx.model import MLXDIMBA
         import numpy as np
         self._np = np
-        self._m = MLXDIMBA.from_torch(torch_model)
+        mx_dtype = None
+        if dtype != "fp32":
+            import mlx.core as mx
+            mx_dtype = {"fp16": mx.float16, "bf16": mx.bfloat16}[dtype]
+        self._m = MLXDIMBA.from_torch(torch_model, dtype=mx_dtype)
 
     def predict_token_logits(self, ids, t):
         out = self._m.predict_token_logits(ids.cpu().numpy(), float(t))
@@ -130,6 +134,7 @@ class _MLXModel:
         guidance,
         seed,
         on_step,
+        commit_threshold=None,
     ):
         callback = None
         if on_step is not None:
@@ -148,6 +153,7 @@ class _MLXModel:
             guidance=guidance,
             seed=seed,
             on_step=callback,
+            commit_threshold=commit_threshold,
         )
         return torch.from_numpy(out)
 
@@ -217,6 +223,32 @@ def guided_logits(model, mask_id, ids, prompt_len, t, guidance, positions=None):
     return lu + guidance * (lc - lu)
 
 
+def _make_cfg_features(model, mask_id, prompt_len, guidance):
+    """Fixed-shape per-step feature pass: CFG combined in feature space.
+
+    Returns ``fn(ids, t) -> [B, L, d_model]`` with ``t`` a 0-d float tensor.
+    Same math as :func:`guided_logits` minus the (shape-varying) vocabulary
+    projection, which the caller keeps eager. Every input shape is constant
+    across the whole trajectory, so the callable is CUDA-graph capturable.
+    ``guidance`` is closed over as a constant (one graph per guidance value)."""
+
+    def cfg_features(ids, t):
+        if guidance in (0.0, 1.0):
+            chosen = ids
+            if guidance == 0.0:
+                chosen = ids.clone()
+                chosen[:, :prompt_len] = mask_id
+            return model.predict_token_features(chosen, t)
+        u = ids.clone()
+        u[:, :prompt_len] = mask_id
+        both_ids = torch.cat([ids, u], dim=0)
+        features = model.predict_token_features(both_ids, t)
+        fc, fu = features.chunk(2, dim=0)
+        return fu + guidance * (fc - fu)
+
+    return cfg_features
+
+
 def _denoise_step(logits, ids, still, positions, prompt_len, mask_id,
                   temperature, top_k, freq_pen, n_keep):
     """One fused denoising step: frequency penalty, temperature, top-k,
@@ -228,6 +260,15 @@ def _denoise_step(logits, ids, still, positions, prompt_len, mask_id,
     ``hidden @ vocab`` projection for prompt and committed tokens.
 
     Returns ``(ids, still, positions)`` for the next step."""
+    ids, conf = _sample_tokens(logits, ids, still, positions, prompt_len,
+                               mask_id, temperature, top_k, freq_pen)
+    return _commit_tokens(ids, still, positions, conf, mask_id, n_keep)
+
+
+def _sample_tokens(logits, ids, still, positions, prompt_len, mask_id,
+                   temperature, top_k, freq_pen):
+    """Penalty/temperature/top-k sampling half of the step: writes the sampled
+    tokens into ``ids`` and returns their confidence for the commit decision."""
     B, _, V = logits.shape
     # Exempt-first frequency penalty over already-committed generated tokens
     # (vectorized equivalent of the old per-row unique() loop).
@@ -245,6 +286,11 @@ def _denoise_step(logits, ids, still, positions, prompt_len, mask_id,
     sampled = top_indices.gather(-1, choice).squeeze(-1)
     conf = top_probs.gather(-1, choice).squeeze(-1)
     ids = ids.scatter(1, positions, sampled)
+    return ids, conf
+
+
+def _commit_tokens(ids, still, positions, conf, mask_id, n_keep):
+    """Remask the ``n_keep`` lowest-confidence positions; commit the rest."""
     if n_keep > 0:
         keep_local = conf.topk(n_keep, dim=1, largest=False).indices
         positions = positions.gather(1, keep_local)
@@ -258,6 +304,7 @@ def _denoise_step(logits, ids, still, positions, prompt_len, mask_id,
 
 # Compiled lazily on first use so import stays cheap and --no-compile can veto.
 _compiled_step = None
+_compiled_split = None
 
 
 def _get_step(use_compile):
@@ -277,6 +324,22 @@ def _get_step(use_compile):
     return _compiled_step
 
 
+def _get_split_step(use_compile):
+    """Sample/commit halves compiled separately: the confidence-threshold
+    commit count is decided on the host between them (one scalar sync)."""
+    global _compiled_split
+    if not use_compile:
+        return _sample_tokens, _commit_tokens
+    if _compiled_split is None:
+        from dimba.utils.compile import maybe_compile_fn
+        dyn = True if DEVICE == "cuda" else None
+        _compiled_split = (
+            maybe_compile_fn(_sample_tokens, dynamic=dyn),
+            maybe_compile_fn(_commit_tokens, dynamic=dyn),
+        )
+    return _compiled_split
+
+
 @torch.inference_mode()
 def generate(
     model,
@@ -291,13 +354,30 @@ def generate(
     on_step=None,
     use_compile=True,
     seed=None,
+    commit_threshold=None,
+    cfg_drop=None,
+    use_graph=None,
 ):
     """MaskGIT-style iterative unmasking with a cosine remask schedule.
 
-    The per-step tensor math (penalty, top-k, sampling, remask) runs through
-    ``torch.compile`` when available (CUDA/MPS/CPU inductor), falling back to
-    eager transparently. ``on_step(ids, still, s, steps)`` is called after
-    every unmasking step (used by --watch to render the denoising live)."""
+    The backbone forward has a constant input shape across the trajectory, so
+    on CUDA it is captured as a CUDA graph (``use_graph``, default on) and each
+    step replays one graph instead of ~1000 eager kernel launches; the
+    shape-varying vocabulary projection stays eager on the selected-positions
+    fast path. The per-step tensor math (penalty, top-k, sampling, remask)
+    runs through ``torch.compile`` when available (CUDA/MPS/CPU inductor),
+    falling back to eager transparently. ``on_step(ids, still, s, steps)`` is
+    called after every unmasking step (used by --watch to render the denoising
+    live).
+
+    ``commit_threshold`` (quality-affecting, off by default): additionally
+    commit any sampled token whose confidence exceeds the threshold even when
+    the cosine schedule would remask it, and stop as soon as every position is
+    committed. Costs one scalar GPU->host sync per step.
+
+    ``cfg_drop`` (quality-affecting, off by default): once this fraction of
+    response tokens is committed, drop the unconditional CFG row and run
+    single-row (guidance-free) forwards for the remaining steps."""
     if steps < 1 or gen_len < 1:
         raise ValueError("steps and gen_len must be positive")
     if temperature <= 0:
@@ -318,9 +398,12 @@ def generate(
             guidance=guidance,
             seed=seed,
             on_step=on_step,
+            commit_threshold=commit_threshold,
         )
 
     step_fn = _get_step(use_compile)
+    if commit_threshold is not None:
+        sample_fn, commit_fn = _get_split_step(use_compile)
     B, P = prompt_ids.shape
     device = prompt_ids.device
     ids = torch.cat(
@@ -333,19 +416,66 @@ def generate(
     still = torch.zeros(B, P + gen_len, dtype=torch.bool, device=device)
     still[:, P:] = True
     positions = torch.arange(P, P + gen_len, device=device).unsqueeze(0).expand(B, -1)
+
+    # Fast path: models exposing the split feature/projection API get CFG
+    # combined in feature space with a fixed-shape backbone call per step,
+    # optionally captured as a CUDA graph. Other models (and the MLX adapter's
+    # guided_logits) keep the generic per-step dispatch below.
+    feature_cfg = hasattr(model, "predict_token_features") and not hasattr(
+        model, "guided_logits"
+    )
+    if use_graph is None:
+        use_graph = DEVICE == "cuda"
+    feats_main = feats_cond = None
+    if feature_cfg:
+        feats_main = _make_cfg_features(model, mask_id, P, guidance)
+        if cfg_drop is not None and guidance not in (0.0, 1.0):
+            feats_cond = _make_cfg_features(model, mask_id, P, 1.0)
+        if use_graph:
+            from dimba.utils.cuda_graphs import GraphedFn
+            feats_main = GraphedFn(feats_main)
+            if feats_cond is not None:
+                feats_cond = GraphedFn(feats_cond)
+
     n_active = gen_len
     for s in range(steps):
         # Python already knows the schedule count; avoid a GPU -> host ``.item()``
         # synchronization just to recover the masked fraction.
         frac = n_active / (P + gen_len)
-        logits = guided_logits(
-            model, mask_id, ids, P, max(frac, T_MIN), guidance, positions
-        )
+        t = max(frac, T_MIN)
+        if feature_cfg:
+            drop_uncond = (
+                feats_cond is not None
+                and (gen_len - n_active) / gen_len >= cfg_drop
+            )
+            # 0-d float tensor: under graph capture/compile a Python float
+            # would be baked in (or trigger a recompile) per distinct t.
+            t_dev = torch.tensor(t, device=device)
+            features = (feats_cond if drop_uncond else feats_main)(ids, t_dev)
+            logits = model.project_token_features(
+                features, positions=positions
+            ).float()
+        else:
+            logits = guided_logits(model, mask_id, ids, P, t, guidance, positions)
         n_keep = int(gen_len * math.cos(math.pi / 2 * (s + 1) / steps))
-        ids, still, positions = step_fn(
-            logits, ids, still, positions, P, mask_id,
-            temperature, top_k, freq_pen, n_keep,
-        )
+        if commit_threshold is None:
+            ids, still, positions = step_fn(
+                logits, ids, still, positions, P, mask_id,
+                temperature, top_k, freq_pen, n_keep,
+            )
+        else:
+            ids, conf = sample_fn(
+                logits, ids, still, positions, P, mask_id,
+                temperature, top_k, freq_pen,
+            )
+            # Keep masked only what is BOTH scheduled to stay masked and still
+            # low-confidence; the max over rows never commits a token the
+            # schedule+threshold combination wouldn't. One scalar sync.
+            n_low = int((conf <= commit_threshold).sum(dim=1).max())
+            n_keep = min(n_keep, n_low)
+            ids, still, positions = commit_fn(
+                ids, still, positions, conf, mask_id, n_keep
+            )
         n_active = n_keep
         if on_step:
             on_step(ids, still, s, steps)
@@ -513,7 +643,7 @@ def slider_generate(model, tokenizer, mask_id, question, quality=0.5,
         quality: Q in [0, 1] mapping to (steps, N).
         critic: optional loaded critic head; used to break near-ties in gap.
         overrides: any of steps, n, temperature, guidance, seed, gen_len,
-            top_k, freq_pen.
+            top_k, freq_pen, commit_threshold, cfg_drop, use_graph.
 
     Returns:
         dict with keys: text, steps, n, seconds, scores (list, empty when N==1),
@@ -549,6 +679,9 @@ def slider_generate(model, tokenizer, mask_id, question, quality=0.5,
         on_step=overrides.get("on_step"),
         use_compile=bool(ov("use_compile", True)),
         seed=seed,
+        commit_threshold=overrides.get("commit_threshold"),
+        cfg_drop=overrides.get("cfg_drop"),
+        use_graph=overrides.get("use_graph"),
     )
 
     scores = []
@@ -603,8 +736,24 @@ def build_parser():
     p.add_argument("--gen-len", type=int, default=None, dest="gen_len")
     p.add_argument("--backend", default="auto", choices=["auto", "torch", "mlx"],
                    help="auto = MLX (Apple GPU) when installed, else torch")
+    p.add_argument("--mlx-dtype", default="fp32", dest="mlx_dtype",
+                   choices=["fp32", "fp16", "bf16"],
+                   help="MLX weight/activation precision; fp16 roughly halves "
+                        "weight bandwidth (quality-affecting, scan and "
+                        "confidence math stay fp32)")
     p.add_argument("--no-compile", action="store_true",
                    help="disable torch.compile on the per-step sampler math")
+    p.add_argument("--no-graph", action="store_true",
+                   help="disable CUDA-graph capture of the backbone forward")
+    p.add_argument("--commit-threshold", type=float, default=None,
+                   dest="commit_threshold", metavar="TAU",
+                   help="commit tokens above this confidence ahead of the "
+                        "cosine schedule and stop early (quality-affecting; "
+                        "try 0.9)")
+    p.add_argument("--cfg-drop", type=float, default=None, dest="cfg_drop",
+                   metavar="FRAC",
+                   help="drop the unconditional CFG pass once this fraction "
+                        "of tokens is committed (quality-affecting; try 0.75)")
     p.add_argument("--critic", action="store_true",
                    help="load the critic head to break near-ties in gap")
     p.add_argument("--show-all", action="store_true",
@@ -635,18 +784,21 @@ def main(argv=None):
 
     model, mask_id = load_model(args.checkpoint)
     if backend == "mlx":
-        model = _MLXModel(model)
+        model = _MLXModel(model, dtype=args.mlx_dtype)
     tokenizer = load_tokenizer()
     critic = load_critic(use_compile=not args.no_compile) if args.critic else None
 
     overrides = {}
-    for k in ("steps", "n", "temperature", "guidance", "seed", "gen_len"):
+    for k in ("steps", "n", "temperature", "guidance", "seed", "gen_len",
+              "commit_threshold", "cfg_drop"):
         v = getattr(args, k)
         if v is not None:
             overrides[k] = v
     # MLX keeps only tiny glue tensors on CPU; compile latency isn't worth it.
     if args.no_compile or backend == "mlx":
         overrides["use_compile"] = False
+    if args.no_graph:
+        overrides["use_graph"] = False
     if args.watch:
         P = len(tokenizer.encode(f"Question: {args.question}\nAnswer:",
                                  add_special_tokens=False))

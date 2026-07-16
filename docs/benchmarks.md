@@ -52,6 +52,14 @@ Median wall-clock seconds per 40-token answer, batch size 1, 1 warmup, 5 measure
 | GPT-2 (124M) | 0.18s |
 | Pythia-160M | 0.19s |
 
+The DIMBA number predates the CUDA-graph sampler (`scripts/generate.py` now replays the
+backbone forward as one CUDA graph per step, default on) and the opt-in
+`--commit-threshold` early-commit schedule. Re-measure with
+`scripts/benchmark_h100.py --cases masked-inference --preset production` — that preset
+reproduces exactly this shape (batch 1, prompt 10, 40 generated tokens, 128 steps) with an
+exact-token parity gate. Estimated (not yet measured) impact is 3-8x from graph replay alone;
+see [PERFORMANCE_AND_SCALING.md](PERFORMANCE_AND_SCALING.md).
+
 ## Test E: Model Facts
 
 | Model | Parameters | Native Infill |

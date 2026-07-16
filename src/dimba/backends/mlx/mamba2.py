@@ -53,6 +53,12 @@ def scan_chunked_mlx(x, dt, A, Bm, Cm, chunk_size: int = 128):
         raise RuntimeError(_NO_MLX)
     B, L, H, P = x.shape
     cs = chunk_size
+    # State-space math always runs in fp32 (mirrors TorchMamba2): the log-decay
+    # exp/cumsum chain is precision-critical even when the surrounding model
+    # runs half-precision weights/activations. No-op for fp32 inputs.
+    out_dtype = x.dtype
+    x, dt, A = x.astype(mx.float32), dt.astype(mx.float32), A.astype(mx.float32)
+    Bm, Cm = Bm.astype(mx.float32), Cm.astype(mx.float32)
     xdt = x * dt[..., None]                       # absorb dt into x
     Adt = A.reshape(1, 1, H) * dt                 # absorb dt into A
     y = mx.zeros((B, L, H, P))
@@ -78,7 +84,7 @@ def scan_chunked_mlx(x, dt, A, Bm, Cm, chunk_size: int = 128):
         state_decay = mx.exp(a_last[:, None] - a_cum)
         dstate = mx.einsum("bthn,bthp,bth->bhpn", bc, xc, state_decay)
         S = mx.exp(a_last)[:, :, None, None] * S + dstate
-    return y
+    return y.astype(out_dtype)
 
 
 if HAS_MLX:
