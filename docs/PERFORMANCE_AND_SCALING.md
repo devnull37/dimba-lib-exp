@@ -221,8 +221,13 @@ the control arm until the next-run pilot confirms time-to-quality.
 
 ### CUDA
 
-No CUDA or H100 timing was measured on the development Mac. The H100 harness is implemented, but
-all CUDA estimates below remain forecasts until its JSON report passes the gate.
+RTX 4090, torch 2.12.0+cu130, mamba-ssm 2.3.2.post1, production shape (batch 1, prompt 10,
+40 generated tokens, 128 steps, CFG 2.0): **17.92 s eager -> 1.16 s CUDA graph = 15.49x**,
+with exact final-token parity (40/40, seed 0). This is one wall-clock run, directional rather
+than a formal H100 promotion result. A separate harness comparison against the historical
+two-sequential-CFG/full-vocabulary baseline measured 8.05 s -> 0.223 s (36.12x); do not use
+that larger number as the graph-only headline. The capture boundary is the raw denoiser;
+latent decode and head preparation remain eager after full-feature capture proved unsupported.
 
 The corrected continuous Stage-3 recipe is a correctness repair, not a throughput optimization.
 Each KD-enabled step adds a logits-only teacher forward plus the student vocabulary head and KL;

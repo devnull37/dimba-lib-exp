@@ -622,6 +622,17 @@ class DIMBA(nn.Module):
             t = (t.clamp(0.0, 1.0) * (self.num_diffusion_steps - 1)).round()
         return t.long()
 
+    def _predict_token_features(self, input_ids: torch.Tensor, t, denoise_fn) -> torch.Tensor:
+        """Masked-inference features using an injectable raw denoiser call."""
+        batch_size = input_ids.shape[0]
+        z = self.encode_latent(self.token_embed(input_ids))
+        cond = self._build_conditioning(None, batch_size, input_ids.device)
+        t_idx = self._to_timestep_index(t, batch_size, input_ids.device)
+        raw = denoise_fn(z, t_idx, cond)
+        z0_hat = self._to_x0_latent(z, raw, t_idx)
+        x_dec = self.decode_latent(z0_hat)
+        return self.output_head.prepare_features(x_dec, self.token_embed.get_weight())
+
     def predict_token_features(self, input_ids: torch.Tensor, t) -> torch.Tensor:
         """Return post-head, pre-vocabulary features for masked inference.
 
@@ -629,14 +640,9 @@ class DIMBA(nn.Module):
         combine conditional/unconditional features exactly, then pay for one selected-
         position vocabulary projection instead of two full-sequence projections.
         """
-        batch_size = input_ids.shape[0]
-        z = self.encode_latent(self.token_embed(input_ids))
-        cond = self._build_conditioning(None, batch_size, input_ids.device)
-        t_idx = self._to_timestep_index(t, batch_size, input_ids.device)
-        raw = self._denoiser_raw(z, t_idx, cond, None)
-        z0_hat = self._to_x0_latent(z, raw, t_idx)
-        x_dec = self.decode_latent(z0_hat)
-        return self.output_head.prepare_features(x_dec, self.token_embed.get_weight())
+        return self._predict_token_features(
+            input_ids, t, lambda z, t_idx, cond: self._denoiser_raw(z, t_idx, cond, None)
+        )
 
     def project_token_features(
         self,

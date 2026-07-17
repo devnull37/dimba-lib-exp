@@ -758,6 +758,11 @@ def _cold_compile(
 def _make_masked_predictors(
     model, mask_id: int, prompt_len: int, guidance: float, graph: bool = False
 ):
+    try:
+        from scripts.generate import _make_cfg_features
+    except ModuleNotFoundError:  # direct `python scripts/benchmark_h100.py`
+        from generate import _make_cfg_features
+
     def baseline(ids: torch.Tensor, t):
         unconditional = ids.clone()
         unconditional[:, :prompt_len] = mask_id
@@ -765,22 +770,10 @@ def _make_masked_predictors(
         unconditional_logits = model.predict_token_logits(unconditional, t).float()
         return unconditional_logits + guidance * (conditional_logits - unconditional_logits)
 
-    def guided_features(ids: torch.Tensor, t):
-        unconditional = ids.clone()
-        unconditional[:, :prompt_len] = mask_id
-        features = model.predict_token_features(torch.cat((ids, unconditional), dim=0), t)
-        conditional_features, unconditional_features = features.chunk(2, dim=0)
-        return unconditional_features + guidance * (
-            conditional_features - unconditional_features
-        )
-
-    graph_handle = None
-    if graph:
-        from dimba.utils.cuda_graphs import GraphedFn
-
-        graph_handle = GraphedFn(guided_features)
-
-    features_fn = graph_handle if graph_handle is not None else guided_features
+    features_fn = _make_cfg_features(
+        model, mask_id, prompt_len, guidance, use_graph=graph
+    )
+    graph_handle = features_fn.graph_handle
 
     def optimized(ids: torch.Tensor, t, positions: Optional[torch.Tensor] = None):
         # 0-d device tensor: a Python float would be baked into a captured
@@ -810,6 +803,11 @@ def run_masked_inference(
     baseline_predict, optimized_predict, graph_handle = _make_masked_predictors(
         model, mask_id, args.prompt_len, args.guidance_scale, graph=use_graph
     )
+    correctness_predict = baseline_predict
+    if use_graph:
+        _, correctness_predict, _ = _make_masked_predictors(
+            model, mask_id, args.prompt_len, args.guidance_scale, graph=False
+        )
 
     def sample(predict):
         return masked_diffusion_sample(
@@ -828,14 +826,16 @@ def run_masked_inference(
     initial_ids = torch.full((batch, args.seq_len), mask_id, dtype=torch.long, device=device)
     initial_ids[:, : args.prompt_len] = prompt
     with torch.inference_mode():
-        full_reference = baseline_predict(initial_ids, 1.0)
-        reference = full_reference[:, args.prompt_len :, :]
+        full_reference = correctness_predict(
+            initial_ids, 1.0, active_positions
+        ) if use_graph else correctness_predict(initial_ids, 1.0)
+        reference = full_reference if use_graph else full_reference[:, args.prompt_len :, :]
         optimized_logits = optimized_predict(initial_ids, 1.0, active_positions)
         logit_parity = tensor_parity(
             reference, optimized_logits, rtol=args.parity_rtol, atol=args.parity_atol
         )
         del full_reference, reference, optimized_logits
-        baseline_ids = sample(baseline_predict)
+        baseline_ids = sample(correctness_predict)
         optimized_ids = sample(optimized_predict)
         output_agreement = token_output_agreement(baseline_ids, optimized_ids)
         valid_ids = bool(
@@ -893,7 +893,9 @@ def run_masked_inference(
             "full_generation_token_agreement": output_agreement["token_agreement"],
             "optimized_ids_valid": valid_ids,
             "accuracy_gate": (
-                "selected logits match within tolerance and deterministic full outputs agree"
+                "graph replay matches eager batched CFG exactly"
+                if use_graph
+                else "selected logits match within tolerance and deterministic full outputs agree"
             ),
         },
         "compile": {"requested": False},

@@ -10,8 +10,7 @@ default — must update this file to match, **autonomously, without asking**, an
 update so every other agent sees the current truth. Keep §2 (status), §4 (TODO), and the
 "Last full update" line below accurate.
 
-Last full update: **2026-07-17** (post general-speedup pass, commit `e243b98`; 4090
-verification in progress).
+Last full update: **2026-07-17** (RTX 4090 CUDA-graph verification and capture-boundary fix).
 
 ---
 
@@ -53,16 +52,18 @@ parallel by iterative denoising. Two diffusion tracks coexist:
 
 ## 2. Current status — what is happening RIGHT NOW
 
-**A general speedup pass landed 2026-07-17 (`e243b98`) and awaits GPU verification.** A rented
-**RTX 4090** is being initialized to verify the CUDA claims. If you are the agent on that box,
-your job is §5 ("Verification protocol").
+**The CUDA-graph sampler is verified on an RTX 4090.** Full-feature capture initially failed at
+the post-denoiser latent decode boundary. Capturing the expensive raw denoiser only fixed it:
+one production-shape run measured **17.92 s eager -> 1.16 s graphed (15.49x)** with exact final
+tokens (40/40, seed 0). A separate harness timing against the historical two-pass/full-vocab
+baseline measured 8.05 s -> 0.223 s (36.12x), but that is not the apples-to-apples headline.
 
 What the speedup pass shipped (all parity-tested on CPU/MPS/MLX; CUDA numbers are ESTIMATES
 until the GPU run):
 
 | Change | Where | Default | Expected (est.) | Gate |
 |---|---|---|---|---|
-| CUDA-graph replay of the sampler backbone | `src/dimba/utils/cuda_graphs.py` + `scripts/generate.py` | ON for CUDA (`--no-graph` off-switch) | **3–8×** e2e latency | exact-token parity in `benchmark_h100.py` |
+| CUDA-graph replay of the sampler denoiser | `src/dimba/utils/cuda_graphs.py` + `scripts/generate.py` | ON for CUDA (`--no-graph` off-switch) | **MEASURED 15.49x on RTX 4090** (17.92 s -> 1.16 s, one run) | exact-token parity (40/40) |
 | Confidence-threshold commits + real early exit | `generate.py --commit-threshold TAU`, MLX `sample_masked` | OFF (quality-affecting) | 1.5–4× fewer steps | quality probes (benchmarks.md A–C), NOT parity |
 | Adaptive CFG truncation | `generate.py --cfg-drop FRAC` | OFF | 1.1–1.4×, only post-graphs | quality probes |
 | Chunked selected-token CE (no `[N,49k]` logits retained) | `training/fused_ce.py:_ChunkedLinearCE`, wired in `masked_token_loss` | ON (2048-token chunks) | ~1.6 GB activation memory back → bigger `--batch` | grad parity (tests + benchmark) |
@@ -112,9 +113,12 @@ user whether/when to commit it.
 ## 4. Live TODO list (ordered)
 
 **Now / blocking:**
-- [ ] **Verify the speedup pass on the rented 4090** — protocol in §5. Replace every
-      "estimate" in `docs/PERFORMANCE_AND_SCALING.md` and the note in `docs/benchmarks.md`
-      Test D with measured numbers.
+- [x] Verify lossless CUDA-graph replay on the rented 4090: **15.49x**, exact 40/40 tokens.
+- [ ] Run the production shape with 1 warmup + 5 repeats and archive the JSON; the current
+      15.49x result is a one-run directional 4090 measurement, not the formal H100 promotion.
+- [ ] Run the complete remote CUDA suite after making CPU-only unit models explicitly select
+      `TorchMamba2`; the focused local graph/benchmark suite is 22/22, while the initial remote
+      full suite had 15 environment-selection failures when fused Mamba was installed.
 - [ ] If graphs verify: re-run the quality probes with `--commit-threshold 0.9` and pick a
       default τ for the quality slider (currently OFF by default, plumbed through
       `slider_generate` overrides).

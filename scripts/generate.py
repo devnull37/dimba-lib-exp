@@ -223,7 +223,7 @@ def guided_logits(model, mask_id, ids, prompt_len, t, guidance, positions=None):
     return lu + guidance * (lc - lu)
 
 
-def _make_cfg_features(model, mask_id, prompt_len, guidance):
+def _make_cfg_features(model, mask_id, prompt_len, guidance, use_graph=False):
     """Fixed-shape per-step feature pass: CFG combined in feature space.
 
     Returns ``fn(ids, t) -> [B, L, d_model]`` with ``t`` a 0-d float tensor.
@@ -232,20 +232,31 @@ def _make_cfg_features(model, mask_id, prompt_len, guidance):
     across the whole trajectory, so the callable is CUDA-graph capturable.
     ``guidance`` is closed over as a constant (one graph per guidance value)."""
 
+    graph_handle = None
+    if use_graph and hasattr(model, "_predict_token_features"):
+        from dimba.utils.cuda_graphs import GraphedFn
+
+        denoise_fn = lambda z, t_idx, cond: model._denoiser_raw(z, t_idx, cond, None)
+        graph_handle = GraphedFn(denoise_fn)
+        predict = lambda ids, t: model._predict_token_features(ids, t, graph_handle)
+    else:
+        predict = model.predict_token_features
+
     def cfg_features(ids, t):
         if guidance in (0.0, 1.0):
             chosen = ids
             if guidance == 0.0:
                 chosen = ids.clone()
                 chosen[:, :prompt_len] = mask_id
-            return model.predict_token_features(chosen, t)
+            return predict(chosen, t)
         u = ids.clone()
         u[:, :prompt_len] = mask_id
         both_ids = torch.cat([ids, u], dim=0)
-        features = model.predict_token_features(both_ids, t)
+        features = predict(both_ids, t)
         fc, fu = features.chunk(2, dim=0)
         return fu + guidance * (fc - fu)
 
+    cfg_features.graph_handle = graph_handle
     return cfg_features
 
 
@@ -425,17 +436,12 @@ def generate(
         model, "guided_logits"
     )
     if use_graph is None:
-        use_graph = DEVICE == "cuda"
+        use_graph = device.type == "cuda"
     feats_main = feats_cond = None
     if feature_cfg:
-        feats_main = _make_cfg_features(model, mask_id, P, guidance)
+        feats_main = _make_cfg_features(model, mask_id, P, guidance, use_graph=use_graph)
         if cfg_drop is not None and guidance not in (0.0, 1.0):
-            feats_cond = _make_cfg_features(model, mask_id, P, 1.0)
-        if use_graph:
-            from dimba.utils.cuda_graphs import GraphedFn
-            feats_main = GraphedFn(feats_main)
-            if feats_cond is not None:
-                feats_cond = GraphedFn(feats_cond)
+            feats_cond = _make_cfg_features(model, mask_id, P, 1.0, use_graph=use_graph)
 
     n_active = gen_len
     for s in range(steps):
