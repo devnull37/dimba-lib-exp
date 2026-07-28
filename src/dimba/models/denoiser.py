@@ -80,11 +80,8 @@ def _make_mixer(
 
     Args:
         force_torch_mixer: Select the pure-PyTorch :class:`TorchMamba2` even when
-            the CUDA ``mamba_ssm`` kernels are installed. TorchMamba2 is the only
-            backend that exposes ``materialize_mixing_matrix`` (needed for MOHAWK
-            Stage-1 distillation) and is state_dict-compatible with
-            ``mamba_ssm.Mamba2`` (identical 8-key param tree at the default config),
-            so weights can be transferred to the CUDA kernel afterwards.
+            the CUDA ``mamba_ssm`` kernels are installed. TorchMamba2 is
+            state_dict-compatible with ``mamba_ssm.Mamba2`` at the default config.
     """
     global _FALLBACK_WARNED
     if use_simple_mamba:
@@ -93,7 +90,7 @@ def _make_mixer(
         return SimpleMamba2(d_model=d_model, d_state=d_state, d_expand=expand)
 
     if force_torch_mixer:
-        # Matrix-capable backend, regardless of whether mamba_ssm is installed.
+        # Portable backend, regardless of whether mamba_ssm is installed.
         from .torch_mamba2 import TorchMamba2
 
         return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
@@ -128,65 +125,16 @@ def _make_mixer(
         return TorchMamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim)
 
 
-def _ssd_mixing_matrix_from_params(mixer: nn.Module, u: torch.Tensor) -> torch.Tensor:
-    """Materialize the ``[B, nheads, L, L]`` SSD token-mixing matrix from a Mamba-2
-    mixer's live parameters.
-
-    The CUDA ``mamba_ssm.Mamba2`` kernel does not expose ``materialize_mixing_matrix``,
-    but its parameters (``in_proj``, ``conv1d``, ``A_log``, ``dt_bias``, ``D``) and the
-    ``[z, xBC, dt]`` projection layout are identical to :class:`TorchMamba2` (which was a
-    line-for-line port). So we replicate that method's math here, reading the kernel's
-    own parameters — the matrix stays differentiable w.r.t. them, so MOHAWK Stage-1
-    alignment trains the real mixer even when the fast CUDA kernel is in use.
-
-    Mirrors ``TorchMamba2.materialize_mixing_matrix``; returns fp32, lower-triangular.
-    """
-    B, L, _ = u.shape
-    nheads = int(mixer.nheads)
-    headdim = int(mixer.headdim)
-    ngroups = int(getattr(mixer, "ngroups", 1))
-    d_state = int(mixer.d_state)
-    d_inner = nheads * headdim
-    conv_dim = d_inner + 2 * ngroups * d_state
-
-    w_dtype = mixer.in_proj.weight.dtype
-    zxbcdt = mixer.in_proj(u.to(w_dtype))
-    _z, xBC, dt = torch.split(zxbcdt, [d_inner, conv_dim, nheads], dim=-1)
-
-    # Causal depthwise conv + SiLU (matches causal_conv1d_fn with activation="silu").
-    xBC = mixer.conv1d(xBC.transpose(1, 2))[..., :L].transpose(1, 2)
-    xBC = F.silu(xBC)
-    _x, Bm, Cm = torch.split(xBC, [d_inner, ngroups * d_state, ngroups * d_state], dim=-1)
-
-    # Precision-sensitive state-space math in fp32.
-    dt = F.softplus(dt.float() + mixer.dt_bias.float())          # [B, L, nheads]
-    A = -torch.exp(mixer.A_log.float())                          # [nheads]
-    Bm = Bm.float().view(B, L, ngroups, d_state).repeat_interleave(nheads // ngroups, dim=2)
-    Cm = Cm.float().view(B, L, ngroups, d_state).repeat_interleave(nheads // ngroups, dim=2)
-
-    a_cum = torch.cumsum(A.view(1, 1, nheads) * dt, dim=1)       # [B, L, h]
-    logdecay = a_cum.unsqueeze(2) - a_cum.unsqueeze(1)           # [B, t, s, h]
-    mask = torch.tril(torch.ones(L, L, device=u.device, dtype=torch.bool))
-    logdecay = logdecay.masked_fill(~mask.view(1, L, L, 1), float("-inf"))
-    decay = torch.exp(logdecay)
-    cb = torch.einsum("bthn,bshn->btsh", Cm, Bm)                 # [B, t, s, h] (C_t·B_s)
-    M = cb * decay
-    return M.permute(0, 3, 1, 2).contiguous()                   # [B, h, t, s]
-
-
 class _BlockFFN(nn.Module):
     """Position-wise feed-forward sub-layer for a Mamba block (channel-mixing).
 
-    A Mamba block mixes *tokens* but has no dedicated *channel*-mixing / memory module
-    the way a Transformer block's MLP does. This optional sub-layer adds one, in either
-    of the two shapes used by real LLMs so a teacher's FFN weights can be inherited
-    directly (MOHAWK-style cross-architecture distillation):
+    A Mamba block mixes *tokens* but has no dedicated *channel*-mixing sub-layer.
+    This optional sub-layer adds one in either of two common shapes:
 
       * ``"mlp"``    -> ``ff2(gelu(ff1(x)))``  (GPT-2 / Pythia / BERT; ``hidden = mult*d``).
       * ``"swiglu"`` -> ``down(silu(gate(x)) * up(x))``  (Llama / Qwen / Mistral).
 
-    Submodule names (``ff1``/``ff2``; ``gate_proj``/``up_proj``/``down_proj``) match the
-    corresponding HuggingFace modules so weight transfer is a plain ``copy_``.
+    Submodule names follow their conventional MLP/SwiGLU equivalents.
     """
 
     def __init__(
@@ -288,8 +236,7 @@ class Mamba2Block(nn.Module):
 
         # Optional position-wise FFN sub-layer (channel-mixing). Off by default so the
         # mixer-only block and existing checkpoints are byte-for-byte unchanged. When
-        # enabled it adds the channel-mixing/memory capacity a mixer lacks and a slot
-        # to inherit a Transformer teacher's MLP weights (cross-architecture distill).
+        # enabled it adds channel-mixing capacity to the mixer-only block.
         self.norm2 = None
         self.ffn = None
         if block_ffn:
@@ -340,34 +287,6 @@ class Mamba2Block(nn.Module):
             else:
                 x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
-
-    def materialize_matrices(self, h_normed: torch.Tensor):
-        """Return ``(M_fwd, M_bwd)`` per-head token-mixing matrices for a mixer input.
-
-        ``h_normed`` is the *already-normalized, conditioned* tensor the block feeds to
-        its mixer (see :meth:`Mamba2Denoiser._mixer_input`). ``M_fwd`` ``[B, H, L, L]``
-        is causal (lower-triangular); ``M_bwd`` ``[B, H, L, L]`` is the backward scan's
-        matrix re-expressed in the original position basis (upper-triangular), or
-        ``None`` when the block is unidirectional. These are the MOHAWK Stage-1 student
-        matrices, directly comparable to a causal teacher's ``tril(A)`` / ``triu(A)``.
-        """
-        def _mat(mixer, x):
-            # TorchMamba2 exposes the method directly; the CUDA mamba_ssm.Mamba2 kernel
-            # does not, so we compute the same SSD matrix from its live parameters
-            # (identical layout — gradients still flow to the kernel's params).
-            if hasattr(mixer, "materialize_mixing_matrix"):
-                return mixer.materialize_mixing_matrix(x)
-            return _ssd_mixing_matrix_from_params(mixer, x)
-
-        m_fwd = _mat(self.mamba_fwd, h_normed)
-        m_bwd = None
-        if self.bidirectional and self.mamba_bwd is not None:
-            m_bwd_flipped = _mat(self.mamba_bwd, torch.flip(h_normed, dims=[1]))
-            # The backward mixer ran on the flipped sequence; flip both sequence axes
-            # of its matrix back to the original position basis (-> upper-triangular).
-            m_bwd = torch.flip(m_bwd_flipped, dims=[2, 3])
-        return m_fwd, m_bwd
-
 
 class Mamba2Denoiser(nn.Module):
     """Stack of (bidirectional) Mamba blocks with prompt + timestep conditioning.
@@ -467,24 +386,16 @@ class Mamba2Denoiser(nn.Module):
         x: torch.Tensor,
         cond: torch.Tensor,
         timestep_emb: torch.Tensor,
-        *,
-        return_hidden_states: bool = False,
-        return_matrices: bool = False,
-    ):
+    ) -> torch.Tensor:
         """Denoise ``x`` conditioned on ``cond`` (prompt) and ``timestep_emb``.
 
         Args:
             x: Noisy latents ``[B, L, d_model]``.
             cond: Conditioning ``[B, L, cond_dim]`` (broadcast over L is fine).
             timestep_emb: Timestep embedding ``[B, time_embed_dim]``.
-            return_hidden_states: Also collect the residual-stream input to each block.
-            return_matrices: Also materialize each block's ``(fwd, bwd)`` mixing matrices.
 
         Returns:
-            Denoised latents ``[B, L, d_model]`` by default. When ``return_hidden_states``
-            or ``return_matrices`` is set, returns ``(out, info)`` where ``info`` carries
-            ``hidden_states`` / ``block_outputs`` (lists of ``[B, L, d_model]``) and
-            ``matrices_fwd`` / ``matrices_bwd`` (lists of ``[B, H, L, L]`` or ``None``).
+            Denoised latents ``[B, L, d_model]``.
         """
         # Broadcast the timestep embedding across the sequence and add to cond.
         time_cond = self.time_proj(timestep_emb).unsqueeze(1)  # [B, 1, cond_dim]
@@ -492,90 +403,19 @@ class Mamba2Denoiser(nn.Module):
         combined_cond = cond + time_cond
 
         output = x
-        if not (return_hidden_states or return_matrices):
-            for block, cond_layer in zip(self.blocks, self.conditioning):
-                if self.use_gradient_checkpointing and self.training:
-                    # use_reentrant=False is the DDP-safe variant and correctly
-                    # restores RNG state for the dropout inside _block_forward.
-                    output = _checkpoint(
-                        self._block_forward,
-                        block,
-                        cond_layer,
-                        output,
-                        combined_cond,
-                        use_reentrant=False,
-                    )
-                else:
-                    output = self._block_forward(block, cond_layer, output, combined_cond)
-            return output
-
-        # Distillation-alignment collection path: capture per-block intermediates.
-        # Gradient checkpointing is bypassed here so the captured tensors are real
-        # graph nodes the alignment losses can backprop through.
-        #
-        # WARNING (return_matrices=True): materialize_mixing_matrix builds a full
-        # [B, nheads, L, L] matrix per block WITHOUT chunking, costing
-        # O(num_layers * B * nheads * L^2) memory in fp32 plus the autograd graph.
-        # This is intentional for distillation at modest L, but will OOM at long
-        # sequences where the normal chunked forward() succeeds.  Raise early with a
-        # clear message rather than an opaque CUDA OOM.
-        if return_matrices and x.shape[1] > 0:
-            B, L, _ = x.shape
-            # Use the real per-mixer head count when available (d_model//64 under-counts
-            # for expand>1, e.g. 9 vs the true 18 at d_model=576), and double it for the
-            # bidirectional fwd+bwd materialisation so the budget isn't ~4x optimistic.
-            _nheads_est = getattr(self.blocks[0].mamba_fwd, "nheads", max(1, self.d_model // 64))
-            if self.bidirectional:
-                _nheads_est *= 2
-            _budget = B * _nheads_est * L * L * self.num_layers
-            # Warn at >256 M elements (~1 GB fp32); hard-fail at >2 B elements (~8 GB).
-            if _budget > 2_000_000_000:
-                raise RuntimeError(
-                    f"return_matrices=True would materialize ~{_budget/1e9:.1f}G fp32 "
-                    f"elements across {self.num_layers} layers (B={B}, L={L}). "
-                    "Use shorter sequences or disable return_matrices to avoid OOM."
-                )
-            if _budget > 256_000_000:
-                warnings.warn(
-                    f"return_matrices=True: estimated {_budget/1e6:.0f}M fp32 elements "
-                    f"across {self.num_layers} layers (B={B}, L={L}). "
-                    "Peak memory is O(num_layers * B * nheads * L^2); "
-                    "consider shorter sequences for Stage-1 distillation.",
-                    ResourceWarning,
-                    stacklevel=2,
-                )
-        hidden_states, block_outputs, mats_fwd, mats_bwd = [], [], [], []
         for block, cond_layer in zip(self.blocks, self.conditioning):
-            if return_hidden_states:
-                hidden_states.append(output)
-            if return_matrices:
-                h_normed = self._mixer_input(block, cond_layer, output, combined_cond)
-                m_fwd, m_bwd = block.materialize_matrices(h_normed)
-                mats_fwd.append(m_fwd)
-                mats_bwd.append(m_bwd)
-            output = self._block_forward(block, cond_layer, output, combined_cond)
-            block_outputs.append(output)
-        info = {
-            "hidden_states": hidden_states,
-            "block_outputs": block_outputs,
-            "matrices_fwd": mats_fwd,
-            "matrices_bwd": mats_bwd,
-        }
-        return output, info
-
-    def _mixer_input(self, block, cond_layer, x, combined_cond):
-        """Reconstruct the normalized, conditioned tensor a block feeds to its mixer.
-
-        Mirrors :meth:`_block_forward` up to (but excluding) the SSM mix, so the
-        matrices from :meth:`Mamba2Block.materialize_matrices` correspond exactly to
-        what that block computes for this input.
-        """
-        if self.conditioning_type == "adaln":
-            params = cond_layer(combined_cond)
-            scale, shift = params[0], params[1]
-            h = block.norm(x)
-            return h * (1 + scale) + shift
-        return block.norm(cond_layer(x, combined_cond))
+            if self.use_gradient_checkpointing and self.training:
+                output = _checkpoint(
+                    self._block_forward,
+                    block,
+                    cond_layer,
+                    output,
+                    combined_cond,
+                    use_reentrant=False,
+                )
+            else:
+                output = self._block_forward(block, cond_layer, output, combined_cond)
+        return output
 
     def _block_forward(self, block, cond_layer, x, combined_cond):
         """Condition + mix for a single denoiser block.

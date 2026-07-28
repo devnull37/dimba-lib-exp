@@ -165,3 +165,6 @@ config_local.yaml
 checkpoints/interactive/
 logs/interactive/
 .continues-handoff.md
+
+# Runtime training monitor output
+training_history.jsonl

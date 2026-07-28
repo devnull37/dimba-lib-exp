@@ -14,13 +14,12 @@ thinking is genuinely conditioned on earlier thinking.
 
 Anti-overthinking controls (see BlockCoTSampler):
   - Hard cap: max_think_blocks (default 2 for small models)
-  - Length penalty: charged per think-token in GRPO reward shaping
+  - Optional length-cost metric per generated think token
   - Adaptive stop: skip remaining blocks when a block is highly repetitive
 
 References
     Block Diffusion (ICLR 2025 Oral):  arXiv:2503.09573
     Test-Time Scaling for Block Diff:  arXiv:2602.09555
-    d1 / diffu-GRPO:                   arXiv:2504.12216
 """
 from __future__ import annotations
 
@@ -218,8 +217,7 @@ class BlockCoTSampler:
         eos_id: EOS token ID for adaptive stopping.
         adaptive_stop: Enable degenerate-block detection.
         thinking_length_weight: Per-think-token penalty to report in metrics
-            (not applied here — subtract from the GRPO reward externally using
-            ``result["n_think_blocks"] * block_size * weight``).
+            (not applied to generation).
         **sample_kwargs: Defaults forwarded to the inner sampler (num_steps,
             sampler, guidance_scale, temperature, etc.).
     """

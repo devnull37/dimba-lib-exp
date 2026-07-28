@@ -1,14 +1,6 @@
-"""Utility functions for DIMBA."""
+"""Runtime optimization helpers for DIMBA inference."""
 
-from .checkpointing import (
-    ProgressiveCheckpointManager,
-    parse_milestone_input,
-)
-from .backends import configure_cuda_training, require_fast_cuda_mamba2
+from .compile import maybe_compile, maybe_compile_fn
+from .cuda_graphs import GraphedFn, cuda_graphs_supported
 
-__all__ = [
-    "ProgressiveCheckpointManager",
-    "parse_milestone_input",
-    "configure_cuda_training",
-    "require_fast_cuda_mamba2",
-]
+__all__ = ["maybe_compile", "maybe_compile_fn", "GraphedFn", "cuda_graphs_supported"]

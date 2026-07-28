@@ -263,10 +263,8 @@ class FlowMatchingSchedule(nn.Module):
             This method must be called explicitly by the training loop (trainer or
             script) to obtain logit-normal timesteps.  The model's ``forward()``
             receives ``t`` as an argument from the caller and does **not** call this
-            method internally.  Training scripts that sample a uniform-integer ``t``
-            and convert via ``t.float() / (T-1)`` bypass this distribution entirely —
-            see ``scripts/train_4090.py`` and ``src/dimba/training/trainer.py``
-            (default ``timestep_sampling="uniform"``).
+            method internally. Callers that sample a uniform-integer ``t`` and
+            convert via ``t.float() / (T-1)`` bypass this distribution entirely.
         """
         if self.logit_normal_sampling:
             u = torch.sigmoid(

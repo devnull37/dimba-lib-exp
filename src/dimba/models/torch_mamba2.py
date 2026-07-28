@@ -128,8 +128,7 @@ class TorchMamba2(nn.Module):
         ``[nheads]`` (negative, scalar-per-head), and ``Bm``/``Cm`` are
         ``[B, L, nheads, d_state]`` (groups expanded to heads). Computed in fp32.
 
-        Both :meth:`forward` and :meth:`materialize_mixing_matrix` go through this so
-        the materialized matrix is *exactly* the operator the scan applies.
+        The forward path uses these projections for both scan implementations.
         """
         B, L, _ = u.shape
         # Run the parameterized projections (in_proj, conv1d) in the module's weight
@@ -184,37 +183,6 @@ class TorchMamba2(nn.Module):
         y = self.norm(y.to(w_dtype), z.to(w_dtype))            # gated RMSNorm (gate then norm)
         out = self.out_proj(y)
         return out.to(orig_dtype)
-
-    def materialize_mixing_matrix(self, u: torch.Tensor) -> torch.Tensor:
-        """Materialize the per-head SSD semiseparable token-mixing matrix ``M``.
-
-        Returns ``M`` of shape ``[B, nheads, L, L]`` such that the scan output
-        (pre-D-skip, pre-gate) equals ``einsum('bhts,bshp->bthp', M, x*dt)`` for the
-        internal per-head input ``x`` and step sizes ``dt`` derived from ``u``. It is
-        a single full-length chunk with zero initial state, so there is no carried
-        term; ``M`` is causal (lower-triangular over the sequence) by construction.
-
-        This is the MOHAWK Stage-1 "student attention matrix" analogue: it is directly
-        comparable, per head, to a Transformer teacher's attention matrix.
-
-        Args:
-            u: Mixer input ``[B, L, d_model]`` (the same pre-normalized tensor the
-                enclosing block passes to :meth:`forward`).
-
-        Returns:
-            ``M`` ``[B, nheads, L, L]`` (fp32, lower-triangular over the last two dims).
-        """
-        B, L, _ = u.shape
-        _z, _x, dt, A, Bm, Cm = self._project_inputs(u)
-        # Cumulative log-decay over the whole sequence (single chunk): a_cum[t] = sum_{k<=t} A*dt_k.
-        a_cum = torch.cumsum(A.view(1, 1, self.nheads) * dt, dim=1)   # [B, L, h]
-        logdecay = a_cum.unsqueeze(2) - a_cum.unsqueeze(1)            # [B, t, s, h]
-        mask = torch.tril(torch.ones(L, L, device=u.device, dtype=torch.bool))
-        logdecay = logdecay.masked_fill(~mask.view(1, L, L, 1), float("-inf"))
-        decay = torch.exp(logdecay)                                  # [B, t, s, h]
-        cb = torch.einsum("bthn,bshn->btsh", Cm, Bm)                 # [B, t, s, h] (C_t . B_s)
-        M = cb * decay                                               # [B, t, s, h]
-        return M.permute(0, 3, 1, 2).contiguous()                   # [B, h, t, s]
 
     # ── SSM scans ───────────────────────────────────────────────────────────────
     @staticmethod

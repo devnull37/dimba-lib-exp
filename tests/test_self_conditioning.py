@@ -2,15 +2,11 @@
 
 Covers:
 - DIMBA(self_conditioning=True) forward with x_self_cond=None and explicit x_self_cond.
-- compute_dimba_losses on a self_conditioning=True model over ~15 steps with backward.
-- Regression: self_conditioning=False model still works through compute_dimba_losses.
 """
 
 import torch
-import pytest
 
 from dimba import DIMBA
-from dimba.training.trainer import compute_dimba_losses
 
 
 # ------------------------------------------------------------------ tiny model factory
@@ -89,79 +85,3 @@ class TestSelfConditioningForward:
         """self_cond_proj should be None when self_conditioning=False."""
         model = _tiny_model(self_conditioning=False)
         assert model.self_cond_proj is None
-
-
-# ------------------------------------------------------------------ loss + backward tests
-
-class TestSelfConditioningLoss:
-    """compute_dimba_losses exercises the 50/50 self-cond branch; loss must be finite."""
-
-    def _run_steps(self, model: DIMBA, num_steps: int = 15) -> None:
-        """Run num_steps of compute_dimba_losses with backward, assert finite loss each time.
-
-        Uses Adam + gradient clipping to match real training stability.
-        """
-        torch.manual_seed(0)
-        model.train()
-        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-        B, L = 4, 12
-
-        for step in range(num_steps):
-            input_ids = torch.randint(0, 64, (B, L))
-            t = torch.randint(0, model.num_diffusion_steps, (B,))
-
-            loss, parts = compute_dimba_losses(model, input_ids, t)
-
-            assert torch.isfinite(loss), (
-                f"Loss is not finite at step {step}: {loss.item()}"
-            )
-            for name, val in parts.items():
-                assert torch.isfinite(val), (
-                    f"Loss component '{name}' is not finite at step {step}: {val.item()}"
-                )
-
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-
-    def test_self_conditioning_true_15_steps(self):
-        """~15 training steps through the self-cond branch: every loss is finite."""
-        torch.manual_seed(42)
-        model = _tiny_model(self_conditioning=True)
-        self._run_steps(model, num_steps=15)
-
-    def test_self_conditioning_false_regression(self):
-        """self_conditioning=False model: compute_dimba_losses still produces finite loss."""
-        torch.manual_seed(42)
-        model = _tiny_model(self_conditioning=False)
-        self._run_steps(model, num_steps=15)
-
-    def test_both_branches_hit(self):
-        """Over enough steps, both the self-cond branch and the skip branch are exercised.
-
-        We verify this by counting how many times the no-grad pre-pass is triggered.
-        We patch torch.rand to alternate deterministically so both code paths run.
-        """
-        import unittest.mock as mock
-
-        model = _tiny_model(self_conditioning=True)
-        model.train()
-
-        # Alternate torch.rand(()) return value: 0.3 triggers the branch, 0.7 skips it.
-        side_effects = [torch.tensor(0.3), torch.tensor(0.7)] * 10
-        B, L = 2, 8
-        input_ids = torch.randint(0, 64, (B, L))
-        t = torch.randint(0, 16, (B,))
-
-        branch_triggered = 0
-        for val in side_effects[:8]:
-            with mock.patch("torch.rand", return_value=val):
-                loss, _ = compute_dimba_losses(model, input_ids, t)
-                assert torch.isfinite(loss), f"Loss not finite with rand={val.item()}"
-                if float(val) < 0.5:
-                    branch_triggered += 1
-
-        assert branch_triggered == 4, (
-            f"Expected 4 self-cond branch hits, got {branch_triggered}"
-        )

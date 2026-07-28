@@ -17,15 +17,6 @@ from .parallel_scan import (
     bidirectional_selective_scan,
 )
 from .vae import TokenVAE, TokenVAEWithDeterministicFallback, create_latent_projector
-from .lora import (
-    DEFAULT_LORA_TARGET_MODULES,
-    LoRALinear,
-    inject_lora_to_model,
-    merge_lora_weights,
-    save_lora_weights,
-    load_lora_weights,
-)
-from .quantization import quantize_model_4bit, prepare_for_qlora
 
 __all__ = [
     "DIMBA",
@@ -47,12 +38,4 @@ __all__ = [
     "TokenVAE",
     "TokenVAEWithDeterministicFallback",
     "create_latent_projector",
-    "DEFAULT_LORA_TARGET_MODULES",
-    "LoRALinear",
-    "inject_lora_to_model",
-    "merge_lora_weights",
-    "save_lora_weights",
-    "load_lora_weights",
-    "quantize_model_4bit",
-    "prepare_for_qlora",
 ]

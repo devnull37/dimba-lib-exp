@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload DIMBA training artifacts to the Hugging Face Hub.
+"""Upload DIMBA release artifacts to the Hugging Face Hub.
 
 Usage:
     # Upload with explicit token
@@ -20,8 +20,12 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Upload DIMBA artifacts to HF Hub")
-    parser.add_argument("--repo-id", required=True, help="HF repo id, e.g. username/dimba-500m-fineweb")
-    parser.add_argument("--artifacts-dir", default="./checkpoints/fineweb_500m_a4000", help="Directory with checkpoints and tokenizer")
+    parser.add_argument("--repo-id", required=True, help="HF repo id, e.g. username/dimba-model")
+    parser.add_argument(
+        "--artifacts-dir",
+        default="./artifacts",
+        help="Directory containing the model release files",
+    )
     parser.add_argument("--token", default=None, help="HF token (or set HF_TOKEN env var)")
     parser.add_argument("--private", action="store_true", help="Create private model repo")
     args = parser.parse_args()
@@ -49,7 +53,7 @@ def main() -> None:
         folder_path=str(artifacts_dir),
         repo_type="model",
         token=token,
-        commit_message="Upload DIMBA 500M A4000 FineWeb checkpoint and tokenizer",
+        commit_message="Upload DIMBA model release",
     )
 
     print(f"Upload complete: https://huggingface.co/{args.repo_id}")

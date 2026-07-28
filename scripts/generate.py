@@ -7,10 +7,9 @@ of best-of-N candidates that get ranked by a guidance-gap verifier.
 
 Production sampler: MaskGIT-style iterative unmasking with a cosine remask
 schedule, classifier-free guidance (2.0), an exempt-first frequency penalty
-(0.7), temperature (0.7), and top-k (20) multinomial sampling. The logic here
-mirrors the validated reference implementations in
-``scripts/experiments/selfcorrect_test.py`` (sampler), ``bestofn2.py``
-(guidance-gap verifier), and ``critic_bon.py`` (critic head).
+(0.7), temperature (0.7), and top-k (20) multinomial sampling. The production
+implementation includes the validated sampler, guidance-gap verifier, and
+optional critic tie-break.
 
 CLI:
     python scripts/generate.py "What is the capital of France?" --quality 0.5
@@ -187,7 +186,7 @@ def load_critic(use_compile=True):
 
 
 # --------------------------------------------------------------------------- #
-# Sampler (replicates selfcorrect_test.py: guided_logits + generate).
+# Sampler.
 # --------------------------------------------------------------------------- #
 @torch.inference_mode()
 def guided_logits(model, mask_id, ids, prompt_len, t, guidance, positions=None):
@@ -495,7 +494,7 @@ def generate(
 # --------------------------------------------------------------------------- #
 @torch.inference_mode()
 def gap_score(model, mask_id, eos, ids, prompt_len, K=4):
-    """Guidance-gap verifier (bestofn2.py): mean over generated positions of
+    """Guidance-gap verifier: mean over generated positions of
     [logp_cond - logp_uncond] for the committed token, with the scored
     positions MASKED via K interleaved leave-k-out passes at t=0.25.
     Higher = better."""

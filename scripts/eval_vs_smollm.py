@@ -8,15 +8,15 @@ Basic (gen + speed tasks, base checkpoint):
         --checkpoint /path/to/base/final.pt \\
         --tasks gen,speed --steps 20
 
-SFT/GRPO instruct checkpoint (block-CoT enabled):
+Instruction-tuned checkpoint (block-CoT enabled):
     python scripts/eval_vs_smollm.py \\
-        --checkpoint checkpoints/sft/final.pt \\
+        --checkpoint /path/to/instruct/model.pt \\
         --tasks gen,speed \\
         --block-cot --steps 20
 
 All tasks including perplexity:
     python scripts/eval_vs_smollm.py \\
-        --checkpoint checkpoints/sft/final.pt \\
+        --checkpoint /path/to/instruct/model.pt \\
         --tasks gen,speed,ppl \\
         --block-cot --steps 20
 
@@ -99,9 +99,8 @@ PPL_TEXT = (
 def load_dimba(checkpoint_path: str, device: torch.device):
     """Load a DIMBA model from a .pt checkpoint.
 
-    Uses DIMBA(**ckpt["config"]) + load_state_dict(strict=False), mirroring
-    train_4090.py's _build_or_load_model. Handles the force_torch_mixer key
-    to route to the pure-PyTorch TorchMamba2 backend when mamba_ssm is absent.
+    Uses the architecture config embedded in the checkpoint and selects the
+    portable TorchMamba2 backend when ``mamba_ssm`` is unavailable.
     """
     import inspect
     from dimba.models.diffusion import DIMBA
@@ -109,8 +108,7 @@ def load_dimba(checkpoint_path: str, device: torch.device):
     if not Path(checkpoint_path).exists():
         raise FileNotFoundError(
             f"DIMBA checkpoint not found: {checkpoint_path}\n"
-            "If the SFT/GRPO run hasn't finished yet, use the base checkpoint "
-            "instead (e.g. --checkpoint /path/to/base/final.pt)."
+            "Provide a released DIMBA checkpoint with an embedded model config."
         )
 
     print(f"  loading DIMBA checkpoint: {checkpoint_path}")
@@ -120,11 +118,11 @@ def load_dimba(checkpoint_path: str, device: torch.device):
     if cfg is None:
         raise ValueError(
             f"Checkpoint {checkpoint_path} has no 'config' key. "
-            "Re-save it with model.config, or use a checkpoint produced by train_4090.py."
+            "Re-save it with the model's embedded config."
         )
 
-    # Resolve the actual vocabulary size from the embedding tensor (handles post-SFT
-    # resize where <think>/</think> tokens pushed vocab_size beyond the config value).
+    # Resolve the actual vocabulary size from the embedding tensor in case special
+    # tokens were added after the original model config was created.
     sd = ckpt.get("model_state_dict", ckpt.get("state_dict", {}))
     emb_keys = [k for k in sd if k.endswith("token_embed.embedding.weight")]
     if emb_keys:
@@ -187,7 +185,6 @@ def load_dimba_tokenizer(baseline_id: str):
 def _add_think_tokens(tokenizer, model):
     """Add <think>/</think> tokens and resize model embedding if not already present.
 
-    Mirrors the run_sft / run_grpo pattern in train_4090.py exactly.
     Returns (think_start_id, think_end_id).
     """
     if "<think>" not in tokenizer.get_vocab():
@@ -220,7 +217,7 @@ def dimba_generate(
 
     if block_cot and think_start_id is not None:
         # Block-CoT path: <think> blocks then response.
-        # Uses block_size=64, 2 think blocks (matching GRPO_CFG defaults).
+        # Conservative defaults for the released small model.
         result = block_sample_from_model(
             model,
             ids,
@@ -327,7 +324,7 @@ def run_gen(
 
     print("NOTE: DIMBA is flow-matching / bidirectional — output quality is")
     print("  expected to differ from AR SmolLM. A base checkpoint will be")
-    print("  incoherent; SFT/GRPO checkpoints should show coherent responses.")
+    print("  less coherent than an instruction-tuned checkpoint.")
 
 
 # ── Task 2: throughput / speed ─────────────────────────────────────────────────
@@ -477,8 +474,8 @@ def run_speed(
 def _dimba_denoising_nll(model, ids, device, n_noise=2, t_stride_frac=0.05, seed=42):
     """Return mean denoising NLL (nats/token) averaged uniformly over timesteps.
 
-    This is the ELBO denoising proxy from perplexity_eval.py, adapted for the
-    new-style train_4090 checkpoint format (uses model.num_diffusion_steps directly).
+    This is the ELBO denoising proxy from perplexity_eval.py and uses
+    ``model.num_diffusion_steps`` directly.
     """
     T = model.num_diffusion_steps
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -618,7 +615,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Use block_sample_from_model with <think>/</think> delimiters. "
-            "Use this for SFT/GRPO checkpoints (instruct-tuned). "
+            "Use this for compatible instruction-tuned checkpoints. "
             "Omit for base checkpoints."
         ),
     )
@@ -734,19 +731,12 @@ def main():
     print(f"  Block-CoT        : {args.block_cot}")
     print(f"  Baseline         : {args.baseline}")
     print()
-    print("RECOMMENDED COMMANDS FOR THE GPU BOX")
+    print("EXAMPLE COMMAND")
     print()
-    print("  # After SFT finishes (instruct checkpoint, with block-CoT):")
     print("  python scripts/eval_vs_smollm.py \\")
-    print("      --checkpoint checkpoints/sft/final.pt \\")
+    print("      --checkpoint /path/to/model.pt \\")
     print("      --tasks gen,speed,ppl \\")
     print("      --block-cot --steps 20 --max-new 128")
-    print()
-    print("  # After GRPO finishes (policy-optimised checkpoint):")
-    print("  python scripts/eval_vs_smollm.py \\")
-    print("      --checkpoint checkpoints/grpo/final.pt \\")
-    print("      --tasks gen,speed,ppl \\")
-    print("      --block-cot --steps 15 --max-new 128")
 
 
 if __name__ == "__main__":

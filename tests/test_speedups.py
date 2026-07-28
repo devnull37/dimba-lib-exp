@@ -1,17 +1,15 @@
 """Parity tests for the general-speedup pass.
 
 Covers the CUDA-graph-ready feature fast path in ``scripts/generate.py``, the
-confidence-threshold commit override, the chunked linear-CE that avoids
-retaining ``[tokens, vocab]`` logits, and the ``GraphedFn`` eager fallback.
-The CUDA-graph capture itself only runs on CUDA and is exercised by
-``scripts/benchmark_h100.py``.
+confidence-threshold commit override, and the ``GraphedFn`` eager fallback.
+CUDA-graph capture itself requires CUDA; this file exercises the portable
+fallback and the graph-ready feature boundary.
 """
 
 import pytest
 import torch
 
 from dimba.models.diffusion import DIMBA
-from dimba.training.fused_ce import output_head_cross_entropy
 from dimba.utils.cuda_graphs import GraphedFn
 from scripts.generate import _make_cfg_features, generate, guided_logits
 
@@ -122,77 +120,6 @@ def test_cfg_drop_switches_to_single_row_forwards() -> None:
     assert calls[0] == 2  # paired CFG rows while mostly masked
     assert calls[-1] == 1  # single conditional row after the drop point
     model.predict_token_features = original
-
-
-# --------------------------------------------------------------------------- #
-# Chunked linear cross-entropy.
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    "head_overrides",
-    [dict(), dict(use_weight_tying=True, use_head_norm=True)],
-    ids=["linear-head", "tied-normed-head"],
-)
-def test_chunked_ce_matches_unchunked_values_and_grads(head_overrides) -> None:
-    torch.manual_seed(26)
-    model = _tiny_model(**head_overrides)
-    n_tokens, d_model = 64, 16
-    targets = torch.randint(0, 31, (n_tokens,))
-
-    def run(chunk_tokens):
-        model.zero_grad(set_to_none=True)
-        features = torch.randn(
-            n_tokens, d_model, generator=torch.Generator().manual_seed(5)
-        ).requires_grad_()
-        prepared = model.output_head.prepare_features(
-            features, model.token_embed.get_weight()
-        )
-        ce = output_head_cross_entropy(
-            model, prepared, targets, prepared=True, reduction="none",
-            chunk_tokens=chunk_tokens,
-        )
-        # Non-uniform per-token weights: the case Liger cannot express and the
-        # chunked backward must preserve exactly.
-        weights = torch.linspace(0.1, 2.0, n_tokens)
-        (ce * weights).sum().backward()
-        grads = {
-            name: p.grad.clone()
-            for name, p in model.named_parameters()
-            if p.grad is not None
-        }
-        return ce.detach().clone(), features.grad.clone(), grads
-
-    ce_ref, feat_grad_ref, grads_ref = run(chunk_tokens=None)
-    ce_chunk, feat_grad_chunk, grads_chunk = run(chunk_tokens=16)
-
-    torch.testing.assert_close(ce_chunk, ce_ref)
-    torch.testing.assert_close(feat_grad_chunk, feat_grad_ref, atol=1e-6, rtol=1e-5)
-    assert grads_chunk.keys() == grads_ref.keys()
-    for name in grads_ref:
-        # Weight grads accumulate across chunks in fp32; tolerance covers the
-        # accumulation-order difference vs the single-matmul reference.
-        torch.testing.assert_close(
-            grads_chunk[name], grads_ref[name], atol=1e-5, rtol=1e-4,
-            msg=lambda m, n=name: f"{n}: {m}",
-        )
-
-
-def test_chunked_ce_inference_mode() -> None:
-    torch.manual_seed(27)
-    model = _tiny_model()
-    targets = torch.randint(0, 31, (48,))
-    with torch.inference_mode():
-        features = torch.randn(48, 16)
-        prepared = model.output_head.prepare_features(
-            features, model.token_embed.get_weight()
-        )
-        ce_ref = output_head_cross_entropy(
-            model, prepared, targets, prepared=True, reduction="none",
-        )
-        ce_chunk = output_head_cross_entropy(
-            model, prepared, targets, prepared=True, reduction="none",
-            chunk_tokens=16,
-        )
-    torch.testing.assert_close(ce_chunk, ce_ref)
 
 
 # --------------------------------------------------------------------------- #

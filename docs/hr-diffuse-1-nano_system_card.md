@@ -12,15 +12,16 @@ tags:
 
 # hr-diffuse-1-nano
 
-> **Historical release card.** Experiment results and the original roadmap are
-> preserved below. The current repository defaults to AdamW and offers Muon only
-> as an opt-in, benchmark-gated pilot; see `docs/PERFORMANCE_AND_SCALING.md`.
+> **Historical release card.** Experiment results and the original roadmap are preserved below.
+> The current public repository contains inference, evaluation, and release tooling only; see
+> `docs/benchmarks.md` and `docs/BACKENDS.md` for surviving public evidence.
 
 **A masked discrete diffusion language model on a bidirectional Mamba backbone. 287.9M measured parameters, 135M-class backbone capacity.**
 
 This is the final release of the first generation of the project. It is a research artifact, trained end to end for about $450 on rented H100s by a self-funded independent researcher. To our knowledge, every published masked-diffusion text model uses a transformer backbone (LLaDA, MDLM, Dream). This model is the same proven objective on a different spine: bidirectional Mamba.
 
-The full development archive, including every failed checkpoint and negative result, lives at [devnull37/d1-135m-28b](https://huggingface.co/devnull37/d1-135m-28b). This repo contains only the release artifacts.
+This repository contains the public inference runtime and release evidence, not internal training
+artifacts or failed-run checkpoints.
 
 ## System card
 
@@ -60,7 +61,9 @@ Conclusion: detection is solved externally at this scale; correction additionall
 
 ### Measured comparison against same-class models
 
-Benchmarked 2026-07-04 on a 40-item factual QA set, a 12-sentence middle-50% infill test, and degeneracy metrics over the QA generations (full harness and raw results in the training repo, `docs/benchmarks.md`).
+Benchmarked 2026-07-04 on a 40-item factual QA set, a 12-sentence middle-50% infill test,
+and degeneracy metrics over the QA generations. The published results and methodology are in
+`docs/benchmarks.md`.
 
 | Model | QA accuracy | Loop rate | Infill recovery | Seconds per 40-token answer |
 |---|---|---|---|---|
@@ -72,11 +75,20 @@ Benchmarked 2026-07-04 on a 40-item factual QA set, a 12-sentence middle-50% inf
 
 Read honestly: the model loses raw QA hard to its own teacher (capacity plus a lossy transfer pipeline), roughly matches GPT-2, and beats Pythia-160M despite an order of magnitude less training data. Its structural wins are native infill (every autoregressive baseline scores near zero because the task requires conditioning on both sides of a gap) and loop resistance (7.5% degenerate answers vs 37.5% for its teacher). Latency is its worst axis: 128 denoising steps with classifier-free guidance is 21x slower than the teacher.
 
-An inference-time quality dial (`scripts/generate.py` in the training repo) maps one knob to denoising steps and best-of-N with a verifier: measured 2.2 to 27.7 seconds per answer across the dial, QA moving 7.5% to 20% (noisy and not monotone: the cost axis works perfectly, the accuracy axis is capacity-bound). Practical summary: 15% at production settings, 20% with the dial maxed, about 18% at settings you would actually wait for.
+The inference-time quality dial (`scripts/generate.py`) maps one knob to denoising steps and
+best-of-N with a verifier: measured 2.2 to 27.7 seconds per answer across the dial, QA moving
+7.5% to 20% (noisy and not monotone: the cost axis works perfectly, the accuracy axis is
+capacity-bound). Practical summary: 15% at production settings, 20% with the dial maxed,
+about 18% at settings you would actually wait for.
 
 ### Architecture note: cheaper bidirectionality
 
-A controlled 3-arm A/B (2000 steps from scratch, identical data and seeds) tested whether the duplicated directional stacks can be shared: full double stack (287.9M, tail CE 6.697) vs one shared stack (225.5M, 6.968) vs shared stack plus per-direction LoRA rank 16 (228.4M, 6.797). The 2.9M LoRA adapters recover 63% of the quality lost to sharing while keeping a 21% parameter cut, making shared+LoRA the best parameters-per-nat variant tested. This is an early-learning probe, not a convergence result; the next run's pilot phase will confirm before adoption. Details: `docs/bidir_ab.md` in the training repo.
+A controlled 3-arm A/B (2000 steps from scratch, identical data and seeds) tested whether the
+duplicated directional stacks can be shared: full double stack (287.9M, tail CE 6.697) vs one
+shared stack (225.5M, 6.968) vs shared stack plus per-direction LoRA rank 16 (228.4M, 6.797).
+The 2.9M LoRA adapters recovered 63% of the quality lost to sharing while keeping a 21% parameter
+cut. This was an early-learning probe, not a convergence result; its training harness is not part
+of this inference-only repository.
 
 ## Files
 
@@ -98,13 +110,16 @@ A controlled 3-arm A/B (2000 steps from scratch, identical data and seeds) teste
 
 1. SFT loss is computed on the response plus exactly one EOS token, never on the padding tail. Training on the tail silently collapses the model to empty answers while the loss looks excellent.
 2. Repair training works with random corruptions and fails with self-generated ones. Training the model to fix its own sampled errors destroyed its detection ability entirely (7.1% to 0.0%), because its own samples are by definition what it finds plausible.
-3. Optimizer: a controlled 2k-step A/B of Muon vs AdamW on this architecture gave Muon a small consistent win (final CE 5.453 vs 5.470) with no instability. That is enough to justify a gated next-run arm, not to replace AdamW by default; promote Muon only on better time-to-held-out-quality.
+3. Optimizer: a controlled 2k-step A/B of Muon vs AdamW on this architecture gave Muon a small
+   consistent win (final CE 5.453 vs 5.470) with no instability. This is an early signal, not
+   evidence to replace AdamW without a time-to-held-out-quality comparison.
 
-## Roadmap
+## Open research questions
 
-- Next run (when funded, roughly $1,500 to $4,000): 1.5B with teacher-enabled distillation from SmolLM2-1.7B and the shared-base plus per-direction LoRA bidirectionality validated above. The run starts with cheap AdamW/Muon and architecture pilot arms before committing the budget.
-- The scientific goal is a scaling curve for the four probes established here: planted-error detection rate, remask fire rate, critic AUC, and the slope of the inference-compute dial. All four are measured at this scale and waiting for their second data point.
-- Planning-latent tokens: a compressed continuous plan vector conditioning the discrete diffusion.
+- How planted-error detection, remask fire rate, critic AUC, and the inference-compute dial change
+  with model capacity.
+- Whether planning-latent tokens can add global planning without giving up discrete diffusion's
+  native infill behavior.
 
 ## Author
 

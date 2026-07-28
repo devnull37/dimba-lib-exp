@@ -56,7 +56,7 @@ The published 13.33 s result predates CUDA graphs. A directional RTX 4090 verifi
 2026-07-17 measured the current eager path at **17.92 s** and denoiser graph replay at
 **1.16 s (15.49x)** for this production shape, with exact final tokens (40/40, seed 0).
 This is a one-run 4090 measurement, not a replacement five-run H100 median; that formal rerun
-remains tracked in AGENTS.md. See [PERFORMANCE_AND_SCALING.md](PERFORMANCE_AND_SCALING.md).
+remains tracked in `AGENTS.md`.
 
 ## Test E: Model Facts
 

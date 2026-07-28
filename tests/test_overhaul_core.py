@@ -3,7 +3,7 @@
 Covers the correctness fixes and new capabilities: zero-terminal-SNR schedule,
 FiLM identity init, the 3-tuple forward, prompt-mask (clean-prefix) conditioning,
 self-conditioning / CFG / v-prediction / latent modes, sampler shapes, config
-round-trip, and the combined training loss.
+round-trip, and latent-scale calibration.
 """
 
 import os
@@ -120,16 +120,3 @@ def test_latent_scale_calibration():
     assert torch.allclose(m.decode_latent(s), x, atol=1e-4)  # round-trips exactly
     new = m.calibrate_latent_scale(torch.randint(0, 40, (4, 8)))
     assert new > 0 and m.config["latent_scale"] == pytest.approx(new)
-
-
-def test_combined_loss():
-    pytest.importorskip("pytorch_lightning")
-    from dimba.training.trainer import compute_dimba_losses
-
-    m = tiny(latent_diffusion=True, d_latent=8)
-    ids = torch.randint(0, 40, (2, 6))
-    t = torch.randint(0, 20, (2,))
-    loss, parts = compute_dimba_losses(m, ids, t)
-    assert torch.isfinite(loss)
-    assert "diff_loss" in parts and "ce_loss" in parts
-    loss.backward()

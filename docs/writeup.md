@@ -2,15 +2,18 @@
 
 *by Faris Allafi, July 2026, draft*
 
-> **Historical experiment narrative.** The measurements and decisions below
-> are preserved as recorded. Current launch policy defaults to AdamW and treats
-> Muon as an opt-in, benchmark-gated pilot; see `docs/PERFORMANCE_AND_SCALING.md`.
+> **Historical experiment narrative.** The measurements and decisions below are preserved as
+> recorded. The current public repository contains inference, evaluation, and release evidence;
+> it does not contain the training stack described in this narrative.
 
 I'm 14, self-funded, and for the past months I've been building **DIMBA**: a language model that uses a *bidirectional Mamba* backbone with a *diffusion* objective instead of the usual left-to-right transformer. This is the story of how the first version failed for $358, how a pivot to masked diffusion made it work, and how one long day of test-time-compute experiments produced the most interesting finding of the project:
 
 > **At 135M-class scale, every inference-time technique that asks the model to judge itself fails, and every technique that imposes an external constraint works.** Self-judgment is the first casualty of small scale.
 
-I measured that six different ways (287.9M measured parameters, 135M-class backbone capacity). Everything below is a real, unedited model output. All checkpoints and code are public, including the failures, because negative results are results.
+I measured that six different ways (287.9M measured parameters, 135M-class backbone capacity).
+Everything below is a real, unedited model output. The released model, inference runtime, and
+published evidence remain public; internal training artifacts and failed-run checkpoints are not
+part of this repository.
 
 ## Part 1: The $358 failure (and why it was worth it)
 
@@ -119,7 +122,11 @@ Two forward-looking pieces from the same day:
 
 **The accuracy↔cost dial.** Diffusion gives you *two* orthogonal inference knobs: number of denoising steps, and best-of-N with the verifier. Both are per-request. That means one deployed model can serve "fast and rough" and "slow and careful" from the same weights, which is a genuine architectural advantage over autoregressive models, where thinking longer had to be trained in. (Next step: let the model set its own dial per request.)
 
-**Muon is promising on Mamba diffusion.** I ran a controlled A/B (2,000 identical steps, same data, same seed) of Muon against AdamW, with the standard hybrid split (243 hidden weight matrices on Muon, embeddings and the rest on AdamW). Muon led at nearly every checkpoint and finished at 5.453 vs 5.470 loss. That small, stable edge justifies a gated next-run arm; AdamW remains the control until Muon wins on wall-clock time to the same held-out quality.
+**Muon is promising on Mamba diffusion.** I ran a controlled A/B (2,000 identical steps, same
+data, same seed) of Muon against AdamW, with the standard hybrid split (243 hidden weight matrices
+on Muon, embeddings and the rest on AdamW). Muon led at nearly every checkpoint and finished at
+5.453 vs 5.470 loss. That small, stable edge warrants more measurement; it does not establish a
+new default without a wall-clock comparison at equal held-out quality.
 
 ## The thesis, and the experiment I actually want to run
 
@@ -127,7 +134,11 @@ Put Part 7 together and you get the sentence I'd defend in front of any research
 
 > **At small scale, inference-time quality must come from external constraints, because self-judgment is the first casualty of small scale.**
 
-And it sets up a measurement nobody has published for diffusion LMs: **where does self-correction turn on?** I now have three cheap, repeatable probes: planted-error detection rate (7.1% at 135M), remasking fire-rate (~0 at 135M), and critic-head AUC (78.9% at 135M). Run the identical probes at 350M and 1B and you get a *calibration scaling curve*: the parameter count at which a diffusion model becomes able to fix its own mistakes. That curve is the scientific payload of the next two runs.
+And it sets up a measurement nobody has published for diffusion LMs: **where does
+self-correction turn on?** I now have three cheap, repeatable probes: planted-error detection rate
+(7.1% at 135M), remasking fire-rate (~0 at 135M), and critic-head AUC (78.9% at 135M).
+Repeating them across larger capacities would produce a *calibration scaling curve*: the point at
+which a diffusion model becomes able to fix its own mistakes.
 
 ## What this cost
 
@@ -139,15 +150,15 @@ And it sets up a measurement nobody has published for diffusion LMs: **where doe
 | Big SFT (422k pairs, 15k steps) + repair training + test-time-compute day (repair v1+v2, RCR/lookahead, verifier, critic head, Muon A/B) | ~$25 |
 | **Total** | **~$450** |
 
-## Roadmap
+## Open research directions
 
-- **350M from scratch, ~5B tokens, Muon, ≈ $200.** Measure the calibration curve's second point. Retrain the critic head jointly. Test whether critic-guided correction closes once the refill model is smarter.
-- **Planning-latent tokens** (my idea I'm most excited about): compress a continuous "plan" vector and condition the discrete diffusion on it. Latent space where it helps (global planning), discrete tokens where diffusion is proven (the text itself). Saved for 350M/1B where there's capacity to use a plan.
-- **Adaptive test-time compute:** the accuracy↔cost dial, eventually self-set per request.
-- **1B, 10-20B tokens, ≈ $1,000-1,600:** where LLaDA says this recipe becomes competitive with same-size autoregressive models. MoE and step-distillation live here.
-- Parked until then: Dream-style noise rescheduling, VRPO, variance-reduced masked training, jointly-trained token critic.
+- Measure the calibration curve across larger capacities and test whether critic-guided
+  correction improves once the refill model is stronger.
+- Explore planning-latent tokens: a compressed continuous plan vector conditioning discrete
+  diffusion.
+- Make the accuracy↔cost dial adaptive per request.
 
-Release model (private for now): **huggingface.co/devnull37/hr-diffuse-1-nano**. Development archive with every checkpoint including the failures: **huggingface.co/devnull37/d1-135m-28b**.
+Release model: **huggingface.co/devnull37/hr-diffuse-1-nano**.
 
 *References: LLaDA (Nie et al.), MDLM (Sahoo et al.), MaskGIT (Chang et al.), D3PM (Austin et al.), Muon/Moonlight (Kimi), Token-Critic (Lezama et al.), ReMDM / RemeDi / remasking-policy literature (2025-26).*
 

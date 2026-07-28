@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "DIMBA: Diffusion-based Mamba for non-autoregressive text generation"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = {text = "CC BY-NC 4.0"}
 authors = [
     {name = "Faris Allafi", email = "faris.qais.allafi@gmail.com"}
 ]
@@ -17,7 +17,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -27,16 +27,10 @@ classifiers = [
 
 dependencies = [
     "torch>=2.0.0",
-    "pytorch-lightning>=2.0.0",
     "transformers>=4.30.0",
-    "datasets>=2.13.0",
+    "huggingface_hub>=0.20.0",
     "numpy>=1.24.0",
-    "pyyaml>=6.0.0",
-    "omegaconf>=2.3.0",
-    "tqdm>=4.65.0",
     "tokenizers>=0.13.0",
-    "textual>=0.47.0",
-    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -44,16 +38,11 @@ mamba = ["mamba-ssm>=2.2.0"]
 gpu = [
     "mamba-ssm>=2.2.0",
     "causal-conv1d>=1.4.0",
-    "liger-kernel>=0.8.0",
 ]
 eval = [
     "sacrebleu>=2.3.1",
     "rouge-score>=0.1.2",
     "nltk>=3.8.0",
-]
-tracking = [
-    "wandb>=0.14.0",
-    "tensorboard>=2.12.0",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -63,21 +52,17 @@ dev = [
     "flake8>=6.0.0",
     "mypy>=1.0.0",
 ]
-finetune = [
-    "peft>=0.7.0",
-    "bitsandbytes>=0.41.0",
-]
 mlx = [
     "mlx>=0.18.0",
 ]
 all = [
-    "dimba-lib[gpu,eval,tracking,dev,finetune]",
+    "dimba-lib[gpu,eval,dev,mlx]",
 ]
 
 [project.urls]
-Repository = "https://github.com/devnull37/dimba-lib"
-Documentation = "https://github.com/devnull37/dimba-lib#readme"
-Issues = "https://github.com/devnull37/dimba-lib/issues"
+Repository = "https://github.com/devnull37/dimba-lib-exp"
+Documentation = "https://github.com/devnull37/dimba-lib-exp#readme"
+Issues = "https://github.com/devnull37/dimba-lib-exp/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dimba"]

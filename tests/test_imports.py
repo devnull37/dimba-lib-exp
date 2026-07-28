@@ -1,34 +1,27 @@
-"""Import smoke tests for the ``dimba`` package.
-
-These tests import the top-level package and every public submodule to catch
-breakage (syntax errors, broken intra-package imports, renamed symbols) early.
-
-Some submodules have *hard* dependencies on optional third-party libraries that
-are not installed in the CPU-only CI environment (for example ``pytorch_lightning``
-for :mod:`dimba.training` and ``datasets`` for :mod:`dimba.data`). When a submodule
-fails to import *solely* because such an optional dependency is missing, the test
-is skipped rather than failed -- a genuine break inside ``dimba`` still fails the
-test because the missing module name would belong to ``dimba`` itself.
-"""
+"""Import smoke tests for the public ``dimba`` package."""
 
 import importlib
 
-import pytest
-
-# Public submodules that should always import on a bare torch-only install.
 CORE_SUBMODULES = [
     "dimba",
     "dimba.models",
     "dimba.models.diffusion",
     "dimba.models.denoiser",
     "dimba.models.embeddings",
+    "dimba.models.parallel_scan",
     "dimba.models.simple_mamba",
+    "dimba.models.torch_mamba2",
     "dimba.models.vae",
-    "dimba.models.lora",
-    "dimba.models.quantization",
+    "dimba.backends",
+    "dimba.backends.mlx",
     "dimba.diffusion",
+    "dimba.diffusion.corruption",
+    "dimba.diffusion.masked_sampling",
+    "dimba.diffusion.rerank",
     "dimba.diffusion.schedules",
     "dimba.diffusion.sampling",
+    "dimba.inference",
+    "dimba.inference.block_cot",
     "dimba.tokenizers",
     "dimba.tokenizers.base",
     "dimba.tokenizers.simple",
@@ -36,46 +29,14 @@ CORE_SUBMODULES = [
     "dimba.evaluation",
     "dimba.evaluation.metrics",
     "dimba.utils",
-    "dimba.utils.checkpointing",
+    "dimba.utils.compile",
+    "dimba.utils.cuda_graphs",
 ]
 
-# Submodules that may require optional third-party packages to import.
-# These are imported best-effort and skipped if only the optional dep is missing.
-OPTIONAL_SUBMODULES = [
-    "dimba.training",
-    "dimba.training.trainer",
-    "dimba.data",
-    "dimba.data.dataset",
-    "dimba.data.finetuning",
-]
-
-
-def _import_or_skip_on_optional_dep(module_name: str) -> None:
-    """Import ``module_name``; skip if a *non-dimba* dependency is missing.
-
-    Args:
-        module_name: Fully-qualified module path to import.
-    """
-    try:
-        importlib.import_module(module_name)
-    except ImportError as exc:
-        missing = getattr(exc, "name", "") or ""
-        # If the missing module is part of dimba itself, this is a real break.
-        if missing.startswith("dimba"):
-            raise
-        pytest.skip(f"Skipping {module_name}: optional dependency missing ({exc}).")
-
-
-@pytest.mark.parametrize("module_name", CORE_SUBMODULES)
-def test_import_core_submodule(module_name: str) -> None:
+def test_import_core_submodules() -> None:
     """Every core submodule must import without error."""
-    importlib.import_module(module_name)
-
-
-@pytest.mark.parametrize("module_name", OPTIONAL_SUBMODULES)
-def test_import_optional_submodule(module_name: str) -> None:
-    """Optional submodules import, or are skipped if an optional dep is missing."""
-    _import_or_skip_on_optional_dep(module_name)
+    for module_name in CORE_SUBMODULES:
+        importlib.import_module(module_name)
 
 
 def test_package_exposes_public_api() -> None:

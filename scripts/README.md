@@ -1,129 +1,53 @@
-# DIMBA scripts
+# Public inference and evaluation scripts
 
-Run commands from the repository root with `PYTHONPATH=src`. See
-`docs/PERFORMANCE_AND_SCALING.md` for the production backend and benchmark policy.
+Run commands from the repository root. There are no public training or distillation entry points.
 
-## Canonical training launchers
-
-### Continuous Stage 3 on one H100
-
-Validate the resolved recipe without CUDA:
+## Released-model generation
 
 ```bash
-PYTHONPATH=src python3 scripts/train_h100.py \
-  --preset repair1b \
-  --phase distill \
-  --stage3-optimizer adamw \
-  --save-dir checkpoints/repair1b \
-  --dry-run
+python3 scripts/generate.py "What is the capital of France?" --quality 0.5
+python3 scripts/generate.py --help
 ```
 
-Remove `--dry-run` on the H100. This launcher requires the fused
-`mamba_ssm.Mamba2` plus `causal-conv1d` stack and rejects `--phase all`. Continuous Stage 3
-supports single-node `torchrun`; alignment runs once on rank 0 and exact resume requires the same
-world size. SFT/GRPO remain single-process. AdamW is the default; Muon is an opt-in
-pilot with `--stage3-optimizer muon`. Run each phase separately and pass
-`--quality-gate-passed` before SFT or GRPO. Use a distinct `--save-dir` for
-every AdamW/Muon arm.
+`generate.py` loads the released checkpoint locally or from Hugging Face, rebuilds its recorded
+architecture, and strictly loads model weights. The default backend is selected from the available
+CUDA, MLX, MPS, or CPU path.
 
-Stage-3 exact resume requires the same preset, optimizer, batch/backend,
-topology, and data configuration:
+## MLX sampling and parity
 
 ```bash
-PYTHONPATH=src python3 scripts/train_h100.py \
-  --preset repair1b \
-  --phase distill \
-  --save-dir checkpoints/repair1b \
-  --resume \
-  --checkpoint checkpoints/repair1b/distill_latest.pt
+pip install -e ".[mlx]"
+python3 scripts/sample_mlx.py --help
+python3 scripts/verify_mlx_model.py
 ```
 
-### Masked base training with DDP
+See `docs/BACKENDS.md` for supported checkpoint formats, precision caveats, and measured results.
+
+## Evaluation
 
 ```bash
-PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
-  scripts/masked_diffusion_finetune.py \
-  --steps 40000 \
-  --batch 8 \
-  --accumulate 2 \
-  --optimizer adamw \
-  --output-dir checkpoints/masked-base-adamw
+python3 scripts/evaluate.py --help
+python3 scripts/eval_vs_smollm.py --help
+python3 scripts/perplexity_eval.py --help
 ```
 
-### Masked SFT with DDP
+DIMBA denoising-reconstruction perplexity is not autoregressive perplexity. Preserve the caveats
+printed and documented by the evaluation scripts.
+
+## Dependency-light CPU benchmark
 
 ```bash
-PYTHONPATH=src torchrun --standalone --nproc-per-node=8 \
-  scripts/mdm_sft_cfg2.py \
-  --steps 15000 \
-  --batch 8 \
-  --accumulate 2 \
-  --optimizer adamw \
-  --output-dir checkpoints/masked-sft-adamw
+python3 scripts/benchmark.py
 ```
 
-For both masked launchers, `--batch` is the microbatch per GPU and global batch
-is `batch × world size × accumulate`. `--resume PATH` is exact only with the
-same world size and run signature. Give every AdamW/Muon arm a distinct
-`--output-dir`.
+This constructs a tiny model and is a local regression/smoke benchmark, not release-model or CUDA
+performance evidence.
 
-### Apple Silicon development training
+## Explicit release upload
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 PYTHONPATH=src \
-  python3 scripts/train_interactive.py
+python3 scripts/upload_to_hf.py --help
 ```
 
-Select `mps-small`. It is the tested fp32 PyTorch-MPS latent recipe. MLX is an
-inference backend, not a training backend.
-
-## H100 performance gate
-
-Run the complete parity and promotion suite on a real H100:
-
-```bash
-PYTHONPATH=src python3 scripts/benchmark_h100.py \
-  --checkpoint checkpoints/model.pt \
-  --output artifacts/h100-benchmark.json \
-  --fail-on-gate
-```
-
-The default suite runs masked inference, continuous DDIM, continuous DPM++,
-continuous fused CE, and masked training. A subset is diagnostic only and is
-not promotion evidence. `--dry-run` validates the benchmark plan on a non-CUDA
-machine.
-
-## Inference and evaluation
-
-```bash
-PYTHONPATH=src python3 scripts/generate.py \
-  "What is the capital of France?" \
-  --checkpoint checkpoints/model.pt \
-  --quality 0.5 \
-  --backend auto
-
-PYTHONPATH=src python3 scripts/evaluate.py --help
-```
-
-`generate.py` loads the architecture embedded in the checkpoint with a strict
-state-dict check. `--backend auto` selects MLX on supported Apple Silicon and
-Torch otherwise.
-
-## Other maintained entry points
-
-- `train.py` — generic YAML-driven training.
-- `train_vae.py` — TokenVAE experiments.
-- `train_interactive.py` — local preset wizard.
-- `finetuning/finetune_sft.py` — direct SFT.
-- `finetuning/finetune_dpo.py` — DPO, IPO, and SimPO.
-- `finetuning/finetune_grpo.py` — reward-driven GRPO.
-- `upload_to_hf.py` — Hugging Face upload utility.
-
-Inspect an entry point before launching it:
-
-```bash
-PYTHONPATH=src python3 scripts/<script>.py --help
-```
-
-Older experiment-specific scripts remain for reproducibility; they are not the
-canonical next-run launchers.
+The uploader requires an explicit artifacts directory, repository id, and Hugging Face token. It
+is never invoked by inference or tests. Do not commit tokens or generated artifacts.
